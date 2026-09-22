@@ -47,12 +47,40 @@ def test_dependency_spellings_all_normalise_to_one_id(tmp_path):
     assert deps == {extension_id("node"), extension_id("views_ui"), extension_id("token")}
 
 
-def test_dependency_targets_are_external_stubs(tmp_path):
+def test_extractor_emits_no_placeholder_for_dependency_targets(tmp_path):
+    """Placeholders are the cross-file resolver's job, not this extractor's.
+
+    A stub emitted here carries the REFERENCING file as its source_file. When
+    the target is also declared by its own info.yml, two nodes end up sharing
+    one id with different source_files, and extract()'s id-remap pass splits
+    the extension by prefixing one with its file path.
+    """
     path = _write(tmp_path, "web/modules/custom/foo/foo.info.yml", MODULE_INFO)
     result = extract_drupal_info(path)
-    stub = next(n for n in result["nodes"] if n["id"] == extension_id("node"))
-    assert stub["external"] is True
-    assert stub["file_type"] == "concept"
+    assert [n["id"] for n in result["nodes"]] == [extension_id("foo")]
+    assert {e["target_name"] for e in result["edges"]} == {"node", "views_ui", "token"}
+
+
+def test_resolver_materialises_only_undeclared_targets():
+    from graphify.drupal.resolvers import resolve_missing_extensions
+
+    nodes = [{"id": extension_id("foo")}, {"id": extension_id("token")}]
+    edges = [
+        {"relation": "depends_on_module", "target": extension_id("token"),
+         "target_name": "token", "source_file": "a/foo.info.yml"},
+        {"relation": "depends_on_module", "target": extension_id("facets"),
+         "target_name": "facets", "source_file": "a/foo.info.yml"},
+        {"relation": "calls", "target": "some_other_language_node",
+         "source_file": "a/x.py"},
+    ]
+    resolve_missing_extensions([], nodes, edges)
+
+    added = [n for n in nodes if n.get("external")]
+    assert [n["id"] for n in added] == [extension_id("facets")]
+    assert added[0]["label"] == "facets"
+    assert added[0]["file_type"] == "concept"
+    # A dangling endpoint belonging to another language is not ours to invent.
+    assert not any(n["id"] == "some_other_language_node" for n in nodes)
 
 
 def test_theme_emits_base_theme_edge(tmp_path):

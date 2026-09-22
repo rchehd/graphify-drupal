@@ -28,27 +28,56 @@ class DrupalSeamError(RuntimeError):
     """A graphify core structure the seam depends on is missing or changed."""
 
 
+def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
+    """Replace `module.name` with a wrapper over it, at most once."""
+    original = getattr(module, name)
+    if getattr(original, "_drupal_patched", False):
+        return
+    wrapper = make_wrapper(original)
+    wrapper._drupal_patched = True
+    wrapper.__wrapped__ = original
+    setattr(module, name, wrapper)
+
+
 def _patch_detect(detect: ModuleType) -> None:
     from graphify.drupal.paths import is_drupal_info_yaml
 
-    for attr in ("classify_file", "FileType"):
+    for attr in ("classify_file", "FileType", "_is_graphable_source"):
         if not hasattr(detect, attr):
             raise DrupalSeamError(
                 f"graphify.detect.{attr} is missing — graphify core changed shape; "
                 "graphify/drupal/register.py must be updated"
             )
-    original = detect.classify_file
-    if getattr(original, "_drupal_patched", False):
-        return
 
-    def classify_file(path: Path):
-        if is_drupal_info_yaml(path):
-            return detect.FileType.CODE
-        return original(path)
+    def _classify(original):
+        def classify_file(path: Path):
+            if is_drupal_info_yaml(path):
+                return detect.FileType.CODE
+            return original(path)
+        return classify_file
 
-    classify_file._drupal_patched = True
-    classify_file.__wrapped__ = original
-    detect.classify_file = classify_file
+    def _graphable(original):
+        def _is_graphable_source(path: Path):
+            # Promoting the file to CODE is not enough on its own. Core's
+            # secret screen exempts "genuine programming-language source" via
+            # this predicate, and it excludes every data format — `.yml`
+            # included — because credentials.yaml is exactly what that screen
+            # must catch. A Drupal *.info.yml is an extension declaration with
+            # a fixed schema and is never a credential store, so it belongs on
+            # the exempt side of core's own rule rather than around it.
+            #
+            # Without this, `token.info.yml` is dropped silently: its stem
+            # `token.info` is two words and hits the generic-keyword rule. On a
+            # real 1,140-extension tree that was the single casualty — but the
+            # `token` module is a dependency of a large share of Drupal sites,
+            # so every depends_on_module edge pointing at it would dangle.
+            if is_drupal_info_yaml(path):
+                return True
+            return original(path)
+        return _is_graphable_source
+
+    _wrap(detect, "classify_file", _classify)
+    _wrap(detect, "_is_graphable_source", _graphable)
 
 
 def _patch_extract(extract: ModuleType) -> None:
@@ -68,18 +97,38 @@ def _patch_extract(extract: ModuleType) -> None:
             "graphify.extract._DISPATCH is missing or no longer a dict — dispatch "
             "was restructured upstream; graphify/drupal/register.py must be updated"
         )
-    original = extract._get_extractor
-    if getattr(original, "_drupal_patched", False):
+    def _dispatch(original):
+        def _get_extractor(path: Path):
+            if is_drupal_info_yaml(path):
+                return extract_drupal_info
+            return original(path)
+        return _get_extractor
+
+    _wrap(extract, "_get_extractor", _dispatch)
+    # Registered here rather than in install() because the registry is imported
+    # from graphify.extract's own dependency graph; doing it at this point keeps
+    # install() free of any import of core.
+    _register_resolvers()
+
+
+def _register_resolvers() -> None:
+    """Register the cross-file pass through graphify's public registry.
+
+    Unlike the two patchers this is a documented extension point, so it widens
+    nothing: `resolver_registry.register` exists for exactly this.
+    """
+    from graphify import resolver_registry
+    from graphify.drupal.resolvers import resolve_missing_extensions
+
+    if any(r.name == "drupal" for r in resolver_registry.registered_resolvers()):
         return
-
-    def _get_extractor(path: Path):
-        if is_drupal_info_yaml(path):
-            return extract_drupal_info
-        return original(path)
-
-    _get_extractor._drupal_patched = True
-    _get_extractor.__wrapped__ = original
-    extract._get_extractor = _get_extractor
+    resolver_registry.register(
+        resolver_registry.LanguageResolver(
+            name="drupal",
+            suffixes=frozenset({".yml"}),
+            resolve=resolve_missing_extensions,
+        )
+    )
 
 
 _PATCHERS = {

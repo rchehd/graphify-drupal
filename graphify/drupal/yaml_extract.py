@@ -81,21 +81,19 @@ def extract_drupal_info(path: Path) -> dict[str, Any]:
         if target_id in seen:
             return  # one relation per ordered pair — the reader drops the rest
         seen.add(target_id)
-        nodes.append({
-            "id": target_id,
-            "label": target_name,
-            "file_type": "concept",
-            "type": "drupal_extension",
-            "layer": "extension",
-            "realm": "unknown",
-            "external": True,
-            "_origin": "static_yaml",
-            "source_file": str_path,
-            "source_location": "L1",
-        })
+        # No placeholder node for the target. An extension named here is very
+        # often declared by another *.info.yml in the same corpus, and emitting
+        # a stub for it creates two nodes with one id and two source_files —
+        # which extract()'s id-remap pass then disambiguates by prefixing one
+        # with its file path, splitting the extension in half. Dangling
+        # endpoints are build.py's job: it already materialises them as
+        # external nodes with file_type "concept".
         edges.append({
             "source": own_id,
             "target": target_id,
+            # Carried so the cross-file resolver can label an external node
+            # without reversing make_id.
+            "target_name": target_name,
             "relation": relation,
             "confidence": "EXTRACTED",
             "_origin": "static_yaml",

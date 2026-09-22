@@ -69,3 +69,28 @@ def test_seam_fails_loudly_when_dispatch_is_replaced(monkeypatch):
     monkeypatch.setattr(extract._get_extractor, "_drupal_patched", False, raising=False)
     with pytest.raises(DrupalSeamError, match="_DISPATCH"):
         _patch_extract(extract)
+
+
+def test_drupal_info_yaml_is_not_treated_as_a_secret_store():
+    """`token.info.yml` is an extension declaration, not a credential dump.
+
+    Core's Stage 3 keyword screen drops it because the stem `token.info` is two
+    words containing `token`. Promotion to CODE alone does not save it: the
+    exemption runs through `_is_graphable_source`, which excludes every data
+    format including `.yml`.
+    """
+    install()
+    import graphify.detect as detect
+
+    assert detect._is_sensitive(Path("/p/web/modules/contrib/token/token.info.yml")) is False
+    assert detect._is_sensitive(Path("/p/web/modules/custom/foo/foo.info.yml")) is False
+
+
+def test_real_secret_stores_are_still_caught():
+    """The exemption must be exactly as wide as *.info.yml and no wider."""
+    install()
+    import graphify.detect as detect
+
+    for name in ("token.yml", "token.json", "credentials.yaml", "secrets.yml",
+                 "token.services.yml", "api_token.txt"):
+        assert detect._is_sensitive(Path("/p") / name) is True, name
