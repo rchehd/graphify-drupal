@@ -48,19 +48,29 @@ graphify/drupal/
 
 ### 2.2 The seam
 
-`register.py` edits nothing in core. It mutates core's own structures at import
-time:
+`register.py` edits nothing in core. `install()` places a finder on
+`sys.meta_path` that wraps the loaders for `graphify.detect` and
+`graphify.extract`, patching each the moment it finishes executing:
 
 ```python
-def register() -> None:
-    from graphify.extract import _DISPATCH
-    from graphify.detect import CODE_EXTENSIONS
-    from graphify import resolver_registry
-    ...
-    _DISPATCH.update({...})
-    CODE_EXTENSIONS |= {".module", ".install", ".theme", ".profile", ".twig"}
-    resolver_registry.register(LanguageResolver(name="drupal", ...))
+def install() -> None:
+    if not any(isinstance(f, _DrupalFinder) for f in sys.meta_path):
+        sys.meta_path.insert(0, _DrupalFinder())
+    for name, patch in _PATCHERS.items():        # already-imported modules
+        module = sys.modules.get(name)
+        if module is not None:
+            patch(module)
 ```
+
+A hook rather than eager registration because `graphify/__init__.py` is
+deliberately lazy. Measured: `import graphify` costs 1 ms, `import
+graphify.extract` costs 809 ms, and `graphify install` must work before heavy
+dependencies exist. `install()` imports only `sys` and `importlib`.
+
+As built, the patchers wrap `detect.classify_file`,
+`detect._is_graphable_source` and `extract._get_extractor`, and register one
+cross-file pass through `resolver_registry`. Mutating `CODE_EXTENSIONS` is not
+needed until P4 adds `.module`/`.install`/`.theme`/`.profile`.
 
 Three verified facts make this work:
 
@@ -114,18 +124,21 @@ base is clean and needs no reconciliation.
 | Branch | Role |
 |---|---|
 | `v8` | mirror of `upstream/v8`, zero local commits. Updated with `git fetch upstream && git merge --ff-only upstream/v8` |
-| `drupal` | all fork work. Updated with `git rebase v8` |
+| `drupal-graph` | all fork work. Updated with `git rebase v8` |
 
 ### 3.3 Two rules
 
 1. **Commits that touch core files are separate and prefixed `core:`.** Then
-   `git log v8..drupal --grep '^core:'` is the exhaustive list of what to review
+   `git log v8..drupal-graph --grep '^core:'` is the exhaustive list of what to review
    after an update. Without the prefix, that list is reconstructed by hand every
    time.
-2. **CI enforces the allow-list.** `git diff upstream/v8 --name-only` must stay
-   within `graphify/drupal/*`, `graphify/__init__.py`, `pyproject.toml`,
-   `tests/test_drupal_*.py`, `docs/*`. This catches an accidental edit to `extract.py` at
-   commit time rather than three months later during a rebase.
+2. **CI enforces the allow-list.** The patterns live in
+   `graphify/drupal/allowlist.txt` — read by both `tests/test_drupal_allowlist.py`
+   and `.github/workflows/drupal-guard.yml`, so the rule has one source. Every
+   path in `git diff upstream/v8 --name-only` must match one. This catches an
+   accidental edit to `extract.py` at commit time rather than three months later
+   during a rebase; verified by appending a line to `extract.py` and watching the
+   test name it.
 
 ---
 
