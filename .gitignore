@@ -27,7 +27,8 @@ skills/
 # A global "core" ignore (for core dumps) would otherwise drop them.
 !tools/skillgen/fragments/core/
 !tools/skillgen/fragments/core/**
-docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
 .vscode/
 .kilo
 openspec/
@@ -37,6 +38,7 @@ scripts/llm.py
 scripts/benchmark_kimi*.json
 scripts/benchmark_kimi*.py
 paper/
+.idea/
 
 # macOS Finder metadata
 .DS_Store
