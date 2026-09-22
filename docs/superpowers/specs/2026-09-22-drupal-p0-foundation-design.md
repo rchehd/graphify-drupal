@@ -53,13 +53,17 @@ Three distinct mechanisms, with the evidence for each.
 `_get_extractor()` in `extract.py` ends with `return _DISPATCH.get(suffix)`. The
 lookup happens per call, so keys added after import are honoured.
 
-### 3.2 In-place set mutation — file classification
+### 3.2 In-place set mutation — deferred to P4
 
-`watch.py` binds `_CODE_EXTENSIONS = CODE_EXTENSIONS` — the same set object, not
-a copy — so `CODE_EXTENSIONS |= {...}` propagates to the watcher.
+`CODE_EXTENSIONS |= {".module", ".install", ".theme", ".profile"}` is how the
+PHP-adjacent Drupal extensions get picked up. `watch.py` binds
+`_CODE_EXTENSIONS = CODE_EXTENSIONS` — the same set object, not a copy — so an
+in-place `|=` propagates to the watcher; `_WATCHED_EXTENSIONS` is a *new* set
+built with `|` at import time and must be updated explicitly.
 
-`_WATCHED_EXTENSIONS` is built as a *new* set via `|` at import time and does
-**not** see the mutation. `register()` must update it explicitly.
+None of this is needed in P0. `*.info.yml` already has a suffix core knows
+(`.yml`); it is routed by the filename predicate in §3.3, not by a new extension.
+Recorded here so the mechanism is not rediscovered in P4.
 
 ### 3.3 Function wrapping — routing `.info.yml` without capturing all YAML
 
@@ -96,30 +100,36 @@ name at module level.
 
 ## 4. Components
 
-### 4.1 `graphify/drupal/config.py`
+### 4.1–4.2 `graphify/drupal/paths.py`
 
-Reads `.graphifyrc` (core already has a reader in `hooks.py`) and exposes:
+One module owns the filename predicates and realm resolution together, so
+classification and dispatch cannot disagree — a divergence there produces a file
+counted as code that yields zero nodes, which core reports only as a warning.
+
+It exposes `is_drupal_info_yaml(path)`, `extension_machine_name(path)`,
+`resolve_realm(path, rules=None)` and `load_realm_rules(root)`.
+
+`resolve_realm` takes no project root: core invokes extractors as
+`extractor(path)` with no further arguments, so every rule is written to match an
+absolute POSIX path.
+
+Realm rules are read from `.graphifyrc`, whose core reader ignores keys it does
+not recognise, so `drupal.realm.*` lines coexist with graphify's own settings:
 
 ```
-drupal.realm.core     = core/**, web/core/**
-drupal.realm.contrib  = **/modules/contrib/**, **/themes/contrib/**
-drupal.realm.custom   = **/modules/custom/**, **/themes/custom/**, **/profiles/**/modules/**
+drupal.realm.core     = */core/modules/*, */core/themes/*, */core/profiles/*, */core/lib/*
+drupal.realm.contrib  = */modules/contrib/*, */themes/contrib/*, */profiles/contrib/*
+drupal.realm.custom   = */modules/custom/*, */themes/custom/*, */profiles/*/modules/*, */profiles/*/themes/*
 ```
 
-First match wins in the order core → contrib → custom. An unmatched extension is
+Patterns are `fnmatch`, whose `*` crosses path separators, so a leading `*`
+absorbs any docroot layout. First match wins in the order core → contrib → custom. An unmatched extension is
 `realm: unknown` and is reported, never silently defaulted. Defaults ship with
 the package; a project overrides any line.
 
 The generality matters: docroot may be `web/`, `docroot/` or the repository root;
 the custom directory may be named anything; and **install profiles contain their
 own modules**, so a custom module can live under `profiles/`.
-
-### 4.2 `graphify/drupal/paths.py`
-
-`is_drupal_info_yaml(path) -> bool` and `resolve_realm(path) -> str`. One module
-owns both, so classification and dispatch cannot disagree — a divergence there
-produces a file counted as code that yields zero nodes, which core reports only
-as a warning.
 
 ### 4.3 `graphify/drupal/yaml_extract.py`
 
@@ -132,10 +142,23 @@ the vocabulary:
 - `depends_on_module` edges from `dependencies:`, normalising the three accepted
   spellings (`drupal:node`, `views:views_ui`, bare `node`) to one id;
 - `base_theme` edges from `base theme:`;
-- `declares_extension` from the extension to its `.info.yml` file node — and
-  **not** `contains_file`, per vocabulary §1.4;
 - unresolved dependency targets as `external: true`,
   `file_type: "concept"` nodes.
+
+Node ids are built with `graphify.ids.make_id`, so the readable form
+`drupal:extension:foo` in the vocabulary is stored as `drupal_extension_foo`. Emitting
+the readable form raw would let `build.py`'s own normalisation rewrite it, and
+the extractor and the builder would disagree about the same node.
+
+`declares_extension` is **deferred to P1**. It needs a file node that nothing
+else in P0 produces, and it exercises no mechanism that `depends_on_module` does
+not already exercise. P0 is a test of the seam, not a coverage exercise.
+
+PyYAML is required to parse the file and is **not currently a declared
+dependency** of the package — it is only present transitively in the dev
+environment. It is added to `[project] dependencies` in this phase, and `uv.lock`
+is regenerated, because CI runs `uv run --frozen` and will fail on a stale lock.
+The import stays function-local so `import graphify` remains 1 ms.
 
 ### 4.4 `graphify/drupal/register.py`
 
@@ -144,19 +167,46 @@ shape. A missing or renamed structure raises a named error **at import**. Silent
 loss of Drupal edges after an upstream update is the failure mode this guards
 against, and it is strictly worse than a crash.
 
-### 4.5 `graphify/__init__.py`
+### 4.5 `graphify/__init__.py` — a post-import hook, not eager registration
+
+An earlier draft of this spec called for `register()` to run eagerly here.
+Measurement rules that out:
+
+| Import | Cost |
+|---|---|
+| `graphify` | **1 ms** |
+| `graphify.detect` | 45 ms |
+| `graphify.extract` | **809 ms** |
+
+`graphify/__init__.py` is deliberately lazy — its `__getattr__` exists so
+`graphify install` works before heavy dependencies are present. Importing
+`graphify.extract` from it would turn every invocation of the CLI, including
+`install`, from 1 ms into roughly 850 ms. That is an unacceptable regression and
+a direct violation of the module's stated design intent.
+
+The two lines therefore install a **post-import hook** rather than doing the
+work:
 
 ```python
-from graphify.drupal.register import register as _register_drupal
-_register_drupal()
+from graphify.drupal.register import install as _install_drupal
+_install_drupal()
 ```
 
-Placing the call here rather than in the CLI is deliberate — see §6.2.
+`install()` imports nothing beyond `sys` and `importlib`, so the 1 ms stays 1 ms.
+It places a `MetaPathFinder` on `sys.meta_path` that wraps the loader for
+`graphify.detect` and `graphify.extract` only, applying the patch immediately
+after each module finishes executing — and patches either one directly if it is
+already in `sys.modules` when `install()` runs.
+
+This also satisfies §6.2 for free. A spawned worker unpickles
+`graphify.extract._extract_single_file`, which imports `graphify.extract`, which
+imports the parent package `graphify` first, which installs the hook before
+`extract` executes.
 
 ### 4.6 CI guard
 
 A job asserting `git diff upstream/v8 --name-only` stays within
-`graphify/drupal/*`, `graphify/__init__.py`, `pyproject.toml`, `tests/drupal/*`,
+`graphify/drupal/*`, `graphify/__init__.py`, `pyproject.toml`, `tests/test_drupal_*.py`,
 `docs/*`.
 
 ---
@@ -253,6 +303,6 @@ The allow-list job fails on a deliberate edit to `graphify/extract.py`.
 ## 8. Definition of done
 
 Every criterion in §6 passes; `uv run pytest -q` is green with no edits to tests
-outside `tests/drupal/`; the diff against `upstream/v8` is inside the allow-list;
+outside `tests/test_drupal_*.py`; the diff against `upstream/v8` is inside the allow-list;
 and a run over a real Drupal fixture yields extension nodes with correct `realm`
 values in `graph.json`.

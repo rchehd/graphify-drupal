@@ -36,8 +36,7 @@ Three options were considered.
 ```
 graphify/drupal/
 ├── __init__.py
-├── config.py         # realm rules, drush runner config, .graphifyrc reading
-├── paths.py          # filename predicates: known YAML families, extension realms
+├── paths.py          # filename predicates, realm rules, .graphifyrc reading
 ├── discovery.py      # the learned registry — plugin types, hooks (pre-pass)
 ├── yaml_extract.py   # Drupal YAML families -> nodes/edges
 ├── php_extract.py    # .module/.install/.theme/.profile/.inc, annotations, attributes
@@ -125,7 +124,7 @@ base is clean and needs no reconciliation.
    time.
 2. **CI enforces the allow-list.** `git diff upstream/v8 --name-only` must stay
    within `graphify/drupal/*`, `graphify/__init__.py`, `pyproject.toml`,
-   `tests/drupal/*`, `docs/*`. This catches an accidental edit to `extract.py` at
+   `tests/test_drupal_*.py`, `docs/*`. This catches an accidental edit to `extract.py` at
    commit time rather than three months later during a rebase.
 
 ---

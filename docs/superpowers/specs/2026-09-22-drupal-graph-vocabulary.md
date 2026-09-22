@@ -44,9 +44,9 @@ Path globs cannot be baked in. Real projects vary on all three axes:
 Defaults ship with the package; a project overrides them in `.graphifyrc`:
 
 ```
-drupal.realm.core     = core/**, web/core/**
-drupal.realm.contrib  = **/modules/contrib/**, **/themes/contrib/**
-drupal.realm.custom   = **/modules/custom/**, **/themes/custom/**, **/profiles/**/modules/**
+drupal.realm.core     = */core/modules/*, */core/themes/*, */core/profiles/*, */core/lib/*
+drupal.realm.contrib  = */modules/contrib/*, */themes/contrib/*, */profiles/contrib/*
+drupal.realm.custom   = */modules/custom/*, */themes/custom/*, */profiles/*/modules/*, */profiles/*/themes/*
 ```
 
 First match wins, in the order core → contrib → custom. Anything unmatched is
@@ -65,7 +65,7 @@ Rule:
 - every node parsed from a file in the repository → `file_type: "code"`;
 - the Drupal taxonomy lives in a separate `type` field (the pattern
   `graphify/manifest_ingest.py` already uses for `type: "package"`);
-- a node with no file in the repository (e.g. `drupal:module:views` in a project
+- a node with no file in the repository (e.g. `drupal:extension:views` in a project
   that does not vendor core) → `file_type: "concept"` plus `external: true`,
   matching what `build.py` already does for external nodes.
 
@@ -112,12 +112,28 @@ Every edge carries `source`, `target`, `relation`, `confidence`
 
 ### 3.1 Extensions — `layer: extension`
 
+Modules, themes and profiles share **one id namespace**:
+`drupal:extension:<machine_name>`. Drupal itself treats these names as one
+namespace, and a `dependencies:` entry names an extension without saying which
+kind it is — the kind is only knowable after reading that extension's own
+`*.info.yml`. Separate `drupal:module:` and `drupal:theme:` namespaces would
+force the producer to guess the target's kind at edge-creation time, and every
+wrong guess is a dangling edge.
+
+The kind lives in `type`, not in the id.
+
 | Type | ID | Source |
 |---|---|---|
-| `drupal_module` | `drupal:module:<name>` | `*.info.yml`, `type: module` |
-| `drupal_theme` | `drupal:theme:<name>` | `*.info.yml`, `type: theme` |
-| `drupal_profile` | `drupal:profile:<name>` | `*.info.yml`, `type: profile` |
+| `drupal_module` | `drupal:extension:<name>` | `*.info.yml`, `type: module` |
+| `drupal_theme` | `drupal:extension:<name>` | `*.info.yml`, `type: theme` |
+| `drupal_profile` | `drupal:extension:<name>` | `*.info.yml`, `type: profile` |
 | `drupal_recipe` | `drupal:recipe:<dir>` | `recipe.yml` |
+
+Ids in this document are written in readable form. Producers build them with
+`graphify.ids.make_id`, so `drupal:extension:foo` is stored as
+`drupal_extension_foo`. Emitting the readable form raw lets `build.py`'s own
+normalisation rewrite it, after which the producer and the builder disagree
+about the same node.
 
 ### 3.2 Container — `layer: di`
 
