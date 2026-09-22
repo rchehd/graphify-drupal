@@ -28,3 +28,11 @@ def __getattr__(name):
         mod = importlib.import_module(mod_name)
         return getattr(mod, attr)
     raise AttributeError(f"module 'graphify' has no attribute {name!r}")
+
+
+# The Drupal seam. `install()` imports only sys and importlib, so the 1 ms cost
+# of importing this package is unchanged; the modules it patches are wrapped when
+# and if they are imported. See graphify/drupal/register.py.
+from graphify.drupal.register import install as _install_drupal  # noqa: E402
+
+_install_drupal()
