@@ -188,7 +188,8 @@ working graph.
 | # | Phase | Contents |
 |---|---|---|
 | **P0** | Foundation | subpackage, `register()` seam and its assertions, configurable `realm`, CI allow-list check, one extractor end to end |
-| **P1** | Known YAML families | services, routing, permissions, libraries, links, breakpoints, themes; profiles, recipes, **config_split**, domains; config `dependencies:`; `core.extension.yml` |
+| **P1** | Module-owned YAML | services, routing, permissions, libraries, links, breakpoints — 1,383 files on the reference corpus |
+| **P1b** | Configuration | config entities, **config_split**, domains, profiles, recipes, config `dependencies:`, `core.extension.yml` — 629 files |
 | **P2** | Discovery registry | plugin-manager pre-pass, learned plugin types, hook discovery from `*.api.php` and invocation sites, unrecognised-family inventory |
 | **P3** | Container producer | runner detection, `drush ev`, the artifact, merge as a distinct step with a divergence log |
 | **P4** | PHP semantics | annotations and attributes, plugin instances against learned types, procedural and `#[Hook]` implementations, forms, events, entity-type handlers, `\Drupal::service()` |
@@ -202,6 +203,11 @@ working graph.
   runtime-registered extractor survives the whole pipeline, `cache.py` included.
   If it does not, approach B is in question, and that should surface in week one
   on 200 lines rather than on 5,000.
+- **P1 split in two.** Measured on the reference corpus, module-owned YAML and
+  configuration are 1,383 and 629 files with different scanning models: the first
+  is discovered by filename family and names its owner by prefix, the second by
+  directory, names its owner inside the file, and moves part of itself outside
+  `config/sync` via `config_split`. See the P1 spec §2.
 - **P2 before P4.** Classification of custom YAML depends on the learned
   registry, and the registry pre-pass must precede `detect` (vocabulary §5.3).
 - **P3 before P4.** The container is the largest measured gain — 4 of 5
