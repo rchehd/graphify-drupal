@@ -1,0 +1,10 @@
+# Paths this fork may diverge from upstream/v8 on.
+# Every entry widens the surface a rebase can conflict on. Add deliberately.
+graphify/drupal/*
+graphify/__init__.py
+pyproject.toml
+uv.lock
+tests/test_drupal_*.py
+docs/*
+.github/workflows/drupal-guard.yml
+.gitignore
