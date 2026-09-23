@@ -17,7 +17,7 @@ Spec: `docs/superpowers/specs/2026-09-23-drupal-p1b-configuration-design.md`.
 - Test files are flat: `tests/test_drupal_*.py`. No files under `tests/fixtures/`; build corpora in `tmp_path`.
 - **Every commit is inside `graphify/drupal/`, `tests/test_drupal_*.py` or `docs/`.** No `core:` commit is expected in P1b.
 - **Never parse with `yaml.safe_load`.** Use `load_drupal_yaml` from `graphify/drupal/yaml_common.py`.
-- **Configuration values never enter the graph** except a config entity's boolean `status` and an extension's `weight` in `core.extension.yml`. Keys are recorded by path, never with their value.
+- **Configuration values never enter the graph** except structural metadata: a config entity's boolean `status`, an extension's `weight` in `core.extension.yml`, a split's `folder`, and a recipe's `name` (label) and `type` (`recipe_type`). Keys are recorded by path, never with their value.
 - `*.info.yml` is the only producer of `drupal_module` / `drupal_theme` / `drupal_profile` nodes.
 - At most one relation per ordered node pair.
 - Anything another file may also declare needs a test through `graphify.extract.extract(paths, cache_root=<tmp>, root=<tmp>)`, not only an extractor unit test.

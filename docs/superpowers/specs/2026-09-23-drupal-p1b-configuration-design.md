@@ -122,9 +122,10 @@ override mechanisms of vocabulary §4.9, `core.extension.yml`, and recipes.
 | Files excluded by `.gitignore` | core never passes them to extractors (`settings.local.php`, `settings.ddev.php` on the corpus); P1b cannot see what core does not collect | — |
 | Configuration of test modules | 959 fixture files that describe no site | — |
 
-**Configuration values never enter the graph**, with two exceptions that are
-structural: a config entity's `status` and an extension's `weight` in
-`core.extension.yml`. Keys are recorded by *path* (`hostname`,
+**Configuration values never enter the graph**, with exceptions that are
+structural metadata rather than site settings: a config entity's boolean
+`status`, an extension's `weight` in `core.extension.yml`, a split's `folder`,
+and a recipe's `name` (its label) and `type`. Keys are recorded by *path* (`hostname`,
 `smtp_host`), never with the value assigned to them.
 
 ---
