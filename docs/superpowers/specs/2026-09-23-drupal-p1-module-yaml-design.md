@@ -142,15 +142,21 @@ so `x.links.menu.yml` is never read as family `menu`.
 | Family | Files | Entries | Primary node |
 |---|---:|---:|---|
 | `*.services.yml` | 375 | **2,305** | `drupal:service:<id>` |
-| `*.routing.yml` | 293 | 1,544 | `drupal:route:<name>` |
+| `*.routing.yml` | 293 | **1,533** | `drupal:route:<name>` |
 | `*.libraries.yml` | 241 | 1,066 | `drupal:library:<owner>/<name>` |
-| `*.permissions.yml` | 133 | 382 | `drupal:permission:<string>` |
+| `*.permissions.yml` | 133 | **355** | `drupal:permission:<string>` |
 | `*.links.task.yml` | 117 | 437 | `drupal:local_task:<id>` |
 | `*.links.menu.yml` | 131 | 312 | `drupal:menu_link:<id>` |
 | `*.links.action.yml` | 65 | 112 | `drupal:local_action:<id>` |
 | `*.breakpoints.yml` | 9 | 36 | `drupal:breakpoint:<owner>:<name>` |
 | `*.links.contextual.yml` | 19 | 34 | `drupal:contextual_link:<id>` |
-| **total** | **1,383** | **6,243** | |
+| **total** | **1,383** | **6,190** | |
+
+Entries count the nodes an extractor emits, not top-level YAML keys. The
+first draft counted keys, which scored 15 parameters-only service files,
+11 `route_callbacks` and 27 `permission_callbacks` sections as entries.
+Rows in bold are confirmed by an extractor; the rest are still key counts
+and are rechecked when their family lands.
 
 ### 5.1 Services
 
@@ -171,7 +177,8 @@ declares.
 
 ### 5.2 Routes
 
-Nodes carry `path`, and the `_controller` / `_form` / `_entity_form` value as an
+Nodes carry `route_path` (not `path`, which core reads as a legacy alias of
+`source_file`), and the `_controller` / `_form` / `_entity_form` value as an
 attribute pending P4.
 
 | Edge | From |
@@ -247,9 +254,9 @@ breakpoints), `yaml_access.py` (permissions), `yaml_links.py`. The existing
 | | Nodes |
 |---|---:|
 | after P0 | 1,169 |
-| P1 primary entities | +6,243 |
+| P1 primary entities | +6,190 |
 | tags, menus, parameters | ~+150 |
-| **after P1** | **≈7,600** |
+| **after P1** | **≈7,500** |
 
 Already past graphify's ~5,000-node aggregation threshold, which the vocabulary
 anticipated. P1 does not need to solve that — but it must not make it worse, so

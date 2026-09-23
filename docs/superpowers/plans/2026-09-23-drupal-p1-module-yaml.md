@@ -993,7 +993,7 @@ def test_routes_are_declared_with_path_and_handler_attribute(tmp_path):
     settings = next(n for n in result["nodes"] if n["id"] == route_id("foo.settings"))
     assert settings["type"] == "drupal_route"
     assert settings["layer"] == "routing"
-    assert settings["path"] == "/admin/config/foo"
+    assert settings["route_path"] == "/admin/config/foo"
     assert settings["form"] == "\\Drupal\\foo\\Form\\SettingsForm"
     # The PHP handler is another layer's node; no edge until P4.
     assert not any(e["relation"] in ("routes_to", "routes_to_form") for e in result["edges"])
@@ -1119,7 +1119,8 @@ def extract_drupal_routing(path: Path) -> dict[str, Any]:
         rid = route_id(name)
         defaults = definition.get("defaults") or {}
         requirements = definition.get("requirements") or {}
-        extra: dict[str, Any] = {"path": definition.get("path", "")}
+        # Not `path`: core reads that key as a legacy alias of `source_file`.
+        extra: dict[str, Any] = {"route_path": definition.get("path", "")}
         for key, attr in (("_controller", "controller"), ("_form", "form"),
                           ("_entity_form", "entity_form"), ("_title", "title")):
             if isinstance(defaults, dict) and key in defaults:
@@ -1183,7 +1184,9 @@ for glob, fn, label in (('web/**/*.routing.yml', extract_drupal_routing, 'routes
 "
 ```
 
-Expected: `routes 1544 errors: 0`, `permissions 382 errors: 0`.
+Expected: `routes 1533 errors: 0`, `permissions 355 errors: 0`. (Key counts are
+1,544 and 382; the differences are 11 `route_callbacks` and 27
+`permission_callbacks` sections, which are not entities.)
 
 - [ ] **Step 8: Commit**
 
