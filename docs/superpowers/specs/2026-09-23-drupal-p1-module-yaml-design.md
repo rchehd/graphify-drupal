@@ -61,7 +61,7 @@ The first is **Drupal core's main service file**. Measured:
 | Loader | Services parsed |
 |---|---:|
 | `yaml.safe_load` | 1,628 |
-| tolerant loader | **2,320** |
+| tolerant loader | **2,305** |
 
 P1 therefore parses with a `SafeLoader` subclass carrying a multi-constructor
 for `!`, so any custom tag yields its underlying scalar, sequence or mapping
@@ -141,7 +141,7 @@ so `x.links.menu.yml` is never read as family `menu`.
 
 | Family | Files | Entries | Primary node |
 |---|---:|---:|---|
-| `*.services.yml` | 375 | **2,320** | `drupal:service:<id>` |
+| `*.services.yml` | 375 | **2,305** | `drupal:service:<id>` |
 | `*.routing.yml` | 293 | 1,544 | `drupal:route:<name>` |
 | `*.libraries.yml` | 241 | 1,066 | `drupal:library:<owner>/<name>` |
 | `*.permissions.yml` | 133 | 382 | `drupal:permission:<string>` |
@@ -267,7 +267,7 @@ Measured against the reference corpus, not a fixture.
    `core/tests/.../invalid_file.libraries.yml`, which is deliberately malformed —
    and it returns an error dict rather than raising. The two Symfony-tag files
    parse.
-2. **Services.** 2,320 service nodes, not 1,628. The gap is the whole point of
+2. **Services.** 2,305 service nodes, not 1,628. The gap is the whole point of
    the tolerant loader.
 3. **Secret screen.** Zero of the 1,383 files are dropped, including the three
    `token.*` ones. `token.yml`, `token.json`, `credentials.yaml`, `secrets.yml`

@@ -179,7 +179,7 @@ custom YAML tags, and `yaml.safe_load` refuses them:
     web/modules/contrib/modeler_api/...           !service_closure
 
 The first is Drupal core's main service file. Measured on a real 1,140-extension
-tree, `safe_load` parses 1,628 services and this loader parses 2,320 — the
+tree, `safe_load` parses 1,628 services and this loader parses 2,305 — the
 difference is most of core's container. Every family parses through here.
 """
 from __future__ import annotations
@@ -373,7 +373,8 @@ print('services:', total, 'errors:', len(bad))
 ```
 
 Expected: `services: 2320 errors: 0`. Anything near 1,628 means the loader is not
-being used.
+being used. (2320 overcounts: `data.get('services', data)` scores each of the 15
+parameters-only files as one entry. The true service count is 2,305 — see Task 3.)
 
 - [ ] **Step 6: Commit**
 
@@ -836,6 +837,11 @@ def extract_drupal_services(path: Path) -> dict[str, Any]:
     return {"nodes": nodes, "edges": edges}
 ```
 
+> **Import cycle.** `families` imports each handler to build its table, so a handler
+> must not import `extension_owner` from `families` at module level — either import
+> order then fails on a half-initialised module. Import it inside the extractor
+> function. The same applies to every handler in Tasks 4–6.
+
 - [ ] **Step 4: Register the family**
 
 In `graphify/drupal/families.py`, add the import and the entry:
@@ -885,7 +891,7 @@ print('service nodes:', n, 'edges:', e, 'errors:', errs)
 "
 ```
 
-Expected: `service nodes: 2320`, `errors: 0`.
+Expected: `service nodes: 2305`, `errors: 0`.
 
 - [ ] **Step 8: Commit**
 
@@ -1960,7 +1966,7 @@ def test_criterion_1_only_the_malformed_core_fixture_fails(corpus_extraction):
 
 def test_criterion_2_the_tolerant_loader_finds_every_service(corpus_extraction):
     services = [n for n in corpus_extraction["nodes"] if n["type"] == "drupal_service"]
-    assert len(services) == 2320, "1628 means safe_load crept back in"
+    assert len(services) == 2305, "1628 means safe_load crept back in"
 
 
 def test_criterion_3_no_family_file_is_dropped_as_a_secret():
@@ -2090,6 +2096,6 @@ git commit -m "test(drupal): assert P1's acceptance criteria against a real Drup
 ## Definition of done
 
 - `uv run --frozen pytest tests/ -q` green apart from the four known `openai` failures.
-- `tests/test_drupal_corpus.py` passes against the reference corpus: 2,320 services, 1,140 extensions declared only by `*.info.yml`, zero family files dropped as secrets, zero dangling edges, zero `realm: unknown`.
+- `tests/test_drupal_corpus.py` passes against the reference corpus: 2,305 services, 1,140 extensions declared only by `*.info.yml`, zero family files dropped as secrets, zero dangling edges, zero `realm: unknown`.
 - `git log v8..HEAD --grep '^core:'` gained **no** new entries — P1 touches nothing upstream owns.
 - The graph carries roughly 7,600 nodes, and the `realm: custom` slice is small enough to render un-aggregated.

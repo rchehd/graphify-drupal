@@ -7,7 +7,7 @@ custom YAML tags, and `yaml.safe_load` refuses them:
     web/modules/contrib/modeler_api/...           !service_closure
 
 The first is Drupal core's main service file. Measured on a real 1,140-extension
-tree, `safe_load` parses 1,628 services and this loader parses 2,320 -- the
+tree, `safe_load` parses 1,628 services and this loader parses 2,305 -- the
 difference is most of core's container. Every family parses through here.
 """
 from __future__ import annotations
