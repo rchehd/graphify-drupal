@@ -89,3 +89,17 @@ def test_synced_and_shipped_copies_are_one_active_node(tmp_path):
     assert site["install_mode"] == "install"
     assert site["declared_in"] == ["config/sync/system.site.yml",
                                    "web/core/modules/system/config/install/system.site.yml"]
+
+
+def test_nothing_dangles_in_a_small_site(tmp_path):
+    from graphify.extract import extract
+
+    paths = [
+        _touch(tmp_path, "config/sync/core.extension.yml", "module:\n  node: 0\n  gone: 0\n"),
+        _touch(tmp_path, "config/sync/views.view.x.yml",
+               "dependencies:\n  config:\n    - node.type.absent\n  module:\n    - views\n"),
+        _touch(tmp_path, "web/core/modules/node/node.info.yml", "name: Node\ntype: module\n"),
+    ]
+    result = extract(paths, cache_root=tmp_path / ".cache", root=tmp_path)
+    ids = {n["id"] for n in result["nodes"]}
+    assert [e for e in result["edges"] if e["source"] not in ids or e["target"] not in ids] == []
