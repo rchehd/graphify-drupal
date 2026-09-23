@@ -17,7 +17,7 @@ numbers by counting keys.
 
 P1 read what extensions declare about themselves. P1b reads what the **site**
 is: which configuration exists, which of it is active, what it depends on, what
-overrides it and where, and which modules and themes are actually installed.
+overrides it and where, and which modules and themes the site installs.
 
 It emits one node per configuration object and the edges that configuration
 states about itself. What a field formats, what a view queries, which plugin a
@@ -34,7 +34,7 @@ the same node ids.
 | `config/splits/{dev,test,prod}` | 8 | config_split 2.x **patches**, not copies (§5.3) |
 | `config/install`, `config/optional` of non-test extensions | 858 | 772 distinct names; **432 are also in sync**, 340 are shipped but not active |
 | `config/install`, `config/optional` of test modules | 959 | out of scope (§4) |
-| `config/schema/*.schema.yml`, non-test | 303 | 1,815 schema types, 151 of them wildcard patterns |
+| `config/schema/*.schema.yml`, non-test | 303 | 1,806 top-level keys: 1,805 schema types (`condition.plugin.entity_bundle:*` is declared twice), 150 of them wildcard patterns |
 | `recipe.yml` | 58 | 28 in `core/recipes`, 30 test fixtures; 49 sit at `recipes/<name>/recipe.yml` (4 Composer-unpack fixtures and 5 grouped fixtures do not); 3 directory names occur twice, so **46 recipe ids** |
 | recipe `config/*.yml` | 103 | 23 in test fixtures |
 | `settings*.php` visible to git | 1 | `settings.php`: 8 `$config[…]` lines, 6 of them set a split's `status` |
@@ -153,6 +153,13 @@ and a recipe's `name` (its label) and `type`. Keys are recorded by *path* (`host
    extensions already share one id namespace (vocabulary §3.1).
 3. `storage_folder` is the attribute `folder`, not an edge to a path node; no
    other part of the graph uses path nodes.
+4. `installed` is not an attribute: a resolver may not write to nodes of
+   unchanged files, which incremental runs never return; the
+   `installs_extension` edges from `core.extension` carry the fact.
+
+A recipe whose `config.actions` keys or `config.import` lists name configuration
+with `${…}` gets those names, sorted, in the attribute `templated_config` and no
+edge for them: the target is unknowable before the recipe is applied.
 
 ### 5.2 Edges
 
@@ -167,8 +174,8 @@ and a recipe's `name` (its label) and `type`. Keys are recorded by *path* (`host
 | `splits_extension` | split → extension | `module`, `theme` | |
 | `splits_config` | split → config | `complete_list`, `partial_list` | `split_kind: complete|partial` |
 | `applies_recipe` | recipe → recipe | `recipes:` | |
-| `imports_config` | recipe → config / extension | `config.import`; `'*'` targets the extension | `wildcard` |
-| `config_action` | recipe → config | `config.actions` | `AMBIGUOUS` when an argument uses `${…}` |
+| `imports_config` | recipe → config / extension | `config.import`; `'*'` targets the extension; a `${…}` name is `templated_config`, not an edge | `wildcard` |
+| `config_action` | recipe → config | `config.actions`; a `${…}` name is `templated_config`, not an edge | `AMBIGUOUS` when an argument uses `${…}` |
 | `overrides_config` | override source → config | §5.3–5.4 | `override_source`, `keys` |
 
 At most one relation per ordered pair, as in P1.
@@ -241,16 +248,25 @@ An extension listed in `core.extension.yml` but absent from the code base is
 materialised with `missing: true` — the site expects a module the repository
 does not contain, which is a real finding, not noise.
 
-After materialisation, one more step sets `installed: true` on every extension
-that a `core.extension` config installs and `installed: false` on the rest. It
-runs only when a `core.extension.yml` exists in the corpus; otherwise no
-extension carries `installed`.
+Whether the site installs an extension is the `installs_extension` edge from
+`core.extension` to it, not a node attribute (§5.1, deviation 4). An attribute
+would be written onto extension nodes of unchanged `*.info.yml` files, and an
+incremental run returns only the nodes of the files it re-extracts, so the
+attribute would go stale; the edge is re-emitted with `core.extension.yml`.
 
 ### 6.4 Unchanged from P1
 
 Every producer uses `load_drupal_yaml`, `node()` / `edge()` and the id helpers.
 The AST cache namespace follows the package source (P1 Task 7b), so new modules
 invalidate it without a manual bump.
+
+### 6.5 Decided during planning
+
+1. **`settings.php` is read per file, not by a resolver pass (spec §5.4).** The resolver receives no scan root, and core hands it `settings.php`'s `source_file` relative. The seam instead returns, for `sites/*/settings*.php`, a handler that runs core's PHP extractor and appends the Drupal settings result. Per-file also makes it cached and incremental like every other producer.
+2. **Path rules precede the sync marker.** `web/core/config/install/core.extension.yml` exists; a marker-first rule would call core's default config a sync store.
+3. **Guards against non-Drupal repositories.** `config/install|optional|schema` counts only when an extension (`*.info.yml`, or Drupal core's own directory) sits above `config/`; `recipe.yml` counts only at `recipes/<name>/recipe.yml`.
+4. **Realm.** Sync and split stores and `settings.php` are the project's own: `realm: custom`. `*/core/config/*` and `*/core/recipes/*` join the `core` rules.
+5. **Recipe-shipped configuration** is owned by its recipe: `defines_config` recipe → config, `install_mode: recipe`.
 
 ---
 
@@ -263,7 +279,7 @@ invalidate it without a manual bump.
 | shipped, not active | ~340 |
 | recipe configuration not already counted | ≤80 |
 | recipes | 46 |
-| schema types | 1,815 |
+| schema types | 1,805 |
 | settings, externals | ~50 |
 | **after P1b** | **≈10,600** |
 
@@ -272,6 +288,56 @@ the site does not enable: "which schema does this extension ship" is itself a
 question the graph should answer, and pruning by match would need wildcard
 matching at resolve time. The `realm: custom` slice grows by roughly 60 nodes (53
 shipped configs, 4 schema files).
+
+### 7.1 Measured (Task 10)
+
+Through `graphify.extract.extract` with a fresh `cache_root`, over every
+`config/**/*.yml` and `web/**/*.yml` the Drupal predicate accepts plus
+`web/sites/*/settings*.php` — 4,459 files. That glob also picks up the three
+gitignored `settings.local.php`, `settings.ddev.php`, `settings.ddev.redis.php`,
+which the CLI would not collect; `settings.ddev.php` adds the second
+`drupal_settings` node (3 `overrides_config` edges, to `smtp.settings` and the two
+domain records). Parse errors: `invalid_file.libraries.yml` only.
+
+10,478 nodes, 22,282 edges; **10,473 Drupal nodes**, 918 of them `realm: custom`.
+
+| Type | Nodes |
+|---|---:|
+| `drupal_service` | 2,220 |
+| `drupal_config_schema` | 1,803 |
+| `drupal_route` | 1,634 |
+| `drupal_library` | 1,114 |
+| `drupal_module` | 1,018 |
+| `drupal_config` | 964 |
+| `drupal_local_task` | 436 |
+| `drupal_permission` | 362 |
+| `drupal_menu_link` | 311 |
+| `drupal_parameter` | 136 |
+| `drupal_local_action` | 108 |
+| `drupal_theme` | 99 |
+| `drupal_extension` | 59 |
+| `drupal_service_tag` | 57 |
+| `drupal_recipe` | 46 |
+| `drupal_breakpoint` | 36 |
+| `drupal_contextual_link` | 34 |
+| `drupal_profile` | 20 |
+| `drupal_menu` | 9 |
+| `drupal_config_split` | 3 |
+| `drupal_domain` | 2 |
+| `drupal_settings` | 2 |
+
+Configuration nodes (`config_name` set): 969 = 613 active (sync) + 340 shipped
+and not active (305 install, 35 optional) + 9 recipe-only + 7 external. 215
+`installs_extension` edges from `core.extension`, none to a missing extension.
+45 `config_action` edges (1 `AMBIGUOUS`); `create_node_type` carries
+`templated_config: [node.type.${node_type}]`. `schema_for`: 104 `EXTRACTED`,
+835 `INFERRED`.
+
+Schema types: 1,805 distinct (150 wildcards) give 1,803 nodes, all 150
+wildcards with `pattern: true`. `schema_id` encodes `*`, so a wildcard never
+shares an id with a literal type. Two literal pairs still differ only by `.`
+against `_` and share one id: `views.field.user` / `views_field_user` and
+`views.field.bulk_form` / `views_field_bulk_form`.
 
 ---
 
@@ -289,21 +355,26 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
    `config/splits/{dev,test,prod}`; 8 patches produce `overrides_config` edges;
    `settings.php` produces `AMBIGUOUS` edges to all three splits with `status` in
    `keys`.
-5. **Installed.** `installed: true` on exactly the 215 extensions
-   `core.extension.yml` lists (207 modules including the profile, 8 themes), `false` on every other
-   extension node; listed-but-absent extensions carry `missing: true`.
+5. **Installed.** Exactly 215 `installs_extension` edges from `core.extension`
+   (207 modules including the profile, 8 themes), every target a node; no node
+   carries `installed`; listed-but-absent extensions carry `missing: true`.
 6. **Integrity.** No dangling edge, no salted Drupal id;
-   `menu_test.links.action.yml` is a config node.
-7. **No values.** `graph.json` contains none of a fixed list of values present in
-   the corpus — split-patch hostnames, `password_reset_timeout` values, the
-   `settings.php` SMTP sender — in any node or edge attribute.
+   `menu_test/config/install/menu_test.links.action.yml` belongs to a test
+   module, so it yields neither a config node nor local actions (the module's own
+   `menu_test.links.action.yml` still yields its local actions).
+7. **No values.** No value of the split patches or `smtp.settings` reaches the
+   graph: none of their 8+-character strings occurs anywhere in the output, and
+   no node or edge attribute (other than P1's `weight`/`version`) equals any
+   value of a patch's `adding:`/`removing:` block, however short — the
+   `password_reset_timeout` and `password_reset` values included. The
+   `settings.php` right-hand side is never read (§5.4).
 8. **Recipes.** 46 recipe nodes from 49 recognised files — `article_content_type`,
    `article_tags` and `page_content_type` exist as a core recipe and as a test
    fixture, and collapse with both in `declared_in`; every `config_action` whose arguments contain
-   `${…}` is `AMBIGUOUS`.
+   `${…}` is `AMBIGUOUS`, and no edge carries a `${…}` name.
 9. **Incremental.** Through the CLI: editing one split patch changes only that
    patch's `overrides_config` edge; removing a module from `core.extension.yml`
-   changes one `installs_extension` edge and that module's `installed`.
+   changes exactly one `installs_extension` edge and nothing else.
 10. **Volume.** Roughly 10,600 nodes; the `realm: custom` slice stays under 5,000.
 
 ---
@@ -318,7 +389,7 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
 | A value leaks through a new attribute | criterion 7 scans the whole `graph.json`, not named fields |
 | `settings.php` regex matches inside a heredoc or string | accepted: `AMBIGUOUS` already says the edge is unverified |
 | A test-fixture recipe shares a directory name with a core recipe (3 on the corpus) | collapsed like P1's name-collision fixtures, with both files in `declared_in`; recipes refer to each other by that name, so a separate id would dangle every `applies_recipe` |
-| Wildcard schema matching is slow on 1,815 types × ~1,500 configs | patterns are grouped by their literal prefix before `fnmatch`; measured in the plan |
+| Wildcard schema matching is slow on 1,805 types × ~1,500 configs | patterns are grouped by their literal prefix before `fnmatch`; measured in the plan |
 
 ---
 
@@ -326,7 +397,8 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
 
 - **P2** learns plugin types; P6 then attaches `configures_plugin` to config
   nodes that already exist.
-- **P3**'s container artifact can be checked against `installed`: a service from
-  an extension that is not installed is a divergence worth logging.
+- **P3**'s container artifact can be checked against the `installs_extension`
+  edges from `core.extension`: a service from an extension that is not installed
+  is a divergence worth logging.
 - **P6** adds field, display, view and block semantics to the `drupal_config`
   nodes P1b creates, without new ids.

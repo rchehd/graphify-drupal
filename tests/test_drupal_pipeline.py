@@ -215,3 +215,51 @@ def test_editing_one_services_file_changes_only_its_own_edge(tmp_path):
 
     assert before - after == {(service_id("foo.a"), "injects_service", service_id("database"))}
     assert after - before == {(service_id("foo.a"), "injects_service", service_id("state"))}
+
+
+def _site_corpus(root: Path) -> None:
+    files = {
+        "web/core/lib/Drupal.php": "<?php\n",
+        "web/core/modules/node/node.info.yml": "name: Node\ntype: module\n",
+        "web/core/modules/views/views.info.yml": "name: Views\ntype: module\n",
+        "config/sync/core.extension.yml": "module:\n  node: 0\n  views: 0\ntheme: {}\n",
+        "config/sync/config_split.config_split.prod.yml":
+            "id: prod\nfolder: ../config/splits/prod\nstatus: false\n",
+        "config/sync/user.settings.yml": "password_reset_timeout: 86400\n",
+        "config/splits/prod/config_split.patch.user.settings.yml":
+            "adding:\n  password_reset_timeout: 1\n",
+    }
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def test_editing_a_split_patch_changes_only_its_override(tmp_path):
+    _site_corpus(tmp_path)
+    before = _run_cli(tmp_path)
+    patch = tmp_path / "config/splits/prod/config_split.patch.user.settings.yml"
+    patch.write_text("adding:\n  password_reset_timeout: 1\n  anonymous: x\n", encoding="utf-8")
+    after = _run_cli(tmp_path)
+
+    def overrides(graph):
+        links = graph.get("links", graph.get("edges", []))
+        return {(e["source"], e["target"], tuple(e.get("keys", []))) for e in links
+                if e.get("relation") == "overrides_config"}
+
+    assert _relations(before) == _relations(after)
+    assert overrides(before) != overrides(after)
+
+
+def test_removing_a_module_from_core_extension_changes_one_install_edge(tmp_path):
+    from graphify.drupal.yaml_common import config_id
+
+    _site_corpus(tmp_path)
+    before = _run_cli(tmp_path)
+    (tmp_path / "config/sync/core.extension.yml").write_text(
+        "module:\n  node: 0\ntheme: {}\n", encoding="utf-8")
+    after = _run_cli(tmp_path)
+
+    assert _relations(before) - _relations(after) == {
+        (config_id("core.extension"), "installs_extension", extension_id("views"))}
+    assert _relations(after) - _relations(before) == set()
