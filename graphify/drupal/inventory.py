@@ -67,6 +67,22 @@ def write_inventory(inventory: dict, out: Path) -> Path:
     return target
 
 
+def remove_inventory(out: Path) -> None:
+    """Delete `<out>/drupal-inventory.json` if present.
+
+    Called when a run finds no Drupal marker (`prepare_run` returned None):
+    without this, a STALE inventory a previous Drupal run left in the same
+    out dir would keep being picked up by `report.generate`'s file fallback
+    (`load_inventory`) for a tree that is no longer Drupal, or no longer
+    scanned here, at all. Tolerant of a missing file or any other OSError,
+    same as everything else in this module (spec §5.8): nothing here raises.
+    """
+    try:
+        (Path(out) / _INVENTORY_FILENAME).unlink()
+    except OSError:
+        pass
+
+
 def _owner_and_family(path: str, registry: Registry) -> tuple[str, str] | None:
     """`(owner, family)` for a `registry.root_yaml` entry: `<owner>.<family>.yml`,
     `owner` being whichever extension's root directory holds it (`core` for

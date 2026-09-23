@@ -87,7 +87,9 @@ def _patch_detect(detect: ModuleType) -> None:
         def detect_(root, *, follow_symlinks=None, google_workspace=None,
                     extra_excludes=None, cache_root=None, gitignore=True):
             from graphify.drupal.discovery import current_registry, out_dir, prepare_run
-            from graphify.drupal.inventory import build_inventory, set_current_inventory, write_inventory
+            from graphify.drupal.inventory import (
+                build_inventory, remove_inventory, set_current_inventory, write_inventory,
+            )
 
             root_path = Path(root)
             prepare_run(root_path, cache_root,
@@ -103,7 +105,11 @@ def _patch_detect(detect: ModuleType) -> None:
             # Built from the same file list detect() just returned (every
             # "files" category plus "unclassified"), after the scan so every
             # category is known (spec §5.7). No registry -> no inventory, same
-            # as prepare_run's own "not a Drupal tree" outcome.
+            # as prepare_run's own "not a Drupal tree" outcome -- and any
+            # inventory a PRIOR Drupal run left on disk in this same out dir
+            # must go too, or report.generate's file fallback would keep
+            # reporting that site's coverage for a tree that is no longer
+            # Drupal (or no longer scanned here) at all.
             registry = current_registry()
             if registry is not None:
                 detected: set[str] = set()
@@ -113,6 +119,9 @@ def _patch_detect(detect: ModuleType) -> None:
                 inventory = build_inventory(registry, detected, root_path)
                 write_inventory(inventory, out_dir(root_path, cache_root))
                 set_current_inventory(inventory)
+            else:
+                set_current_inventory(None)
+                remove_inventory(out_dir(root_path, cache_root))
             return result
         detect_.__name__ = detect_.__qualname__ = "detect"
         detect_.__doc__ = original.__doc__
@@ -393,6 +402,8 @@ def _patch_report(report: ModuleType) -> None:
                 root = args[8]
             inventory = current_inventory()
             if inventory is None and root is not None:
+                # No `cache_root` here: `out_dir(root)` is the default out dir
+                # under `root` itself, which is all every caller passes today.
                 inventory = load_inventory(out_dir(Path(root)))
             if inventory is None:
                 return text

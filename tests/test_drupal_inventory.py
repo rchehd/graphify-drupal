@@ -140,6 +140,42 @@ def _run_cli(corpus: Path) -> subprocess.CompletedProcess:
     )
 
 
+def test_a_stale_inventory_is_removed_once_the_tree_stops_being_drupal(
+        tmp_path, _isolated_discovery_state):
+    """A prior run's `drupal-inventory.json` must not survive a later run on
+    the same out dir whose tree has no Drupal marker -- otherwise
+    `report.generate`'s file fallback keeps reporting that old site's
+    coverage for a tree that isn't Drupal (or isn't scanned here) any more."""
+    install()
+    import networkx as nx
+    import graphify.detect as detect
+    import graphify.report as report
+    from graphify.drupal.discovery import current_registry, out_dir
+    from graphify.drupal.inventory import current_inventory, load_inventory
+
+    root = _coverage_site(tmp_path)
+    detect.detect(root)
+    assert current_registry() is not None
+    inventory_path = out_dir(root) / "drupal-inventory.json"
+    assert inventory_path.is_file()
+    assert current_inventory() is not None
+
+    detection_result = {"warning": "test corpus"}
+    before = report.generate(nx.Graph(), {}, {}, {}, [], [], detection_result, {}, str(root))
+    assert "## Drupal coverage" in before
+
+    (root / "web/core/lib/Drupal.php").unlink()
+    detect.detect(root)
+
+    assert current_registry() is None
+    assert not inventory_path.exists()
+    assert current_inventory() is None
+    assert load_inventory(out_dir(root)) is None
+
+    after = report.generate(nx.Graph(), {}, {}, {}, [], [], detection_result, {}, str(root))
+    assert "## Drupal coverage" not in after
+
+
 def test_cli_writes_the_inventory_and_the_report_section(tmp_path):
     root = _coverage_site(tmp_path)
     proc = _run_cli(root)
