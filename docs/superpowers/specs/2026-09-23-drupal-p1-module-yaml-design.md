@@ -280,6 +280,10 @@ breakpoints), `yaml_access.py` (permissions), `yaml_links.py`. The existing
 | tags, menus, parameters | ~+150 |
 | **after P1** | **≈7,400** |
 
+Measured at the end of P1 through `extract()` on the 2,523 family files: **7,646
+nodes, 14,768 edges** — 4,214 `core`, 2,910 `contrib`, 292 `custom`, 230 `unknown`
+(external nodes only). The custom slice is far below the aggregation threshold.
+
 Already past graphify's ~5,000-node aggregation threshold, which the vocabulary
 anticipated. P1 does not need to solve that — but it must not make it worse, so
 `realm` and `layer` are mandatory on every node P1 emits, and an acceptance

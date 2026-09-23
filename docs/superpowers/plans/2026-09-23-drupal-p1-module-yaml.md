@@ -2213,6 +2213,13 @@ def test_criterion_7b_the_custom_slice_renders_without_aggregation(corpus_extrac
     assert len(custom) < 5000, "the custom slice must stay visually readable"
 ```
 
+> Revised during execution: the fixture runs `graphify.extract.extract` with a
+> fresh `cache_root` instead of calling each family's extractor. Criteria 2, 4
+> and 6 depend on the id collapse (Task 5b) and criterion 5 on the resolver,
+> both of which happen only in the pipeline. Added: 3b (real secret stores still
+> caught), 4b (no salted Drupal id); criterion 5 checks both edge endpoints.
+> `tests/test_drupal_corpus.py` in the repository is the authoritative version.
+
 - [ ] **Step 2: Run it**
 
 Run: `uv run pytest tests/test_drupal_corpus.py -q --tb=short`
@@ -2286,6 +2293,6 @@ git commit -m "test(drupal): assert P1's acceptance criteria against a real Drup
 ## Definition of done
 
 - `uv run --frozen pytest tests/ -q` green apart from the four known `openai` failures.
-- `tests/test_drupal_corpus.py` passes against the reference corpus: 2,191 services, 1,140 extensions declared only by `*.info.yml`, zero family files dropped as secrets, zero dangling edges, zero `realm: unknown`.
+- `tests/test_drupal_corpus.py` passes against the reference corpus, measured through `extract()`: 2,191 services, 1,137 extensions from 1,140 `*.info.yml` and declared by nothing else, zero family files dropped as secrets, zero salted ids, zero dangling edges, zero `realm: unknown` outside external nodes.
 - `git log v8..HEAD --grep '^core:'` gained **no** new entries — P1 touches nothing upstream owns.
-- The graph carries roughly 7,600 nodes, and the `realm: custom` slice is small enough to render un-aggregated.
+- The graph carries roughly 7,600 nodes (measured: 7,646), and the `realm: custom` slice (292) is small enough to render un-aggregated.
