@@ -415,11 +415,49 @@ def _patch_report(report: ModuleType) -> None:
     _wrap(report, "generate", _generate)
 
 
+def _patch_watch(watch: ModuleType) -> None:
+    """Make `graphify watch` rebuild (not just flag) when Drupal YAML changes.
+
+    `watch._WATCHED_EXTENSIONS` already includes `.yml`, so a Drupal YAML edit
+    is observed and debounced; the gap is that `.yml` is not in core's
+    `_CODE_EXTENSIONS`, so `_batch_triggers_rebuild` sends it to the
+    LLM-needed `needs_update` flag instead of the no-LLM AST rebuild. A
+    Drupal family file's extractor is a fixed-schema parser, not an LLM, so
+    it belongs on the rebuild side like any other code change.
+    """
+    from graphify.drupal.families import is_drupal_file
+
+    for attr in ("_batch_triggers_rebuild", "_has_non_code"):
+        if not hasattr(watch, attr):
+            raise DrupalSeamError(
+                f"graphify.watch.{attr} is missing — graphify core changed shape; "
+                "graphify/drupal/register.py must be updated"
+            )
+
+    def _triggers(original):
+        def _batch_triggers_rebuild(batch):
+            return original(batch) or any(
+                p.exists() and is_drupal_file(p) for p in batch
+            )
+        return _batch_triggers_rebuild
+
+    def _non_code(original):
+        def _has_non_code(changed_paths):
+            # Drupal-recognised files are excluded before core's check: a
+            # batch of only Drupal YAML must not still raise the LLM flag.
+            return original([p for p in changed_paths if not is_drupal_file(p)])
+        return _has_non_code
+
+    _wrap(watch, "_batch_triggers_rebuild", _triggers)
+    _wrap(watch, "_has_non_code", _non_code)
+
+
 _PATCHERS = {
     "graphify.cache": _patch_cache,
     "graphify.detect": _patch_detect,
     "graphify.extract": _patch_extract,
     "graphify.report": _patch_report,
+    "graphify.watch": _patch_watch,
 }
 
 
