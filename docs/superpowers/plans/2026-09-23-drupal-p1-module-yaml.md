@@ -2018,6 +2018,28 @@ def test_dependency_edge_carries_a_readable_target_name(tmp_path):
     assert dep["target_name"] in ("core/once", "foo/helper")
 ```
 
+> **Revised during execution — three gaps the corpus exposed:**
+>
+> 1. `parent_link` is emitted by menu links *and* local tasks. A missing parent
+>    takes the type of its child (the source node), not a fixed `drupal_menu_link`.
+> 2. Owners can be missing on the **source** side: `core.services.yml`,
+>    `core.libraries.yml`, `sites/development.services.yml` and drush/fixture
+>    files have no `*.info.yml`, which left 848 `declares_*` edges dangling. The
+>    resolver also materialises the source of every `declares_*` relation, named
+>    by `extension_owner(source_file)`, realm from its path.
+> 3. `web/core/core.*.yml` and `web/core/assets/*` matched no realm rule, so every
+>    node from `core.services.yml` was `realm: unknown`. Both are now `core`
+>    (`graphify/drupal/paths.py`).
+>
+> Tests: `test_a_missing_parent_takes_the_kind_of_its_child`,
+> `test_an_owner_without_info_yml_is_materialised_from_its_file`, a
+> `target_name` test per family, and realm cases in `tests/test_drupal_paths.py`.
+>
+> Measured through `extract()` with a fresh cache: 0 dangling edges on either
+> side, 0 salted ids, 0 non-external `realm: unknown`; 283 external nodes
+> (52 extensions, 105 routes, 48 libraries, 29 services, 12 parameters,
+> 7 permissions, 1 menu link).
+
 - [ ] **Step 5: Run the Drupal suite**
 
 Run: `uv run pytest tests/test_drupal_*.py -q`
@@ -2157,7 +2179,9 @@ def test_criterion_7_every_node_is_filterable(corpus_extraction):
     for node in corpus_extraction["nodes"]:
         assert node.get("realm") in ("core", "contrib", "custom", "unknown"), node["id"]
         assert node.get("layer"), node["id"]
-    unknown = [n for n in corpus_extraction["nodes"] if n["realm"] == "unknown"]
+    # External nodes are named, not located, so `unknown` is their honest realm.
+    unknown = [n for n in corpus_extraction["nodes"]
+               if n["realm"] == "unknown" and not n.get("external")]
     assert unknown == []
 
 
