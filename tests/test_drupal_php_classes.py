@@ -188,3 +188,23 @@ class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
     assert cls.has_get_discovery is False
     assert cls.discoveries == ()
     assert cls.construct_args is None
+
+
+def test_pathologically_nested_source_returns_none_rather_than_raising(tmp_path):
+    # The limit is pinned: another test in the suite may have raised it, and
+    # the walk must exceed it for the RecursionError to happen at all.
+    import sys
+
+    saved = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        depth = 3000
+        p = tmp_path / "DeepManager.php"
+        p.write_text(
+            "<?php\nclass DeepManager {\n  public function __construct() {\n"
+            f"    $x = {'(' * depth}1{')' * depth};\n  }}\n}}\n",
+            encoding="utf-8",
+        )
+        assert read_php_class(p) is None
+    finally:
+        sys.setrecursionlimit(saved)

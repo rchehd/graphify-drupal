@@ -75,8 +75,16 @@ def read_php_class(path: Path) -> PhpClass | None:
 
     Returns None for missing/unreadable/oversized files, files tree-sitter
     cannot parse, and files with no class or interface declaration. Never
-    raises.
+    raises: the tree walks recurse, so a pathologically nested expression
+    (a `RecursionError`) is one more file that yields None.
     """
+    try:
+        return _read_php_class(path)
+    except Exception:
+        return None
+
+
+def _read_php_class(path: Path) -> PhpClass | None:
     try:
         if not path.is_file() or path.stat().st_size > _MAX_SIZE:
             return None
