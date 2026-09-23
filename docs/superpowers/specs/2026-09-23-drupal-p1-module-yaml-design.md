@@ -328,6 +328,7 @@ Measured against the reference corpus, not a fixture.
 | Risk | Mitigation |
 |---|---|
 | The tolerant loader masks a real parse error | The multi-constructor applies only to `!`-prefixed tags. Structural errors still raise and are reported, as the malformed core fixture demonstrates. |
+| A changed Drupal extractor is served from core's AST cache (the key is graphify's version + content hash) | The seam appends a hash of `graphify/drupal/*.py` to the cache version, so every change to this package moves the namespace. The semantic cache is unaffected. |
 | A family suffix collides with a config filename (`system.menu.main.yml` vs a `*.menu.yml` family) | Family keys are full compound suffixes and the table is matched longest-first. `*.links.menu.yml` is a key; `*.menu.yml` is not. Criterion 4 catches a regression. One real case remains: `menu_test/config/install/menu_test.links.action.yml` is a config object; it yields no nodes. Excluding `config/install|optional` from the family table belongs to P1b. |
 | Service ids collide across extensions | Drupal service ids are globally unique by definition — the container is flat. Criterion 6 catches a violation. |
 | Node count pushes visualisation over the edge | Anticipated, not solved here. Criterion 7 keeps the filter attributes intact so P7 can generate slices. |

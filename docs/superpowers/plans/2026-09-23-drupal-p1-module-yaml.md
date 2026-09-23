@@ -2055,6 +2055,29 @@ git commit -m "feat(drupal): resolve undeclared targets for every P1 relation"
 
 ---
 
+### Task 7b: Namespace the AST cache by the Drupal source (added during execution)
+
+Found while verifying Task 7: core keys an AST cache entry by graphify's version,
+a schema number and the file's content hash. A changed Drupal extractor moves
+none of them, so an unchanged YAML file kept the output of an older extractor —
+202 external nodes lost their labels until the cache was bypassed.
+
+**Files:**
+- Create: `graphify/drupal/fingerprint.py` — `drupal_fingerprint()`, SHA-1 of
+  `graphify/drupal/*.py`, 10 hex chars
+- Modify: `graphify/drupal/register.py` — `_patch_cache` on `graphify.cache`
+  rewrites `_EXTRACTOR_VERSION` to `<version>+drupal.<fingerprint>`, once;
+  `DrupalSeamError` if the attribute disappears
+- Test: `tests/test_drupal_cache.py`
+
+The value is read when `cache_dir()` resolves the directory, so patching the
+module attribute is enough; core's `_cleanup_stale_ast_entries` removes the
+previous namespace. Only the AST cache moves — the semantic (LLM) cache is not
+version-namespaced and is untouched. Verified through the CLI: the cache lands in
+`v0.9.65+drupal.<hash>-s4/`, and a second run reuses it.
+
+---
+
 ### Task 8: Verify against the reference corpus
 
 The spec's nine acceptance criteria, as a test that runs only where the corpus
