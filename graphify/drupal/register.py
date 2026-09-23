@@ -152,7 +152,29 @@ def _register_resolvers() -> None:
     )
 
 
+def _patch_cache(cache: ModuleType) -> None:
+    """Namespace core's AST cache by this package's source as well as graphify's version.
+
+    Core keys an AST entry by graphify's version, a schema number and the file's
+    content. A changed Drupal extractor moves none of them, so an unchanged
+    `*.services.yml` would keep the nodes an older extractor made. The value is
+    read when the cache directory is resolved, so rewriting it here is enough.
+    """
+    from graphify.drupal.fingerprint import drupal_fingerprint
+
+    version = getattr(cache, "_EXTRACTOR_VERSION", None)
+    if not isinstance(version, str):
+        raise DrupalSeamError(
+            "graphify.cache._EXTRACTOR_VERSION is missing or not a string — the AST "
+            "cache namespace changed upstream; graphify/drupal/register.py must be updated"
+        )
+    if "+drupal." in version:
+        return
+    cache._EXTRACTOR_VERSION = f"{version}+drupal.{drupal_fingerprint()}"
+
+
 _PATCHERS = {
+    "graphify.cache": _patch_cache,
     "graphify.detect": _patch_detect,
     "graphify.extract": _patch_extract,
 }
