@@ -485,7 +485,7 @@ and why divergence between the two is recorded rather than resolved.
 `detect.classify_file()` runs before any PHP is parsed, so a learned YAML pattern
 must exist before the first file is classified. The registry is therefore
 **built at the start of every `detect`** (a wrapper on `detect.detect`), from
-`*.services.yml` and plugin-manager classes only — about 2–3 s on the reference
+`*.services.yml` and plugin-manager classes only — about 3 s on the reference
 corpus (P2a spec §8).
 
 `graphify-out/drupal-discovery.json` is an **output**, not an input. It is never
@@ -508,12 +508,16 @@ Scope rules:
   (`core/lib/Drupal.php`) at, below (`web/`, `docroot/`) or above the scan
   root, or a `*.info.yml` directly in the scan root; any other tree is not
   walked, gets no registry file and no inventory;
-- the walk honours core's ignore rules (`graphify.detect.ignored_predicate`
-  with `detect`'s own `extra_excludes` and `gitignore`), so an ignored module
-  defines no type. On a Drupal tree this costs one extra ignore evaluation per
-  ignored directory. A composer-managed site usually gitignores `web/core` and
-  `web/modules/contrib`; measuring such a site needs `--no-gitignore`
-  (P2a spec §8);
+- the registry is knowledge about the site, not graph content: the walk
+  honours explicit user intent — `.graphifyignore` and `--exclude` — and core's
+  noise-dir pruning (`graphify.detect.ignored_predicate` with `gitignore=False`),
+  so an ignored module defines no type, but it does **not** honour
+  `.gitignore`, by design: a composer-managed site gitignores `web/core` and
+  `web/modules/contrib`, which define almost every plugin type. The graph
+  still honours `.gitignore`; an edge from a custom file to a type defined in
+  an ignored tree points at a materialised (`missing: true`) type node. The
+  predicate is asked only about directories and the files the registry
+  collects;
 - when the web root is an **ancestor** of the scan root, the registry walks the
   web root, outside the scan root, and those paths are not subject to the
   scan's ignore rules (core's predicate is anchored at the scan root).

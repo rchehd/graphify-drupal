@@ -142,15 +142,23 @@ so they obey the same "a file owns its nodes" rule as everything else.
    does; else none — the scan root is used alone and the inventory records
    `no_drupal_core`.
 
-   **Scope.** The walk honours core's ignore rules
-   (`graphify.detect.ignored_predicate` with `detect`'s `extra_excludes` and
-   `gitignore`): an ignored directory is never descended, an ignored file never
-   read. On a Drupal tree this costs one extra ignore evaluation per ignored
-   directory. When the web root is an ancestor of the scan root the walk covers
-   the web root, outside the scan root, and those paths are not subject to the
-   scan's ignore rules (the predicate is anchored at the scan root). A
-   composer-managed site that gitignores `web/core` and `web/modules/contrib`
-   learns only its custom managers unless run with `--no-gitignore` (§8).
+   **Scope.** The registry is knowledge about the site, not graph content. Its
+   walk honours explicit user intent — `.graphifyignore`, `--exclude`
+   (`extra_excludes`) — and core's noise-dir pruning, through
+   `graphify.detect.ignored_predicate(root, extra_excludes=…, gitignore=False)`,
+   but **not `.gitignore`**, by design and whatever `detect`'s `gitignore` says:
+   a composer-managed site gitignores `web/core` and `web/modules/contrib`,
+   which define almost every plugin type. The graph itself still honours
+   `.gitignore`; a `plugin_of_type` edge from a custom file to a type defined
+   in an ignored tree points at a materialised type node (`missing: true`,
+   labelled by the type's name). An ignored directory is never descended; the
+   predicate is asked only about directories before descending and about the
+   files the registry collects (`*.info.yml`, `*.services.yml`,
+   `src/**/*Manager.php`, `*ServiceProvider.php`, extension-root `*.yml`), never
+   about every walked file. When the web root is an ancestor of the scan root
+   the walk covers the web root, outside the scan root, and those paths are not
+   subject to the scan's ignore rules (the predicate is anchored at the scan
+   root).
 2. **Extensions.** Every `<name>.info.yml` gives a machine name and directory;
    PSR-4 maps `Drupal\<name>\` → `<dir>/src`, `Drupal\Core\` →
    `core/lib/Drupal/Core`, `Drupal\Component\` → `core/lib/Drupal/Component`.
@@ -306,13 +314,12 @@ missing.
 ## 8. Measured
 
 On `/home/user/Projects/FormsRemote`, 2026-09-23 (plan Tasks 2 and 9; the corpus
-acceptance tests are `tests/test_drupal_corpus.py::test_p2a_*`). Everything is
-measured with `--no-gitignore` (`prepare_run(..., gitignore=False)`) unless
-stated, because of the first row.
+acceptance tests are `tests/test_drupal_corpus.py::test_p2a_*`), on a default
+run: the corpus's `.gitignore` lists `/web/core` and `/web/modules/contrib`,
+which the registry does not honour (§5.1 Scope).
 
 | Measured | Value |
 |---|---|
-| types with the corpus's own `.gitignore` honoured (the default) | **2** — `system_type`, `webform_integration_type`, both custom; no `yaml_name`, so no P1 node gets `plugin_of_type` (`.gitignore` lists `/web/core` and `/web/modules/contrib`) |
 | plugin types | 143: 140 registered, 3 second-net |
 | distinct manager classes behind them | 121: 118 registered, 3 second-net (5 classes back several services: `ViewsPluginManager`/`ViewsHandlerManager` 23 `views.*`, `MigratePluginManager` 2, `KeyPluginManager` 3, `BetterExposedFiltersWidgetManager` 3) |
 | `discovery` | annotation 76, mixed 35, yaml 20, attribute 9, dynamic 3 |
@@ -325,8 +332,8 @@ stated, because of the first row.
 | P1 plugin nodes with one `plugin_of_type` target (criterion 4) | 924 of 924 |
 | `drupal_plugin` attributes outside §4.1 (criterion 5) | none |
 | full `detect` inventory summary | unrecognised 4 families / 4 files (`permission`, `plugin_type`, `service`, `starterkit`), deferred 285 files (`component` 33, `migrations` 252), filtered 897 |
-| `build_registry` (criterion 8) | 2.0–3.0 s (load ≈ 3.5 on 14 cores); 2.4–2.5 s in Task 2 at lower load |
-| `prepare_run` (what `detect` pays), whole tree | ≈ 5 s: the build plus core's ignore predicate on every walked file and directory; ≈ 0.8 s with the `.gitignore` honoured |
+| `build_registry` | 2.0–3.0 s (load ≈ 3.5 on 14 cores); 2.4–2.5 s in Task 2 at lower load |
+| `prepare_run`, what `detect` pays (criterion 8) | 2.6–3.7 s at the same load. Before the Task 9 fixes: ≈ 5 s, from core's ignore predicate on every walked file (now only directories and collected files) and the pure-Python YAML loader on the services files (now libyaml, falling back to P1's loader) |
 
 Differences from §2, and why:
 
