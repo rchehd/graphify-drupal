@@ -14,12 +14,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+from graphify.drupal.yaml_access import extract_drupal_permissions, extract_drupal_routing
 from graphify.drupal.yaml_extract import extract_drupal_info
 from graphify.drupal.yaml_services import extract_drupal_services
 
 FAMILY_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".info.yml": extract_drupal_info,
     ".services.yml": extract_drupal_services,
+    ".permissions.yml": extract_drupal_permissions,
+    ".routing.yml": extract_drupal_routing,
 }
 
 

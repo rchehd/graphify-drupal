@@ -85,6 +85,7 @@ def test_drupal_info_yaml_is_not_treated_as_a_secret_store():
     assert detect._is_sensitive(Path("/p/web/modules/contrib/token/token.info.yml")) is False
     assert detect._is_sensitive(Path("/p/web/modules/custom/foo/foo.info.yml")) is False
     assert detect._is_sensitive(Path("/p/web/modules/contrib/token/token.services.yml")) is False
+    assert detect._is_sensitive(Path("/p/web/modules/contrib/token/token.routing.yml")) is False
 
 
 def test_real_secret_stores_are_still_caught():
