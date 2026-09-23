@@ -44,10 +44,8 @@ def test_a_split_patch_emits_one_node_and_overrides_keys(tmp_path):
     assert cfg["realm"] == "custom"
     assert "_rank" not in cfg
 
-    [override, contains] = [e for e in result["edges"] if e["relation"] == "overrides_config"], \
-        [e for e in result["edges"] if e["relation"] == "contains"]
-    [override] = override
-    [contains] = contains
+    [override] = [e for e in result["edges"] if e["relation"] == "overrides_config"]
+    [contains] = [e for e in result["edges"] if e["relation"] == "contains"]
     assert override["source"] == config_id("config_split.config_split.prod")
     assert override["target"] == config_id("domain.record.forms_public")
     assert override["override_source"] == "split"
