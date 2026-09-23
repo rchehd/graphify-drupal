@@ -160,7 +160,8 @@ class _Builder:
         self.types: dict[str, PluginType] = {}
         self._classes: dict[str, tuple[Path, PhpClass] | None] = {}
         self._reaches: dict[str, bool] = {}
-        self._parse_errors: set[str] = set()
+        self._noted: set[tuple[str, str, str]] = set()
+        self._psr4_misses: set[str] = set()
         self.psr4: list[tuple[str, Path]] = []
         for ext, directory in walk.extensions.items():
             if ext != "core":
@@ -174,13 +175,14 @@ class _Builder:
     # -- recording -----------------------------------------------------------
 
     def note(self, cls: str, file: str, reason: str) -> None:
-        self.unresolved.append({"class": cls, "file": file, "reason": reason})
+        """Record an entry once: a class backing several services is one problem."""
+        key = (cls, file, reason)
+        if key not in self._noted:
+            self._noted.add(key)
+            self.unresolved.append({"class": cls, "file": file, "reason": reason})
 
     def parse_error(self, path: Path) -> None:
-        key = path.as_posix()
-        if key not in self._parse_errors:
-            self._parse_errors.add(key)
-            self.note("", key, "parse_error")
+        self.note("", path.as_posix(), "parse_error")
 
     # -- classes -------------------------------------------------------------
 
@@ -191,21 +193,25 @@ class _Builder:
                 return directory / (rest.replace("\\", "/") + ".php") if rest else None
         return None
 
-    def psr4_file_exists(self, fqcn: str) -> bool:
-        path = self.psr4_path(fqcn)
-        return path is not None and path.is_file()
+    def psr4_missed(self, fqcn: str) -> bool:
+        """True when PSR-4 found no file for `fqcn`, or a file declaring another class."""
+        return fqcn in self._psr4_misses
 
     def lookup(self, fqcn: str) -> tuple[Path, PhpClass] | None:
         if fqcn in self._classes:
             return self._classes[fqcn]
         self._classes[fqcn] = None
         path = self.psr4_path(fqcn)
-        if path is not None and path.is_file():
-            cls = read_php_class(path)
-            if cls is None:
-                self.parse_error(path)
-            elif cls.fqcn == fqcn:
-                self._classes[fqcn] = (path, cls)
+        if path is None or not path.is_file():
+            self._psr4_misses.add(fqcn)
+            return None
+        cls = read_php_class(path)
+        if cls is None:
+            self.parse_error(path)
+        elif cls.fqcn == fqcn:
+            self._classes[fqcn] = (path, cls)
+        else:
+            self._psr4_misses.add(fqcn)
         return self._classes[fqcn]
 
     def remember(self, path: Path, cls: PhpClass) -> None:
@@ -270,7 +276,8 @@ class _Builder:
         dynamic = facts.pop("_dynamic", False)
         deferred = facts["deferred_to"]
         if deferred and facts["discovery"] == "dynamic":
-            # Both deferred families are YAML-defined; P5/P6 read them, not a guess here.
+            # Deferred types are listed as deferred, not as unresolved; both deferred
+            # families are YAML-defined and P5/P6 read them.
             facts["discovery"] = "yaml"
         elif dynamic:
             self.note(cls.fqcn, manager_file, "dynamic_discovery")
@@ -314,7 +321,7 @@ def _facts(chain: list[PhpClass]) -> dict[str, Any]:
             facts["annotation_class"] = arg.value.lstrip("\\")
     facts["alter_hook"] = next((c.alter_info for c in chain if c.alter_info), "") or ""
 
-    source = next((c for c in chain if c.has_get_discovery), None)
+    source = next((c for c in chain if c.has_get_discovery or c.construct_discoveries), None)
     manager = chain[0].fqcn
     directory_discovery = False
     if source is None:
@@ -323,7 +330,10 @@ def _facts(chain: list[PhpClass]) -> dict[str, Any]:
     else:
         kinds: set[str] = set()
         literal = True
-        for d in source.discoveries:
+        # A getDiscovery() override that builds discoveries wins; a manager that
+        # assigns `$this->discovery` in its constructor is read the same way.
+        built = source.discoveries or source.construct_discoveries
+        for d in built:
             short = _short(d.cls)
             if short == "YamlDiscovery" or short == "YamlDiscoveryDecorator":
                 index = 0 if short == "YamlDiscovery" else 1
@@ -396,7 +406,7 @@ def _read_services(builder: _Builder, path: Path) -> set[str]:
             continue
         found = builder.lookup(fqcn)
         if found is None:
-            if fqcn not in reached and not builder.psr4_file_exists(fqcn):
+            if builder.psr4_missed(fqcn):
                 builder.note(fqcn, path.as_posix(), "psr4_unresolved")
             reached.add(fqcn)
             continue

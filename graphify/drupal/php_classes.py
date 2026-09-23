@@ -50,6 +50,7 @@ class PhpClass:
     has_get_discovery: bool
     discoveries: tuple[Discovery, ...]       # every `new …Discovery…(...)` inside getDiscovery()
     alter_info: str | None                   # literal of `$this->alterInfo('x')` anywhere in the class
+    construct_discoveries: tuple[Discovery, ...] = ()   # every `new …Discovery…(...)` inside __construct
 
 
 def resolve_name(name: str, namespace: str, uses: dict[str, str]) -> str:
@@ -126,6 +127,7 @@ def read_php_class(path: Path) -> PhpClass | None:
         )
 
     construct_args: tuple[Arg, ...] | None = None
+    construct_discoveries: tuple[Discovery, ...] = ()
     has_get_discovery = False
     discoveries: tuple[Discovery, ...] = ()
     alter_info: str | None = None
@@ -135,6 +137,7 @@ def read_php_class(path: Path) -> PhpClass | None:
         if ctor is not None:
             ctor_body = ctor.child_by_field_name("body")
             if ctor_body is not None:
+                construct_discoveries = _collect_discoveries(ctor_body, namespace, uses)
                 parent_call = next(
                     (
                         n
@@ -156,24 +159,8 @@ def read_php_class(path: Path) -> PhpClass | None:
         has_get_discovery = discovery_method is not None
         if discovery_method is not None:
             discovery_body = discovery_method.child_by_field_name("body")
-            found_discoveries: list[Discovery] = []
             if discovery_body is not None:
-                for node in _walk(discovery_body):
-                    if node.type != "object_creation_expression":
-                        continue
-                    name_children = [c for c in node.named_children if c.type in ("name", "qualified_name")]
-                    if not name_children:
-                        continue
-                    raw_name = _text(name_children[0])
-                    resolved = resolve_name(raw_name, namespace, uses)
-                    short = resolved.rsplit("\\", 1)[-1]
-                    if "Discovery" not in short:
-                        continue
-                    args_node = next((c for c in node.children if c.type == "arguments"), None)
-                    found_discoveries.append(
-                        Discovery(cls=resolved, args=_build_args(args_node, namespace, uses))
-                    )
-            discoveries = tuple(found_discoveries)
+                discoveries = _collect_discoveries(discovery_body, namespace, uses)
 
         alter_call = next(
             (
@@ -203,7 +190,27 @@ def read_php_class(path: Path) -> PhpClass | None:
         has_get_discovery=has_get_discovery,
         discoveries=discoveries,
         alter_info=alter_info,
+        construct_discoveries=construct_discoveries,
     )
+
+
+def _collect_discoveries(
+    body: "tree_sitter.Node", namespace: str, uses: dict[str, str]
+) -> tuple[Discovery, ...]:
+    """Every `new X(...)` in `body` whose short class name contains `Discovery`, outermost first."""
+    found: list[Discovery] = []
+    for node in _walk(body):
+        if node.type != "object_creation_expression":
+            continue
+        name_children = [c for c in node.named_children if c.type in ("name", "qualified_name")]
+        if not name_children:
+            continue
+        resolved = resolve_name(_text(name_children[0]), namespace, uses)
+        if "Discovery" not in resolved.rsplit("\\", 1)[-1]:
+            continue
+        args_node = next((c for c in node.children if c.type == "arguments"), None)
+        found.append(Discovery(cls=resolved, args=_build_args(args_node, namespace, uses)))
+    return tuple(found)
 
 
 def _find_class(node: "tree_sitter.Node", state: dict) -> None:

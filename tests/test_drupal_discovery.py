@@ -386,3 +386,84 @@ def test_unparsable_inputs_are_parse_errors(tmp_path):
         {"class": "", "file": (d / "foo.services.yml").as_posix(), "reason": "parse_error"},
         {"class": "", "file": (d / "src/BrokenManager.php").as_posix(), "reason": "parse_error"},
     ]
+
+
+CTOR_YAML_MANAGER = r"""<?php
+namespace Drupal\foo;
+use Drupal\Core\Plugin\Discovery\YamlDiscovery;
+class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  public function __construct($module_handler) {
+    $yaml_discovery = new YamlDiscovery('foo.contexts', $module_handler->getModuleDirectories());
+    $this->discovery = new ContainerDerivativeDiscoveryDecorator($yaml_discovery);
+    $this->alterInfo('foo_context_info');
+  }
+}
+"""
+
+
+def test_a_discovery_built_in_the_constructor_is_learned(tmp_path):
+    _site(tmp_path, _module("foo", FOO_SERVICES, {"src/FooManager.php": CTOR_YAML_MANAGER}))
+    r = build_registry(tmp_path)
+    t = r.types["foo"]
+    assert (t.discovery, t.yaml_name, t.alter_hook) == ("yaml", "foo.contexts", "foo_context_info")
+    assert list(r.by_yaml_name()) == ["foo.contexts"]
+    assert r.unresolved == []
+
+
+def test_get_discovery_wins_over_constructor_discoveries(tmp_path):
+    manager = r"""<?php
+namespace Drupal\foo;
+class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  public function __construct($module_handler) {
+    $this->discovery = new YamlDiscovery('from.ctor', $module_handler->getModuleDirectories());
+  }
+  protected function getDiscovery() {
+    return new YamlDiscovery('from.method', $this->moduleHandler->getModuleDirectories());
+  }
+}
+"""
+    _site(tmp_path, _module("foo", FOO_SERVICES, {"src/FooManager.php": manager}))
+    assert build_registry(tmp_path).types["foo"].yaml_name == "from.method"
+
+
+def test_a_file_declaring_another_class_is_psr4_unresolved(tmp_path):
+    services = "services:\n  foo.wrong:\n    class: Drupal\\foo\\Wrong\n"
+    wrong = "<?php\nnamespace Drupal\\other;\nclass Wrong extends \\Drupal\\Core\\Plugin\\DefaultPluginManager {}\n"
+    _site(tmp_path, _module("foo", services, {"src/Wrong.php": wrong}))
+    r = build_registry(tmp_path)
+    assert r.types == {}
+    assert r.unresolved == [{
+        "class": "Drupal\\foo\\Wrong",
+        "file": (tmp_path / "web/modules/custom/foo/foo.services.yml").as_posix(),
+        "reason": "psr4_unresolved",
+    }]
+
+
+def test_an_unreadable_service_class_is_a_parse_error(tmp_path):
+    services = "services:\n  foo.broken:\n    class: Drupal\\foo\\Broken\n"
+    _site(tmp_path, _module("foo", services, {"src/Broken.php": "<?php\ntrait Broken {}\n"}))
+    r = build_registry(tmp_path)
+    assert r.types == {}
+    assert r.unresolved == [{
+        "class": "",
+        "file": (tmp_path / "web/modules/custom/foo/src/Broken.php").as_posix(),
+        "reason": "parse_error",
+    }]
+
+
+def test_a_class_backing_several_services_is_recorded_once(tmp_path):
+    manager = r"""<?php
+namespace Drupal\foo;
+class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  protected function getDiscovery() { return $this->buildDiscovery(); }
+}
+"""
+    services = (
+        "services:\n"
+        "  plugin.manager.one:\n    class: Drupal\\foo\\FooManager\n"
+        "  plugin.manager.two:\n    class: Drupal\\foo\\FooManager\n"
+    )
+    _site(tmp_path, _module("foo", services, {"src/FooManager.php": manager}))
+    r = build_registry(tmp_path)
+    assert sorted(r.types) == ["one", "two"]
+    assert _reasons(r) == [("dynamic_discovery", "Drupal\\foo\\FooManager")]

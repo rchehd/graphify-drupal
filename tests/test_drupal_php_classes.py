@@ -115,3 +115,32 @@ def test_resolve_name():
     assert resolve_name("C", "N", uses) == "X\\Y"
     assert resolve_name("Local", "N", uses) == "N\\Local"
     assert resolve_name("Local", "", uses) == "Local"
+
+
+CTOR_DISCOVERY = r"""<?php
+namespace Drupal\m;
+use Drupal\Core\Plugin\Discovery\YamlDiscovery;
+class ContextManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  public function __construct($module_handler) {
+    $yaml_discovery = new YamlDiscovery('m.contexts', $module_handler->getModuleDirectories());
+    $this->discovery = new ContainerDerivativeDiscoveryDecorator($yaml_discovery);
+    $this->helper = new Helper();
+  }
+}
+"""
+
+
+def test_discoveries_built_in_the_constructor_are_read(tmp_path):
+    cls = read_php_class(_write(tmp_path, CTOR_DISCOVERY))
+    assert cls.has_get_discovery is False
+    assert cls.discoveries == ()
+    assert cls.construct_args is None
+    assert [d.cls for d in cls.construct_discoveries] == [
+        "Drupal\\Core\\Plugin\\Discovery\\YamlDiscovery",
+        "Drupal\\m\\ContainerDerivativeDiscoveryDecorator",
+    ]
+    assert cls.construct_discoveries[0].args[0] == Arg("string", "m.contexts")
+
+
+def test_a_class_without_constructor_discoveries_has_none(tmp_path):
+    assert read_php_class(_write(tmp_path, D11_MANAGER)).construct_discoveries == ()
