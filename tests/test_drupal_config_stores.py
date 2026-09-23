@@ -135,3 +135,24 @@ def test_every_extract_run_starts_with_fresh_store_caches(tmp_path):
     _touch(tmp_path, "config/sync/core.extension.yml", "module: {}\n")
     second = extract([path], cache_root=tmp_path / ".c2", root=tmp_path)
     assert config_id("system.site") in {n["id"] for n in second["nodes"]}
+
+
+def test_a_checkout_under_a_tests_directory_keeps_its_configuration(tmp_path):
+    """P1b final review minor: only a `tests` segment inside the Drupal tree excludes."""
+    root = _site(tmp_path / "home/ci/tests/checkout")
+    assert config_store(_touch(root, "config/sync/system.site.yml")).kind == "sync"
+    shipped = _touch(root, "web/modules/custom/foo/config/install/foo.settings.yml")
+    assert config_store(shipped).kind == "install"
+    fixture = _touch(root, "web/modules/custom/foo/tests/modules/foo_test/foo_test.info.yml",
+                     "name: T\ntype: module\n")
+    assert config_store(_touch(fixture.parent, "config/install/foo_test.settings.yml")) is None
+    assert config_store(_touch(root, "web/core/tests/fixtures/config/sync/core.extension.yml",
+                               "module: {}\n")) is None
+
+
+def test_an_unreadable_graphifyrc_is_no_override(tmp_path):
+    from graphify.drupal.config_stores import clear_caches
+
+    (tmp_path / ".graphifyrc").write_bytes(b"drupal.config.sync = \xff\xfe\n")
+    clear_caches()
+    assert config_store(_touch(tmp_path, "exported/system.site.yml")) is None

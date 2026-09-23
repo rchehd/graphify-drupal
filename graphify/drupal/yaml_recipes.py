@@ -20,6 +20,10 @@ from graphify.drupal.yaml_common import config_id, edge, load_drupal_yaml, node,
 from graphify.drupal.yaml_extract import extension_id
 
 
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
 def extract_drupal_recipe(path: Path, store: ConfigStore) -> dict[str, Any]:
     data, error = load_drupal_yaml(path)
     if error:
@@ -39,10 +43,11 @@ def extract_drupal_recipe(path: Path, store: ConfigStore) -> dict[str, Any]:
         pairs.add(target)
         edges.append(edge(rid, target, relation, path=path, line=1, **attrs))
 
-    for ext in data.get("install") or []:
+    # A bare string is malformed; iterating it would yield its characters.
+    for ext in _list(data.get("install")):
         if isinstance(ext, str) and ext:
             add(extension_id(ext), "installs_extension", target_name=ext)
-    for ref in data.get("recipes") or []:
+    for ref in _list(data.get("recipes")):
         if isinstance(ref, str) and ref:
             name = Path(ref).name
             add(recipe_id(name), "applies_recipe", target_name=name)

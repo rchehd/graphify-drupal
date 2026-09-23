@@ -161,6 +161,17 @@ def _config_object(path: Path, store: ConfigStore, name: str, data: dict) -> dic
     if store.kind == "recipe" and store.owner:
         edges.add(recipe_id(store.owner), own, "defines_config", install_mode="recipe")
 
+    # What a split splits is more specific than a dependency on it, so it goes first.
+    if type_ == "drupal_config_split":
+        for key in ("module", "theme"):
+            for ext in _names(data.get(key)):
+                edges.add(own, extension_id(ext), "splits_extension", target_name=ext)
+        for key, kind in (("complete_list", "complete"), ("partial_list", "partial")):
+            for target in _names(data.get(key)):
+                if "*" not in target:
+                    edges.add(own, config_id(target), "splits_config",
+                              split_kind=kind, target_name=target)
+
     # Enforced first: the same pair keeps the stronger relation.
     for kind, target, raw in _dependency_targets(deps.get("enforced")):
         edges.add(own, target, "enforced_dependency", dependency_kind=kind, target_name=raw)
@@ -175,16 +186,6 @@ def _config_object(path: Path, store: ConfigStore, name: str, data: dict) -> dic
                     edges.add(own, extension_id(str(ext)), "installs_extension",
                               target_name=str(ext),
                               weight=weight if isinstance(weight, int) else None)
-
-    if type_ == "drupal_config_split":
-        for key in ("module", "theme"):
-            for ext in _names(data.get(key)):
-                edges.add(own, extension_id(ext), "splits_extension", target_name=ext)
-        for key, kind in (("complete_list", "complete"), ("partial_list", "partial")):
-            for target in _names(data.get(key)):
-                if "*" not in target:
-                    edges.add(own, config_id(target), "splits_config",
-                              split_kind=kind, target_name=target)
 
     if store.kind == "split":
         edges.add(_split_source(store), own, "overrides_config",

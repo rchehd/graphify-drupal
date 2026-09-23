@@ -146,3 +146,17 @@ def test_malformed_config_reports_instead_of_raising(tmp_path):
     root = _site(tmp_path)
     result = extract_drupal_config(_touch(root, "config/sync/bad.yml", "a: [\n"))
     assert result["nodes"] == [] and "parse error" in result["error"]
+
+
+def test_a_split_that_also_depends_on_what_it_splits_keeps_the_split_relation(tmp_path):
+    """P1b final review minor: the more specific relation wins the pair."""
+    root = _site(tmp_path)
+    text = (
+        "id: dev\nstatus: false\nfolder: ../config/splits/dev\n"
+        "dependencies:\n  module:\n    - devel\n  config:\n    - devel.settings\n"
+        "module:\n  devel: 0\ntheme: {}\ncomplete_list:\n  - devel.settings\n"
+    )
+    result = extract_drupal_config(_touch(root, "config/sync/config_split.config_split.dev.yml", text))
+    by_target = {e["target"]: e["relation"] for e in result["edges"]}
+    assert by_target[extension_id("devel")] == "splits_extension"
+    assert by_target[config_id("devel.settings")] == "splits_config"

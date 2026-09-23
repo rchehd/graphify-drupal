@@ -309,6 +309,11 @@ def test_p1b_criterion_8_recipes(site_extraction):
     for e in site_extraction["edges"]:
         if e["relation"] == "config_action" and e.get("confidence") != "AMBIGUOUS":
             assert "${" not in repr(e), e
+    # A templated name is never an edge target, whatever the relation.
+    assert [e for e in site_extraction["edges"] if "${" in str(e.get("target_name", ""))] == []
+    # Three test-fixture recipes share a directory name with a core recipe (spec §9).
+    doubled = [n for n in recipes if len(n.get("declared_in") or []) == 2]
+    assert len(doubled) == 3, [n["id"] for n in doubled]
 
 
 def test_p1b_criterion_10_volume(site_extraction):

@@ -112,3 +112,9 @@ def test_a_templated_config_name_is_an_attribute_not_an_edge(tmp_path):
 def test_a_recipe_without_templated_names_has_no_templated_attribute(tmp_path):
     [recipe] = extract_drupal_config(_write(tmp_path))["nodes"]
     assert "templated_config" not in recipe
+
+
+def test_a_bare_string_install_or_recipes_list_is_not_split_into_characters(tmp_path):
+    """P1b final review minor: `install: node` is malformed, not n/o/d/e."""
+    result = extract_drupal_config(_write(tmp_path, "name: X\ninstall: node\nrecipes: blog\n"))
+    assert result["edges"] == []

@@ -47,13 +47,21 @@ def clear_caches() -> None:
 
 
 def _in_tests(path: Path) -> bool:
+    """True inside a Drupal test tree: a `tests` directory below an extension or core.
+
+    Only a `tests` segment with an extension (`*.info.yml`) or a `core` directory
+    above it counts, so a checkout that itself sits under some `…/tests/…`
+    directory keeps its configuration.
+    """
     parts = path.parts
     if "tests" not in parts:
         return False
     for i in range(len(parts) - len(_RECIPE_FIXTURES) + 1):
         if parts[i:i + len(_RECIPE_FIXTURES)] == _RECIPE_FIXTURES:
             return False
-    return True
+    # `_owner` is also true of a directory named `core`: Drupal core's own.
+    return any(part == "tests" and any(_owner(Path(*parts[:j])) for j in range(2, i + 1))
+               for i, part in enumerate(parts))
 
 
 @lru_cache(maxsize=None)
@@ -69,7 +77,11 @@ def _owner(extension_dir: Path) -> str:
 @lru_cache(maxsize=None)
 def _rc_sync_dirs_from(rc: Path) -> frozenset[Path]:
     dirs: set[Path] = set()
-    for raw in rc.read_text(encoding="utf-8").splitlines():
+    try:
+        text = rc.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return frozenset()  # unreadable: no override, as if absent
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
