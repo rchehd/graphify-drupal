@@ -596,6 +596,13 @@ def set_current(
     _current = registry
     _previous = previous
     _force_miss = frozenset(forced) if registry is not None else frozenset()
+    if registry is None:
+        # A non-Drupal run in the same process must not report a previous
+        # site's inventory (spec §5.7); deferred import avoids a cycle with
+        # inventory.py, which imports Registry/current_registry from here.
+        from graphify.drupal.inventory import set_current_inventory
+
+        set_current_inventory(None)
 
 
 def _sorted_types(types: list[PluginType]) -> list[PluginType]:

@@ -1,9 +1,9 @@
 """The single point where graphify.drupal touches graphify core.
 
 Nothing in core is edited. `install()` places a finder on `sys.meta_path` that
-wraps the loader for `graphify.detect` and `graphify.extract`, applying the patch
-immediately after each module finishes executing — and patches either directly if
-it is already in `sys.modules`.
+wraps the loader for `graphify.cache`, `graphify.detect`, `graphify.extract` and
+`graphify.report`, applying the patch immediately after each module finishes
+executing — and patches either directly if it is already in `sys.modules`.
 
 The hook exists rather than an eager `import graphify.extract` because
 `graphify/__init__.py` is deliberately lazy: importing it costs 1 ms, importing
@@ -86,11 +86,13 @@ def _patch_detect(detect: ModuleType) -> None:
         # `current_registry()`, and `prepare_run` is what makes that possible.
         def detect_(root, *, follow_symlinks=None, google_workspace=None,
                     extra_excludes=None, cache_root=None, gitignore=True):
-            from graphify.drupal.discovery import prepare_run
+            from graphify.drupal.discovery import current_registry, out_dir, prepare_run
+            from graphify.drupal.inventory import build_inventory, set_current_inventory, write_inventory
 
-            prepare_run(Path(root), cache_root,
+            root_path = Path(root)
+            prepare_run(root_path, cache_root,
                         extra_excludes=extra_excludes, gitignore=gitignore)
-            return original(
+            result = original(
                 root,
                 follow_symlinks=follow_symlinks,
                 google_workspace=google_workspace,
@@ -98,6 +100,20 @@ def _patch_detect(detect: ModuleType) -> None:
                 cache_root=cache_root,
                 gitignore=gitignore,
             )
+            # Built from the same file list detect() just returned (every
+            # "files" category plus "unclassified"), after the scan so every
+            # category is known (spec §5.7). No registry -> no inventory, same
+            # as prepare_run's own "not a Drupal tree" outcome.
+            registry = current_registry()
+            if registry is not None:
+                detected: set[str] = set()
+                for paths in (result.get("files") or {}).values():
+                    detected.update(paths)
+                detected.update(result.get("unclassified") or [])
+                inventory = build_inventory(registry, detected, root_path)
+                write_inventory(inventory, out_dir(root_path, cache_root))
+                set_current_inventory(inventory)
+            return result
         detect_.__name__ = detect_.__qualname__ = "detect"
         detect_.__doc__ = original.__doc__
         return detect_
@@ -358,10 +374,41 @@ def _patch_cache(cache: ModuleType) -> None:
     cache._EXTRACTOR_VERSION = f"{version}+drupal.{drupal_fingerprint()}"
 
 
+def _patch_report(report: ModuleType) -> None:
+    """Append the "Drupal coverage" section to `report.generate`'s output."""
+    if not callable(getattr(report, "generate", None)):
+        raise DrupalSeamError(
+            "graphify.report.generate is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _generate(original):
+        def generate_(*args, **kwargs):
+            text = original(*args, **kwargs)
+            from graphify.drupal.discovery import out_dir
+            from graphify.drupal.inventory import current_inventory, load_inventory, render_section
+
+            root = kwargs.get("root")
+            if root is None and len(args) > 8:
+                root = args[8]
+            inventory = current_inventory()
+            if inventory is None and root is not None:
+                inventory = load_inventory(out_dir(Path(root)))
+            if inventory is None:
+                return text
+            return text + "\n" + render_section(inventory)
+        generate_.__name__ = generate_.__qualname__ = "generate"
+        generate_.__doc__ = original.__doc__
+        return generate_
+
+    _wrap(report, "generate", _generate)
+
+
 _PATCHERS = {
     "graphify.cache": _patch_cache,
     "graphify.detect": _patch_detect,
     "graphify.extract": _patch_extract,
+    "graphify.report": _patch_report,
 }
 
 
