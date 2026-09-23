@@ -580,7 +580,8 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
         )
         os.environ[ENV_VAR] = str(target.absolute())
     except OSError:
-        pass
+        # A worker must not read an earlier run's registry through a stale path.
+        os.environ.pop(ENV_VAR, None)
 
     set_current(registry, previous)
     return registry
