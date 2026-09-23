@@ -544,12 +544,18 @@ _REGISTRY_FILENAME = "drupal-discovery.json"
 
 _current: Registry | None = None
 _previous: Registry | None = None
+_force_miss: frozenset[str] = frozenset()
 
 # current_registry() caches the file it loads from ENV_VAR by (path, mtime), so
 # a worker process that calls it many times over one run reads the file once.
 _env_cache_path: str | None = None
 _env_cache_mtime: float | None = None
 _env_cache_registry: Registry | None = None
+_env_cache_force_miss: frozenset[str] = frozenset()
+
+#: The registry file's key for `force_miss()`, read by a spawned worker. It is
+#: not part of `Registry`: next run's `from_json` ignores it.
+_FORCE_MISS_KEY = "force_miss"
 
 
 def out_dir(root: Path, cache_root: Path | None = None) -> Path:
@@ -568,11 +574,97 @@ def out_dir(root: Path, cache_root: Path | None = None) -> Path:
     return out if out.is_absolute() else Path(location).resolve() / out
 
 
-def set_current(registry: Registry | None, previous: Registry | None = None) -> None:
-    """Set this process's in-memory registry (and the prior run's, if any)."""
-    global _current, _previous
+def set_current(
+    registry: Registry | None,
+    previous: Registry | None = None,
+    forced: frozenset[str] = frozenset(),
+) -> None:
+    """Set this process's in-memory registry (and the prior run's, if any),
+    with the files this run must re-extract because the registry changed."""
+    global _current, _previous, _force_miss
     _current = registry
     _previous = previous
+    _force_miss = frozenset(forced) if registry is not None else frozenset()
+
+
+def _sorted_types(types: list[PluginType]) -> list[PluginType]:
+    return sorted(types, key=lambda t: t.plugin_type)
+
+
+def affected_files(previous: Registry | None, current: Registry | None) -> set[str]:
+    """Absolute paths whose extraction depends on what changed between two registries.
+
+    For every `yaml_name` whose type was added, removed or changed in any field,
+    the extension-root files `*.<yaml_name>.yml` of either registry (its plugins
+    are typed by it); for every manager class file whose types changed, that
+    file (it carries the type nodes). Empty when there is no previous registry:
+    a first run extracts everything anyway.
+    """
+    if previous is None:
+        return set()
+    current = current if current is not None else Registry(web_root=None)
+    result: set[str] = set()
+
+    old_families, new_families = previous.by_yaml_name(), current.by_yaml_name()
+    suffixes = tuple(
+        f".{name}.yml" for name in sorted(old_families.keys() | new_families.keys())
+        if old_families.get(name) != new_families.get(name)
+    )
+    if suffixes:
+        for path in (*previous.root_yaml, *current.root_yaml):
+            if Path(path).name.endswith(suffixes):
+                result.add(path)
+
+    old_files, new_files = previous.by_class_file(), current.by_class_file()
+    for path in old_files.keys() | new_files.keys():
+        if _sorted_types(old_files.get(path, [])) != _sorted_types(new_files.get(path, [])):
+            result.add(path)
+    return result
+
+
+def force_miss() -> frozenset[str]:
+    """The files this run must not serve from the AST cache (spec §5.5).
+
+    Set by `prepare_run` in the process that ran `detect()`. A spawned
+    extraction worker has no in-process state, so it reads the set from the
+    registry file `ENV_VAR` names -- core's worker checks the cache again
+    before extracting, and a stale hit there would undo the parent's miss.
+    """
+    if _current is not None:
+        return _force_miss
+    _load_env_file()
+    return _env_cache_force_miss
+
+
+def _load_env_file() -> None:
+    """Load ENV_VAR's registry file into the (path, mtime) cache, or clear it."""
+    global _env_cache_path, _env_cache_mtime, _env_cache_registry, _env_cache_force_miss
+    path = os.environ.get(ENV_VAR)
+    mtime: float | None = None
+    if path:
+        try:
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            mtime = None
+    if mtime is None:
+        _env_cache_path = _env_cache_mtime = _env_cache_registry = None
+        _env_cache_force_miss = frozenset()
+        return
+    if (
+        _env_cache_registry is not None
+        and _env_cache_path == path
+        and _env_cache_mtime == mtime
+    ):
+        return
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        registry = Registry.from_json(data)
+    except (OSError, ValueError, TypeError, KeyError):
+        _env_cache_path = _env_cache_mtime = _env_cache_registry = None
+        _env_cache_force_miss = frozenset()
+        return
+    _env_cache_path, _env_cache_mtime, _env_cache_registry = path, mtime, registry
+    _env_cache_force_miss = frozenset(str(p) for p in data.get(_FORCE_MISS_KEY) or [])
 
 
 def current_registry() -> Registry | None:
@@ -583,29 +675,10 @@ def current_registry() -> Registry | None:
     most one read. Returns None when neither is available, or the file cannot
     be read/parsed.
     """
-    global _env_cache_path, _env_cache_mtime, _env_cache_registry
     if _current is not None:
         return _current
-    path = os.environ.get(ENV_VAR)
-    if not path:
-        return None
-    try:
-        mtime = os.stat(path).st_mtime
-    except OSError:
-        return None
-    if (
-        _env_cache_registry is not None
-        and _env_cache_path == path
-        and _env_cache_mtime == mtime
-    ):
-        return _env_cache_registry
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    registry = Registry.from_json(data)
-    _env_cache_path, _env_cache_mtime, _env_cache_registry = path, mtime, registry
-    return registry
+    _load_env_file()
+    return _env_cache_registry
 
 
 def previous_registry() -> Registry | None:
@@ -625,6 +698,9 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
     permissions, ...) degrades to keeping the registry in-process only: no
     file is written, `ENV_VAR` is left untouched, and the run proceeds exactly
     as `build_registry` intends — never raising on bad input.
+
+    The files the change from the previous registry affects (`affected_files`)
+    become this run's `force_miss()` set, kept in process and in the file.
     """
     root = Path(root)
     target = out_dir(root, cache_root) / _REGISTRY_FILENAME
@@ -636,11 +712,13 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
         previous = None
 
     registry = build_registry(root)
+    forced = frozenset(affected_files(previous, registry))
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
-            json.dumps(registry.to_json(), sort_keys=True, indent=1),
+            json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced)},
+                       sort_keys=True, indent=1),
             encoding="utf-8",
         )
         os.environ[ENV_VAR] = str(target.absolute())
@@ -648,5 +726,5 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
         # A worker must not read an earlier run's registry through a stale path.
         os.environ.pop(ENV_VAR, None)
 
-    set_current(registry, previous)
+    set_current(registry, previous, forced)
     return registry

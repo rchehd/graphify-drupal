@@ -110,7 +110,7 @@ def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.config_stores import clear_caches
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor
-    from graphify.drupal.merge import _relative, collapse_drupal_duplicates, collision_group
+    from graphify.drupal.merge import collapse_drupal_duplicates, collision_group
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
@@ -186,25 +186,17 @@ def _patch_extract(extract: ModuleType) -> None:
             clear_caches()
             context = kwargs.get("resolution_context_nodes")
             if context:
-                # An incremental run: re-extract each collision group together
-                # (see merge.collision_group), and keep the pulled files out of
+                # An incremental run. Pull in the unchanged files a changed
+                # plugin registry affects (spec §5.5), then each collision group
+                # (see merge.collision_group), and keep every pulled file out of
                 # the read-only context, as core does for every file it extracts.
                 root = kwargs.get("root")
                 anchor = root if root is not None else cache_root
-                widened = collision_group(list(paths), context, anchor)
-                if len(widened) > len(paths):
-                    pulled = {
-                        _relative(str(p), Path(anchor) if anchor is not None else None)
-                        for p in widened[len(paths):]
-                    } | {str(p) for p in widened[len(paths):]}
-                    kwargs["resolution_context_nodes"] = [
-                        n for n in context if str(n.get("source_file")) not in pulled
-                    ] or None
-                    edges = kwargs.get("resolution_context_edges")
-                    if edges:
-                        kwargs["resolution_context_edges"] = [
-                            e for e in edges if str(e.get("source_file")) not in pulled
-                        ] or None
+                given = list(paths)
+                widened = collision_group(
+                    given + _registry_widening(given, context, anchor), context, anchor)
+                if len(widened) > len(given):
+                    _strip_context(kwargs, widened[len(given):], anchor)
                     paths = widened
             return original(paths, cache_root, **kwargs)
         extract_.__name__ = extract_.__qualname__ = "extract"
@@ -212,10 +204,98 @@ def _patch_extract(extract: ModuleType) -> None:
         return extract_
 
     _wrap(extract, "extract", _run)
+
+    # `from .cache import load_cached` binds the name when graphify.extract is
+    # imported. It is normally the wrapper already (graphify.cache is patched
+    # first), but not when graphify.extract was imported before install().
+    if not callable(getattr(extract, "load_cached", None)):
+        raise DrupalSeamError(
+            "graphify.extract.load_cached is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+    _wrap(extract, "load_cached", _force_miss_wrapper)
     # Registered here rather than in install() because the registry is imported
     # from graphify.extract's own dependency graph; doing it at this point keeps
     # install() free of any import of core.
     _register_resolvers()
+
+
+def _absolute(path, base: Path | None) -> Path:
+    """`path` made absolute against `base` (else the working directory), resolved."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = (Path(base) if base is not None else Path.cwd()) / p
+    return p.resolve()
+
+
+def _registry_widening(paths: list, context: list[dict], anchor) -> list[Path]:
+    """The `force_miss()` files an incremental batch must add (spec §5.5).
+
+    Only files that exist, are not in the batch, and have nodes in the
+    read-only context: those nodes are what the changed registry made stale.
+    A file with none needs nothing -- core re-queues a zero-node file itself,
+    and a file the scan excludes must not enter the graph through this door.
+    """
+    from graphify.drupal.discovery import force_miss
+
+    forced = force_miss()
+    if not forced:
+        return []
+    known = {_absolute(f, anchor) for f in {str(n.get("source_file") or "") for n in context} if f}
+    given = {_absolute(p, anchor) for p in paths}
+    out: list[Path] = []
+    for path in sorted(forced):
+        candidate = _absolute(path, anchor)
+        if candidate in known and candidate not in given and candidate.is_file():
+            out.append(candidate)
+    return out
+
+
+def _strip_context(kwargs: dict, pulled: list, anchor) -> None:
+    """Drop the pulled files' nodes and edges from the read-only context, in place.
+
+    Context entries carry `source_file` as core wrote it -- relative to the
+    anchor, or as given -- so both spellings are matched.
+    """
+    from graphify.drupal.merge import _relative
+
+    base = Path(anchor) if anchor is not None else None
+    names = {_relative(str(p), base) for p in pulled} | {str(p) for p in pulled}
+    for key in ("resolution_context_nodes", "resolution_context_edges"):
+        entries = kwargs.get(key)
+        if entries:
+            kwargs[key] = [e for e in entries if str(e.get("source_file")) not in names] or None
+
+
+def _force_miss_wrapper(original):
+    """`load_cached` that misses for this run's `force_miss()` files (spec §5.5).
+
+    The registry is deliberately not folded into `_EXTRACTOR_VERSION`: core
+    deletes every other version namespace, so any manager change would then
+    re-parse the whole project instead of the files it affects.
+    """
+    from graphify.drupal.discovery import force_miss
+
+    seen: frozenset[str] | None = None
+    resolved: frozenset[str] = frozenset()
+
+    def forced_paths() -> frozenset[str]:
+        # Resolved once per set: the wrapper runs for every file in a scan.
+        nonlocal seen, resolved
+        forced = force_miss()
+        if forced is not seen:
+            seen, resolved = forced, frozenset(Path(p).resolve().as_posix() for p in forced)
+        return resolved
+
+    def load_cached(path, root=Path("."), kind="ast", *args, **kwargs):
+        if kind == "ast":
+            forced = forced_paths()
+            if forced and _absolute(path, root).as_posix() in forced:
+                return None
+        return original(path, root, kind, *args, **kwargs)
+    load_cached.__name__ = load_cached.__qualname__ = "load_cached"
+    load_cached.__doc__ = original.__doc__
+    return load_cached
 
 
 def _register_resolvers() -> None:
@@ -247,8 +327,18 @@ def _patch_cache(cache: ModuleType) -> None:
     content. A changed Drupal extractor moves none of them, so an unchanged
     `*.services.yml` would keep the nodes an older extractor made. The value is
     read when the cache directory is resolved, so rewriting it here is enough.
+
+    `load_cached` is wrapped as well, so the files a changed plugin registry
+    affects miss the cache this run (see `_force_miss_wrapper`).
     """
     from graphify.drupal.fingerprint import drupal_fingerprint
+
+    if not callable(getattr(cache, "load_cached", None)):
+        raise DrupalSeamError(
+            "graphify.cache.load_cached is missing — the AST cache changed shape "
+            "upstream; graphify/drupal/register.py must be updated"
+        )
+    _wrap(cache, "load_cached", _force_miss_wrapper)
 
     version = getattr(cache, "_EXTRACTOR_VERSION", None)
     if not isinstance(version, str):
