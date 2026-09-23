@@ -272,7 +272,9 @@ def resolve_missing_targets(
             # The site installs an extension the code base does not contain.
             created[target]["missing"] = True
         if node_type == "drupal_plugin_type":
-            # A plugin type no manager in this corpus registered.
+            # A type no manager file in the graph defines. On a composer site
+            # that is mostly a type the registry knows but whose manager lives
+            # in gitignored core/contrib, which the graph leaves out.
             created[target]["missing"] = True
 
     all_nodes.extend(created.values())

@@ -197,3 +197,41 @@ def test_cli_writes_the_inventory_and_the_report_section(tmp_path):
     report = (root / "graphify-out" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
     assert "## Drupal coverage" in report
     assert "qux" in report
+
+
+def test_cluster_only_with_a_graph_in_another_out_dir_reports_coverage(tmp_path):
+    root = _coverage_site(tmp_path / "site")
+    out = tmp_path / "out"
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "extract", str(root), "--code-only", "--out", str(out)],
+        capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    graph = out / "graphify-out" / "graph.json"
+
+    # `cluster-only <site> --graph <out>/graphify-out/graph.json` writes the
+    # report beside that graph; the inventory is there too, not under <site>.
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "cluster-only", str(root), "--graph", str(graph),
+         "--no-label", "--no-viz"],
+        capture_output=True, text=True, cwd=tmp_path,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    report = (out / "graphify-out" / "GRAPH_REPORT.md").read_text(encoding="utf-8")
+    assert "## Drupal coverage" in report
+    assert "qux" in report
+
+
+def test_yaml_plugins_counts_only_the_entries_extraction_emits(tmp_path, _isolated_discovery_state):
+    install()
+    root = _site(tmp_path, {
+        **_module("foo", "services: {}\n"),
+        **_module("bar", BAR_SERVICES, {"src/BarManager.php": YAML_MANAGER}),
+        # A mapping and a null are plugins; a scalar and a list are skipped.
+        "web/modules/custom/foo/foo.bar.yml": "one: {}\ntwo: ~\nthree: 5\nfour: [a]\n",
+    })
+    registry = prepare_run(root)
+
+    inventory = build_inventory(registry, _detected_yaml(root), root)
+    assert inventory["summary"]["yaml_plugins"] == 2

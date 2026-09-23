@@ -42,12 +42,22 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
 def _patch_detect(detect: ModuleType) -> None:
     from graphify.drupal.families import is_drupal_file
 
-    for attr in ("classify_file", "FileType", "_is_graphable_source", "detect"):
+    # `ignored_predicate` is not wrapped but called by the registry walk
+    # (discovery._scan_predicate); `GRAPHIFY_OUT` is what `out_dir` resolves.
+    for attr in ("classify_file", "FileType", "_is_graphable_source", "detect",
+                 "detect_incremental", "ignored_predicate"):
         if not hasattr(detect, attr):
             raise DrupalSeamError(
                 f"graphify.detect.{attr} is missing — graphify core changed shape; "
                 "graphify/drupal/register.py must be updated"
             )
+    import graphify.paths as core_paths
+
+    if not isinstance(getattr(core_paths, "GRAPHIFY_OUT", None), str):
+        raise DrupalSeamError(
+            "graphify.paths.GRAPHIFY_OUT is missing or not a string — graphify core "
+            "changed shape; graphify/drupal/register.py must be updated"
+        )
 
     def _classify(original):
         def classify_file(path: Path):
@@ -110,15 +120,25 @@ def _patch_detect(detect: ModuleType) -> None:
             # must go too, or report.generate's file fallback would keep
             # reporting that site's coverage for a tree that is no longer
             # Drupal (or no longer scanned here) at all.
+            #
+            # Neither step may fail detect() (spec §5.8): an unwritable out dir
+            # (read-only checkout) keeps the inventory in process only.
             registry = current_registry()
             if registry is not None:
                 detected: set[str] = set()
                 for paths in (result.get("files") or {}).values():
                     detected.update(paths)
                 detected.update(result.get("unclassified") or [])
-                inventory = build_inventory(registry, detected, root_path)
-                write_inventory(inventory, out_dir(root_path, cache_root))
+                try:
+                    inventory = build_inventory(registry, detected, root_path)
+                except Exception:
+                    inventory = None
                 set_current_inventory(inventory)
+                if inventory is not None:
+                    try:
+                        write_inventory(inventory, out_dir(root_path, cache_root))
+                    except OSError:
+                        pass
             else:
                 set_current_inventory(None)
                 remove_inventory(out_dir(root_path, cache_root))
@@ -127,9 +147,30 @@ def _patch_detect(detect: ModuleType) -> None:
         detect_.__doc__ = original.__doc__
         return detect_
 
+    def _incremental(original):
+        # Core's detect_incremental calls detect() without a cache_root, so on
+        # `extract --out` the nested prepare_run would look for the previous
+        # registry (and write both files) under the scanned tree. Its
+        # `manifest_path` is `<out>/manifest.json` there: that directory is
+        # the out dir. The default manifest path carries no such information
+        # (it is relative to the working directory), so it changes nothing.
+        def detect_incremental_(root, *args, **kwargs):
+            from graphify.drupal.discovery import using_out_dir
+
+            manifest = args[0] if args else kwargs.get("manifest_path")
+            default = getattr(detect, "_MANIFEST_PATH", None)
+            if manifest is None or str(manifest) == str(default):
+                return original(root, *args, **kwargs)
+            with using_out_dir(Path(manifest).resolve().parent):
+                return original(root, *args, **kwargs)
+        detect_incremental_.__name__ = detect_incremental_.__qualname__ = "detect_incremental"
+        detect_incremental_.__doc__ = original.__doc__
+        return detect_incremental_
+
     _wrap(detect, "classify_file", _classify)
     _wrap(detect, "_is_graphable_source", _graphable)
     _wrap(detect, "detect", _detect)
+    _wrap(detect, "detect_incremental", _incremental)
 
 
 def _patch_extract(extract: ModuleType) -> None:
@@ -385,14 +426,36 @@ def _patch_cache(cache: ModuleType) -> None:
 
 def _patch_report(report: ModuleType) -> None:
     """Append the "Drupal coverage" section to `report.generate`'s output."""
-    if not callable(getattr(report, "generate", None)):
-        raise DrupalSeamError(
-            "graphify.report.generate is missing — graphify core changed shape; "
-            "graphify/drupal/register.py must be updated"
-        )
+    for attr in ("generate", "load_learning_for_report"):
+        if not callable(getattr(report, attr, None)):
+            raise DrupalSeamError(
+                f"graphify.report.{attr} is missing — graphify core changed shape; "
+                "graphify/drupal/register.py must be updated"
+            )
+
+    # The directory of the graph a caller is about to report on. `generate`
+    # is given only the scanned root, but every caller builds its `learning=`
+    # argument with `load_learning_for_report(<out>/graph.json)` just before,
+    # which names the out dir: `cluster-only <site> --graph <out>/.../graph.json`
+    # after `extract --out` keeps the inventory there, not under <site>.
+    noted: list[Path] = []
+
+    def _learning(original):
+        def load_learning_for_report(graph_path, *args, **kwargs):
+            try:
+                noted[:] = [Path(graph_path).parent]
+            except TypeError:
+                noted[:] = []
+            return original(graph_path, *args, **kwargs)
+        load_learning_for_report.__name__ = load_learning_for_report.__qualname__ = (
+            "load_learning_for_report")
+        load_learning_for_report.__doc__ = original.__doc__
+        return load_learning_for_report
 
     def _generate(original):
         def generate_(*args, **kwargs):
+            graph_out = noted[0] if noted else None
+            noted[:] = []
             text = original(*args, **kwargs)
             from graphify.drupal.discovery import out_dir
             from graphify.drupal.inventory import current_inventory, load_inventory, render_section
@@ -401,9 +464,11 @@ def _patch_report(report: ModuleType) -> None:
             if root is None and len(args) > 8:
                 root = args[8]
             inventory = current_inventory()
+            if inventory is None and graph_out is not None:
+                inventory = load_inventory(graph_out)
             if inventory is None and root is not None:
                 # No `cache_root` here: `out_dir(root)` is the default out dir
-                # under `root` itself, which is all every caller passes today.
+                # under `root` itself.
                 inventory = load_inventory(out_dir(Path(root)))
             if inventory is None:
                 return text
@@ -412,6 +477,7 @@ def _patch_report(report: ModuleType) -> None:
         generate_.__doc__ = original.__doc__
         return generate_
 
+    _wrap(report, "load_learning_for_report", _learning)
     _wrap(report, "generate", _generate)
 
 
@@ -427,6 +493,9 @@ def _patch_watch(watch: ModuleType) -> None:
     """
     from graphify.drupal.families import is_drupal_file
 
+    # `is_drupal_file` knows a learned family (`foo.bar.yml` read by a plugin
+    # manager) only once a detect() in this process has built the registry:
+    # until watch's first rebuild runs one, such a file is not recognised here.
     for attr in ("_batch_triggers_rebuild", "_has_non_code"):
         if not hasattr(watch, attr):
             raise DrupalSeamError(

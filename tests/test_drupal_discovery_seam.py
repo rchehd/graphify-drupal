@@ -232,3 +232,77 @@ def test_a_single_module_checkout_still_gets_its_type(tmp_path, _isolated_discov
     assert registry is not None
     assert "foo" in registry.types
     assert ("no_drupal_core", "") in {(u["reason"], u["class"]) for u in registry.unresolved}
+
+
+# -- an unwritable out dir (spec §5.8) -----------------------------------------
+
+
+@pytest.fixture
+def _read_only_site(tmp_path):
+    """A Drupal site whose root (and so its default graphify-out) cannot be written."""
+    root = _drupal_site(tmp_path / "site")
+    root.chmod(0o555)
+    yield root
+    root.chmod(0o755)
+
+
+def test_detect_on_a_read_only_site_returns_normally(_read_only_site, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.inventory import current_inventory
+
+    result = detect.detect(_read_only_site)
+
+    assert result["files"]
+    assert not (_read_only_site / "graphify-out").exists()
+    # The inventory is still built for this process's report.
+    assert current_inventory() is not None
+    assert current_inventory()["summary"]["types"] == 1
+
+
+def test_an_unwritable_out_dir_hands_workers_a_temp_registry(
+        _read_only_site, _isolated_discovery_state):
+    install()
+    import tempfile
+
+    import graphify.detect as detect
+    from graphify.drupal.discovery import Registry, current_registry
+
+    detect.detect(_read_only_site)
+    path = Path(os.environ[ENV_VAR])
+    try:
+        assert path.parent == Path(tempfile.gettempdir())
+        assert path.name.startswith("graphify-drupal-discovery-")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert Registry.from_json(data) == current_registry()
+        assert "force_miss" in data
+
+        # A second run replaces its own temp file rather than piling up another.
+        detect.detect(_read_only_site)
+        again = Path(os.environ[ENV_VAR])
+        assert again.is_file()
+        if again != path:
+            assert not path.exists()
+    finally:
+        Path(os.environ[ENV_VAR]).unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("attr", ["ignored_predicate", "detect_incremental"])
+def test_patch_detect_fails_loudly_when_a_seam_symbol_disappears(monkeypatch, attr):
+    install()
+    import graphify.detect as detect
+
+    monkeypatch.delattr(detect, attr, raising=True)
+    with pytest.raises(DrupalSeamError, match=rf"graphify\.detect\.{attr}"):
+        _patch_detect(detect)
+
+
+def test_patch_detect_fails_loudly_when_graphify_out_disappears(monkeypatch):
+    install()
+    import graphify.detect as detect
+    import graphify.paths as paths
+
+    monkeypatch.delattr(paths, "GRAPHIFY_OUT", raising=True)
+    with pytest.raises(DrupalSeamError, match=r"graphify\.paths\.GRAPHIFY_OUT"):
+        _patch_detect(detect)

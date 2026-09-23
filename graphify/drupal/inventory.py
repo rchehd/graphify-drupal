@@ -200,7 +200,9 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         data, error = load_drupal_yaml(Path(p))
         if error or not data:
             continue
-        yaml_plugin_count += len(data)
+        # Exactly what `extract_drupal_yaml_plugins` emits: a mapping or a null
+        # definition is a plugin; any other top-level value is skipped there.
+        yaml_plugin_count += sum(1 for v in data.values() if v is None or isinstance(v, dict))
 
     filtered = 0
     for p in detected:

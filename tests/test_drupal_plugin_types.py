@@ -189,3 +189,26 @@ def test_resolver_runs_without_php_suffix_regression_guard(tmp_path, _isolated_d
     assert by_id[extension_id("foo")]["label"] == "foo"
     assert service_id("plugin.manager.foo") in by_id
     assert by_id[service_id("plugin.manager.foo")]["missing"] is True
+
+
+ORPHAN_MANAGER = r"""<?php
+namespace Drupal\orphan;
+use Drupal\Core\Plugin\DefaultPluginManager;
+class OrphanManager extends DefaultPluginManager {
+  public function __construct($namespaces, $module_handler) {
+    parent::__construct('Plugin/Orphan', $namespaces, $module_handler);
+  }
+}
+"""
+
+
+def test_a_manager_outside_every_extension_defines_its_type_without_an_owner(
+        tmp_path, _isolated_discovery_state):
+    root = _site(tmp_path, {"web/src/OrphanManager.php": ORPHAN_MANAGER})
+    registry = prepare_run(root)
+    assert registry.types["class:Drupal\\orphan\\OrphanManager"].owner == ""
+
+    result = extract_plugin_types(root / "web/src/OrphanManager.php")
+    assert [n["type"] for n in result["nodes"]] == ["drupal_plugin_type"]
+    # No `defines_plugin_type` from `extension_id("")`: there is no owner.
+    assert result["edges"] == []

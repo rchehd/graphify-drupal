@@ -285,3 +285,38 @@ def test_only_files_already_in_the_graph_are_pulled_in(tmp_path, _isolated_disco
     context = [{"id": "a", "source_file": FOO_BAR_FILE}]
     assert _registry_widening([root / MANAGER], context, root) == [(root / FOO_BAR_FILE).resolve()]
     assert _registry_widening([root / FOO_BAR_FILE], context, root) == []
+
+
+# -- `extract --out`: the out dir is not the scanned tree ------------------------
+
+
+def _run_cli_out(root: Path, out: Path) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "extract", str(root), "--code-only", "--out", str(out)],
+        capture_output=True, text=True, cwd=root.parent,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads((out / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+
+
+def _drupal_files_in(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("drupal-*.json"))
+
+
+def test_an_incremental_run_with_out_uses_the_out_dir(tmp_path):
+    root = _bar_site(tmp_path / "site")
+    out = tmp_path / "out"
+    first = _run_cli_out(root, out)
+    assert set(_plugins_from(first, FOO_BAR_FILE)) == {plugin_id("bar", "one"), plugin_id("bar", "two")}
+
+    _rename_family(root)
+    second = _run_cli_out(root, out)
+
+    # Nothing of ours lands inside the project (core avoids that too, #1747) ...
+    assert _drupal_files_in(root) == []
+    assert (out / "graphify-out" / "drupal-discovery.json").is_file()
+    assert (out / "graphify-out" / "drupal-inventory.json").is_file()
+    # ... and the previous registry was found, so the rename moved the plugins.
+    assert _plugins_from(second, FOO_BAR_FILE) == {}
+    assert set(_plugins_from(second, FOO_BAZ_FILE)) == {plugin_id("bar", "three")}
+    assert _nodes(second)[type_id("bar")]["yaml_name"] == "baz"

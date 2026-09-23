@@ -11,11 +11,14 @@ never an exception.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
@@ -154,8 +157,11 @@ def extract_plugin_types(path: Path) -> dict[str, Any]:
                 attrs[key] = value
         nodes.append(node(tid, t.plugin_type, type="drupal_plugin_type", layer="plugin",
                           path=path, line=t.line, **attrs))
-        edges.append(edge(extension_id(t.owner), tid, "defines_plugin_type", path=path,
-                          line=t.line, owner=t.owner, target_name=t.plugin_type))
+        if t.owner:
+            # A second-net manager outside every extension has no owner; an
+            # edge from `extension_id("")` would invent one.
+            edges.append(edge(extension_id(t.owner), tid, "defines_plugin_type", path=path,
+                              line=t.line, owner=t.owner, target_name=t.plugin_type))
         if t.registered:
             edges.append(edge(service_id(t.manager_service), tid, "plugin_manager_for",
                               path=path, line=t.line, source_name=t.manager_service,
@@ -649,6 +655,35 @@ _env_cache_force_miss: frozenset[str] = frozenset()
 _FORCE_MISS_KEY = "force_miss"
 
 
+#: Prefix of the private temp file a worker reads the registry from when the
+#: out dir cannot be written (see `_write_temp_registry`).
+_TEMP_PREFIX = "graphify-drupal-discovery-"
+
+_log = logging.getLogger(__name__)
+_warned_unwritable = False
+
+#: The out dir a caller fixed for the duration of a call (`using_out_dir`).
+_out_override: Path | None = None
+
+
+@contextmanager
+def using_out_dir(path: Path) -> Iterator[None]:
+    """Make `out_dir()` return `path` until the block exits (re-entrant).
+
+    `detect_incremental` knows its out dir only through its `manifest_path`
+    and calls `detect()` without a `cache_root`; the seam wraps it in this so
+    the nested `prepare_run` and inventory land beside that manifest, where
+    the full run (which did get a `cache_root`) wrote them.
+    """
+    global _out_override
+    saved = _out_override
+    _out_override = Path(path)
+    try:
+        yield
+    finally:
+        _out_override = saved
+
+
 def out_dir(root: Path, cache_root: Path | None = None) -> Path:
     """The graphify-out directory for this run, matching core's own resolution.
 
@@ -656,10 +691,13 @@ def out_dir(root: Path, cache_root: Path | None = None) -> Path:
     Path(location).resolve() / _out`, where `location` is `cache_root` when
     given, else `root` — so a `GRAPHIFY_OUT` override (relative or absolute)
     and an `extract --out`-style `cache_root` land the registry file exactly
-    where the rest of graphify's output already goes.
+    where the rest of graphify's output already goes. Inside `using_out_dir`
+    the directory it names wins.
     """
     from graphify.paths import GRAPHIFY_OUT
 
+    if _out_override is not None:
+        return _out_override
     location = cache_root if cache_root is not None else root
     out = Path(GRAPHIFY_OUT)
     return out if out.is_absolute() else Path(location).resolve() / out
@@ -863,9 +901,9 @@ def prepare_run(
     if missing or unreadable), builds the new registry with `build_registry`
     (which never raises), and tries to write it back to that same path with
     sorted keys and one-space indent. A write failure (read-only tree,
-    permissions, ...) degrades to keeping the registry in-process only: no
-    file is written, `ENV_VAR` is left untouched, and the run proceeds exactly
-    as `build_registry` intends — never raising on bad input.
+    permissions, ...) never raises: the registry stays in process, and
+    `ENV_VAR` points at a private temp copy for spawned workers instead
+    (`_write_temp_registry`), or is removed if even that cannot be written.
 
     `extra_excludes` is `detect()`'s own: the walk honours the same
     `.graphifyignore`/`--exclude` rules and noise-dir pruning, so an ignored
@@ -879,6 +917,7 @@ def prepare_run(
     """
     root = Path(root)
     if not _looks_like_drupal(root):
+        _drop_temp_registry()
         os.environ.pop(ENV_VAR, None)
         set_current(None)
         return None
@@ -906,17 +945,57 @@ def prepare_run(
     registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore=False))
     forced = frozenset(affected_files(previous, registry) | carried)
 
+    payload = json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced)},
+                         sort_keys=True, indent=1)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced)},
-                       sort_keys=True, indent=1),
-            encoding="utf-8",
-        )
+        target.write_text(payload, encoding="utf-8")
+        _drop_temp_registry()
         os.environ[ENV_VAR] = str(target.absolute())
     except OSError:
-        # A worker must not read an earlier run's registry through a stale path.
-        os.environ.pop(ENV_VAR, None)
+        _write_temp_registry(payload)
 
     set_current(registry, previous, forced)
     return registry
+
+
+def _is_temp_registry(path: str | None) -> bool:
+    if not path:
+        return False
+    p = Path(path)
+    return p.name.startswith(_TEMP_PREFIX) and p.parent == Path(tempfile.gettempdir())
+
+
+def _drop_temp_registry() -> None:
+    """Delete the temp registry file ENV_VAR names, if it is one of ours."""
+    path = os.environ.get(ENV_VAR)
+    if _is_temp_registry(path):
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+
+
+def _write_temp_registry(payload: str) -> None:
+    """Point ENV_VAR at a private temp copy of the registry (the out dir is unwritable).
+
+    A spawn/forkserver worker (Python 3.14's Linux default, macOS's) inherits
+    nothing but the environment, so without a readable file it would have no
+    registry at all. The previous temp file this process made is replaced,
+    not accumulated. If even that fails, ENV_VAR is removed -- a worker must
+    never read an earlier run's registry through a stale path -- and the
+    degradation is logged once.
+    """
+    global _warned_unwritable
+    _drop_temp_registry()
+    try:
+        fd, name = tempfile.mkstemp(prefix=_TEMP_PREFIX, suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.environ[ENV_VAR] = name
+    except OSError:
+        os.environ.pop(ENV_VAR, None)
+        if not _warned_unwritable:
+            _warned_unwritable = True
+            _log.warning("graphify-drupal: the plugin registry could not be written "
+                         "anywhere; spawned extraction workers will run without it")
