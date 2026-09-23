@@ -14,7 +14,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class
@@ -189,14 +189,21 @@ class _Walk:
     root_yaml: list[str] = field(default_factory=list)
 
 
-def _walk(base: Path, core_dir: Path | None) -> _Walk:
+def _walk(base: Path, core_dir: Path | None,
+          is_ignored: Callable[[Path], bool] | None = None) -> _Walk:
+    """One pass over `base`. A directory `is_ignored` rejects is never descended,
+    and a file it rejects is never read -- the same scope `detect()` has."""
     found = _Walk()
     if core_dir is not None:
         found.extensions["core"] = core_dir.as_posix()
     for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = sorted(d for d in dirnames if d not in _PRUNED_DIRS and not d.startswith("."))
         directory = Path(dirpath)
-        names = sorted(filenames)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _PRUNED_DIRS and not d.startswith(".")
+            and not (is_ignored is not None and is_ignored(directory / d))
+        )
+        names = sorted(n for n in filenames if is_ignored is None or not is_ignored(directory / n))
         info = [n for n in names if is_drupal_info_yaml(Path(n))]
         exts = [extension_machine_name(Path(n)) for n in info]
         for ext in exts:
@@ -494,12 +501,16 @@ def _read_provider(builder: _Builder, path: Path) -> None:
         builder.note(cls.fqcn if cls else "", path.as_posix(), "service_provider_alter")
 
 
-def build_registry(scan_root: Path) -> Registry:
-    """Learn every plugin type the site's managers define. Never raises on bad input."""
+def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = None) -> Registry:
+    """Learn every plugin type the site's managers define. Never raises on bad input.
+
+    `is_ignored` (core's `detect.ignored_predicate` in the pipeline) keeps the
+    walk to what `detect()` scans; without it every file under the web root counts.
+    """
     scan_root = Path(scan_root).absolute()
     web_root = find_web_root(scan_root)
     base = web_root if web_root is not None else scan_root
-    walk = _walk(base, web_root / "core" if web_root is not None else None)
+    walk = _walk(base, web_root / "core" if web_root is not None else None, is_ignored)
     builder = _Builder(web_root, walk)
     if web_root is None:
         builder.note("", "", "no_drupal_core")
@@ -688,8 +699,56 @@ def previous_registry() -> Registry | None:
     return _previous
 
 
-def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
+def _scan_predicate(
+    root: Path, extra_excludes: list[str] | None, gitignore: bool,
+) -> Callable[[Path], bool]:
+    """Core's own "would detect() exclude this path?" for `root`.
+
+    Core anchors the predicate at the resolved root, while the registry walks
+    absolute but unresolved paths; a symlinked checkout is mapped across so
+    its ignore rules still apply.
+    """
+    from graphify.detect import ignored_predicate
+
+    resolved = Path(root).resolve()
+    predicate = ignored_predicate(resolved, extra_excludes=extra_excludes, gitignore=gitignore)
+    walked = Path(root).absolute()
+    if walked == resolved:
+        return predicate
+
+    def is_ignored(path: Path) -> bool:
+        try:
+            return predicate(resolved / Path(path).relative_to(walked))
+        except ValueError:
+            return predicate(path)
+    return is_ignored
+
+
+def _looks_like_drupal(root: Path) -> bool:
+    """A web root at, below or above `root`, or a `*.info.yml` directly in it."""
+    if find_web_root(root) is not None:
+        return True
+    try:
+        with os.scandir(root) as entries:
+            return any(e.is_file() and is_drupal_info_yaml(Path(e.name)) for e in entries)
+    except OSError:
+        return False
+
+
+def prepare_run(
+    root: Path,
+    cache_root: Path | None = None,
+    *,
+    extra_excludes: list[str] | None = None,
+    gitignore: bool = True,
+) -> Registry | None:
     """Build the registry for this run and make it visible to the pipeline.
+
+    Only a tree with a cheap Drupal marker gets one: a web root
+    (`find_web_root`), or a scan root that directly holds a `*.info.yml` (a
+    single extension checkout). Any other tree is not walked at all -- no
+    registry, no file, `ENV_VAR` removed, `set_current(None)` -- and None is
+    returned, so a non-Drupal repository pays nothing.
 
     Reads `<out>/drupal-discovery.json` as the previous run's registry (ignored
     if missing or unreadable), builds the new registry with `build_registry`
@@ -699,10 +758,18 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
     file is written, `ENV_VAR` is left untouched, and the run proceeds exactly
     as `build_registry` intends — never raising on bad input.
 
+    `extra_excludes` and `gitignore` are `detect()`'s own: the walk honours
+    the same `.graphifyignore`/`.gitignore`/`--exclude` rules and noise-dir
+    pruning, so an ignored module defines no type and is never descended.
+
     The files the change from the previous registry affects (`affected_files`)
     become this run's `force_miss()` set, kept in process and in the file.
     """
     root = Path(root)
+    if not _looks_like_drupal(root):
+        os.environ.pop(ENV_VAR, None)
+        set_current(None)
+        return None
     target = out_dir(root, cache_root) / _REGISTRY_FILENAME
 
     previous: Registry | None = None
@@ -711,7 +778,7 @@ def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
     except (OSError, ValueError, TypeError, KeyError):
         previous = None
 
-    registry = build_registry(root)
+    registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore))
     forced = frozenset(affected_files(previous, registry))
 
     try:

@@ -117,3 +117,86 @@ def test_patch_detect_fails_loudly_when_detect_disappears(monkeypatch):
     monkeypatch.delattr(detect, "detect", raising=True)
     with pytest.raises(DrupalSeamError, match=r"graphify\.detect\.detect"):
         _patch_detect(detect)
+
+
+def _walk_tracker(monkeypatch) -> list[str]:
+    visited: list[str] = []
+    real_walk = os.walk
+
+    def tracking_walk(top, *args, **kwargs):
+        for dirpath, dirnames, filenames in real_walk(top, *args, **kwargs):
+            visited.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    monkeypatch.setattr(os, "walk", tracking_walk)
+    return visited
+
+
+def test_a_graphifyignored_module_is_never_walked_and_defines_no_type(
+        tmp_path, monkeypatch, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.discovery import current_registry
+
+    root = _drupal_site(tmp_path)
+    (root / "web/modules/custom/foo").rename(root / "web/modules/ignored_foo")
+    (root / ".graphifyignore").write_text("web/modules/ignored_foo/\n", encoding="utf-8")
+    visited = _walk_tracker(monkeypatch)
+    detect.detect(root)
+
+    assert "foo" not in current_registry().types
+    assert "foo" not in current_registry().extensions
+    assert not any("ignored_foo" in Path(v).parts for v in visited)
+
+
+def test_an_excluded_module_is_left_out_of_the_registry(tmp_path, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.discovery import current_registry
+
+    root = _drupal_site(tmp_path)
+    detect.detect(root)
+    assert "foo" in current_registry().types
+
+    detect.detect(root, extra_excludes=["web/modules/custom/foo"])
+    assert "foo" not in current_registry().types
+    assert not any("/modules/custom/foo/" in p for p in current_registry().root_yaml)
+
+
+def test_a_non_drupal_tree_builds_no_registry_and_never_walks(
+        tmp_path, monkeypatch, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal import discovery
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+
+    def no_walk(*args, **kwargs):
+        raise AssertionError("graphify.drupal walked a non-Drupal tree")
+
+    monkeypatch.setattr(discovery, "_walk", no_walk)
+    detect.detect(tmp_path)
+
+    assert discovery.current_registry() is None
+    assert not (tmp_path / "graphify-out" / "drupal-discovery.json").exists()
+    assert ENV_VAR not in os.environ
+
+
+def test_a_single_module_checkout_still_gets_its_type(tmp_path, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.discovery import current_registry
+    from tests.test_drupal_discovery import D11_MANAGER, FOO_SERVICES
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "foo.info.yml").write_text("name: foo\ntype: module\n", encoding="utf-8")
+    (tmp_path / "foo.services.yml").write_text(FOO_SERVICES, encoding="utf-8")
+    (tmp_path / "src" / "FooManager.php").write_text(D11_MANAGER, encoding="utf-8")
+    detect.detect(tmp_path)
+
+    registry = current_registry()
+    assert registry is not None
+    assert "foo" in registry.types
+    assert ("no_drupal_core", "") in {(u["reason"], u["class"]) for u in registry.unresolved}

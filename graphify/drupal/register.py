@@ -88,7 +88,8 @@ def _patch_detect(detect: ModuleType) -> None:
                     extra_excludes=None, cache_root=None, gitignore=True):
             from graphify.drupal.discovery import prepare_run
 
-            prepare_run(Path(root), cache_root)
+            prepare_run(Path(root), cache_root,
+                        extra_excludes=extra_excludes, gitignore=gitignore)
             return original(
                 root,
                 follow_symlinks=follow_symlinks,
@@ -233,8 +234,7 @@ def _registry_widening(paths: list, context: list[dict], anchor) -> list[Path]:
 
     Only files that exist, are not in the batch, and have nodes in the
     read-only context: those nodes are what the changed registry made stale.
-    A file with none needs nothing -- core re-queues a zero-node file itself,
-    and a file the scan excludes must not enter the graph through this door.
+    A file with none needs nothing -- core re-queues zero-node files itself.
     """
     from graphify.drupal.discovery import force_miss
 
