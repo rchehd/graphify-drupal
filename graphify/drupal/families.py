@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Callable
 
 from graphify.drupal.yaml_extract import extract_drupal_info
+from graphify.drupal.yaml_services import extract_drupal_services
 
 FAMILY_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".info.yml": extract_drupal_info,
+    ".services.yml": extract_drupal_services,
 }
 
 

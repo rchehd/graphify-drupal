@@ -21,11 +21,15 @@ def test_info_family_is_registered():
 
 def test_owner_is_the_name_before_the_family_suffix():
     assert extension_owner(Path("/p/views_ui.info.yml")) == "views_ui"
+    assert extension_owner(Path("/p/token.services.yml")) == "token"
 
 
 def test_an_unregistered_family_has_no_owner():
-    """extension_owner answers only for files the table claims."""
-    assert extension_owner(Path("/p/foo.services.yml")) == ""
+    """extension_owner answers only for files the table claims.
+
+    `*.schema.yml` is configuration schema, which P1 does not read.
+    """
+    assert extension_owner(Path("/p/foo.schema.yml")) == ""
 
 
 def test_the_longest_matching_suffix_wins(monkeypatch):
