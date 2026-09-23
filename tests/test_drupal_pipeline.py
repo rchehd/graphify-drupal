@@ -192,3 +192,26 @@ def test_changing_one_dependency_changes_exactly_one_edge(corpus):
     assert after - before == {
         (extension_id("foo"), "depends_on_module", extension_id("path_alias"))
     }
+
+
+def test_editing_one_services_file_changes_only_its_own_edge(tmp_path):
+    """P1 spec criterion 8: the incremental path holds for the P1 families.
+
+    The services file shares its extension with a routing file and an info
+    file, so a regression that re-reads or drops a neighbour shows up here.
+    """
+    from graphify.drupal.yaml_common import service_id
+
+    module = tmp_path / "web/modules/custom/foo"
+    module.mkdir(parents=True)
+    (module / "foo.info.yml").write_text("name: Foo\ntype: module\n", encoding="utf-8")
+    (module / "foo.routing.yml").write_text("foo.page:\n  path: /foo\n", encoding="utf-8")
+    services = "services:\n  foo.a:\n    class: A\n    arguments: ['@{}']\n"
+    (module / "foo.services.yml").write_text(services.format("database"), encoding="utf-8")
+
+    before = _relations(_run_cli(tmp_path))
+    (module / "foo.services.yml").write_text(services.format("state"), encoding="utf-8")
+    after = _relations(_run_cli(tmp_path))
+
+    assert before - after == {(service_id("foo.a"), "injects_service", service_id("database"))}
+    assert after - before == {(service_id("foo.a"), "injects_service", service_id("state"))}
