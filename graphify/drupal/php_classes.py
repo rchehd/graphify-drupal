@@ -71,7 +71,7 @@ def resolve_name(name: str, namespace: str, uses: dict[str, str]) -> str:
 
 
 def read_php_class(path: Path) -> PhpClass | None:
-    """Read the first class/interface declaration in a PHP file.
+    """Read the class/interface declaration named after the file (else the first) in a PHP file.
 
     Returns None for missing/unreadable/oversized files, files tree-sitter
     cannot parse, and files with no class or interface declaration. Never
@@ -93,12 +93,16 @@ def read_php_class(path: Path) -> PhpClass | None:
     if root is None:
         return None
 
-    state = {"namespace": "", "uses": {}, "result": None}
+    state: dict = {"namespace": "", "uses": {}, "found": []}
     _find_class(root, state)
-    found = state["result"]
-    if found is None:
+    declarations = state["found"]
+    if not declarations:
         return None
-    class_node, namespace, uses = found
+    # PSR-4: `X.php` declares `X`; a BC shim declared before it must not win.
+    class_node, namespace, uses = next(
+        (d for d in declarations if _text(d[0].child_by_field_name("name")) == path.stem),
+        declarations[0],
+    )
 
     name_node = class_node.child_by_field_name("name")
     if name_node is None:
@@ -214,15 +218,14 @@ def _collect_discoveries(
 
 
 def _find_class(node: "tree_sitter.Node", state: dict) -> None:
-    """Populate state['result'] with the first class/interface declaration.
+    """Append every top-level class/interface declaration to state['found'].
 
     Walks top-level declarations in source order, tracking the ambient
     namespace and `use` aliases as it goes, and descending into brace-style
-    namespace bodies.
+    namespace bodies. Each declaration keeps the namespace and aliases in
+    force where it appears.
     """
     for child in node.named_children:
-        if state["result"] is not None:
-            return
         if child.type == "namespace_definition":
             name_node = child.child_by_field_name("name")
             state["namespace"] = _text(name_node) if name_node is not None else ""
@@ -234,8 +237,7 @@ def _find_class(node: "tree_sitter.Node", state: dict) -> None:
             _collect_use_decl(child, state["uses"])
             continue
         if child.type in ("class_declaration", "interface_declaration"):
-            state["result"] = (child, state["namespace"], dict(state["uses"]))
-            return
+            state["found"].append((child, state["namespace"], dict(state["uses"])))
 
 
 def _collect_use_decl(decl: "tree_sitter.Node", uses: dict[str, str]) -> None:

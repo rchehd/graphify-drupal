@@ -144,3 +144,22 @@ def test_discoveries_built_in_the_constructor_are_read(tmp_path):
 
 def test_a_class_without_constructor_discoveries_has_none(tmp_path):
     assert read_php_class(_write(tmp_path, D11_MANAGER)).construct_discoveries == ()
+
+
+TWO_DECLARATIONS = r"""<?php
+namespace Drupal\redis\Cache;
+use Drupal\Core\Cache\CacheTagsChecksumInterface;
+interface ChecksumPreloadInterface {}
+class Checksum implements CacheTagsChecksumInterface {}
+"""
+
+
+def test_the_declaration_named_after_the_file_wins(tmp_path):
+    cls = read_php_class(_write(tmp_path, TWO_DECLARATIONS, "Checksum.php"))
+    assert (cls.fqcn, cls.kind, cls.line) == ("Drupal\\redis\\Cache\\Checksum", "class", 5)
+    assert cls.implements == ("Drupal\\Core\\Cache\\CacheTagsChecksumInterface",)
+
+
+def test_a_file_named_after_no_declaration_reads_the_first(tmp_path):
+    cls = read_php_class(_write(tmp_path, TWO_DECLARATIONS, "Other.php"))
+    assert (cls.fqcn, cls.kind) == ("Drupal\\redis\\Cache\\ChecksumPreloadInterface", "interface")
