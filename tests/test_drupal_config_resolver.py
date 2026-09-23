@@ -98,3 +98,29 @@ def test_a_shipped_configs_missing_owner_is_named_from_its_store(tmp_path):
     resolve_missing_targets([], nodes, edges)
     owner = next(n for n in nodes if n["id"] == extension_id("core"))
     assert owner["label"] == "core"
+
+
+def _stripped(n):
+    """What an incremental run's resolution context keeps of an unchanged node."""
+    return {"id": n["id"], "label": n["label"], "type": n["type"],
+            "source_file": "x.yml", "file_type": "code"}
+
+
+def test_schema_for_is_drawn_against_stripped_context_nodes():
+    """P1b final review, Important 2: unchanged nodes arrive as id/label/type only."""
+    nodes = [_cfg("system.site"), _stripped(_schema("system.site")),
+             _stripped(_cfg("views.view.x")), _schema("views.view.*"),
+             _stripped({"id": config_id("config_split.config_split.dev"),
+                        "label": "config_split.config_split.dev",
+                        "type": "drupal_config_split"}),
+             _stripped(_schema("config_split.config_split.*"))]
+    edges: list[dict] = []
+    resolve_missing_targets([], nodes, edges)
+    schema_for = {(e["source"], e["target"]): e["confidence"]
+                  for e in edges if e["relation"] == "schema_for"}
+    assert schema_for == {
+        (schema_id("system.site"), config_id("system.site")): "EXTRACTED",
+        (schema_id("views.view.*"), config_id("views.view.x")): "INFERRED",
+        (schema_id("config_split.config_split.*"),
+         config_id("config_split.config_split.dev")): "INFERRED",
+    }

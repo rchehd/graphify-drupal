@@ -134,18 +134,30 @@ def _specificity(pattern: list[str]) -> tuple[int, int]:
     return literal, prefix
 
 
+#: Node types that stand for one config name (spec §4).
+_CONFIG_TYPES = frozenset({"drupal_config", "drupal_config_split", "drupal_domain"})
+
+
 def _draw_schema_for(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    schemas = [n for n in all_nodes if n.get("type") == "drupal_config_schema"]
-    exact = {n.get("schema_type"): n["id"] for n in schemas if not n.get("pattern")}
+    # An incremental run hands unchanged nodes over as id/label/type only, so a
+    # schema's type and a config's name fall back to the label, which is each.
+    exact: dict[str, str] = {}
     # Group patterns by their first segment so each config tests only its own family.
     patterns: dict[str, list[tuple[list[str], str]]] = {}
-    for n in schemas:
-        if n.get("pattern"):
-            parts = str(n.get("schema_type", "")).split(".")
+    for n in all_nodes:
+        if n.get("type") != "drupal_config_schema":
+            continue
+        type_ = str(n.get("schema_type") or n.get("label") or "")
+        if "*" in type_:
+            parts = type_.split(".")
             patterns.setdefault(parts[0], []).append((parts, n["id"]))
+        elif type_:
+            exact[type_] = n["id"]
     for config in all_nodes:
-        name = config.get("config_name")
-        if not isinstance(name, str) or not config.get("type", "").startswith("drupal_"):
+        if config.get("type") not in _CONFIG_TYPES:
+            continue
+        name = config.get("config_name") or config.get("label")
+        if not isinstance(name, str) or not name:
             continue
         if name in exact:
             all_edges.append(_schema_edge(exact[name], config, "EXTRACTED"))
