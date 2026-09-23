@@ -71,3 +71,68 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
     for node in nodes:
         if node.get("_origin") == _ORIGIN:
             node.pop("_rank", None)
+
+
+def _context_index(context_nodes: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Drupal id -> every file the persisted graph says declares it."""
+    index: dict[str, set[str]] = {}
+    for n in context_nodes:
+        nid = n.get("id")
+        # A resolver's external node names a referencing file, not a declaring one.
+        if not isinstance(nid, str) or not str(n.get("type", "")).startswith("drupal_") \
+                or n.get("file_type") == "concept":
+            continue
+        files = index.setdefault(nid, set())
+        if n.get("source_file"):
+            files.add(str(n["source_file"]))
+        declared = n.get("declared_in")
+        if isinstance(declared, list):
+            files.update(str(f) for f in declared if f)
+    return index
+
+
+def collision_group(
+    paths: list[Path],
+    context_nodes: list[dict[str, Any]],
+    root: Path | None,
+) -> list[Path]:
+    """`paths` plus every unchanged file that declares an id one of them declares.
+
+    The collapse is only right when it sees every copy of an id at once. An
+    incremental run extracts a changed (or, through core's zero-node heal, a
+    shadowed) copy alone, and alone it wins its own collapse and replaces the
+    survivor. So an incremental batch is widened to the whole collision group,
+    transitively: a pulled file's own ids may collide with further files.
+    """
+    from graphify.drupal.families import drupal_extractor
+
+    index = _context_index(context_nodes)
+    if not index:
+        return list(paths)
+    base = Path(root) if root is not None else Path.cwd()
+
+    def absolute(p: str | Path) -> Path:
+        p = Path(p)
+        return (p if p.is_absolute() else base / p).resolve()
+
+    out = list(paths)
+    seen = {absolute(p) for p in paths}
+    queue = list(paths)
+    while queue:
+        path = Path(queue.pop())
+        handler = drupal_extractor(path)
+        if handler is None:
+            continue
+        try:
+            ids = {n.get("id") for n in handler(path).get("nodes", [])}
+        except Exception:
+            continue
+        for nid in ids:
+            for sibling in index.get(nid, ()):
+                candidate = absolute(sibling)
+                if candidate in seen or not candidate.is_file():
+                    continue
+                seen.add(candidate)
+                out.append(candidate)
+                queue.append(candidate)
+    return out

@@ -85,8 +85,9 @@ def _patch_detect(detect: ModuleType) -> None:
 
 
 def _patch_extract(extract: ModuleType) -> None:
+    from graphify.drupal.config_stores import clear_caches
     from graphify.drupal.families import drupal_extractor
-    from graphify.drupal.merge import collapse_drupal_duplicates
+    from graphify.drupal.merge import _relative, collapse_drupal_duplicates, collision_group
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
@@ -137,6 +138,47 @@ def _patch_extract(extract: ModuleType) -> None:
         return _disambiguate_colliding_node_ids
 
     _wrap(extract, "_disambiguate_colliding_node_ids", _collapse)
+
+    if not callable(getattr(extract, "extract", None)):
+        raise DrupalSeamError(
+            "graphify.extract.extract is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _run(original):
+        # The CLI, `graphify watch` and the hooks all do
+        # `from graphify.extract import extract` inside the calling function,
+        # so they read the module attribute at call time and get this wrapper.
+        def extract_(paths, cache_root=None, **kwargs):
+            clear_caches()
+            context = kwargs.get("resolution_context_nodes")
+            if context:
+                # An incremental run: re-extract each collision group together
+                # (see merge.collision_group), and keep the pulled files out of
+                # the read-only context, as core does for every file it extracts.
+                root = kwargs.get("root")
+                anchor = root if root is not None else cache_root
+                widened = collision_group(list(paths), context, anchor)
+                if len(widened) > len(paths):
+                    pulled = {
+                        _relative(str(p), Path(anchor) if anchor is not None else None)
+                        for p in widened[len(paths):]
+                    } | {str(p) for p in widened[len(paths):]}
+                    kwargs["resolution_context_nodes"] = [
+                        n for n in context if str(n.get("source_file")) not in pulled
+                    ] or None
+                    edges = kwargs.get("resolution_context_edges")
+                    if edges:
+                        kwargs["resolution_context_edges"] = [
+                            e for e in edges if str(e.get("source_file")) not in pulled
+                        ] or None
+                    paths = widened
+            return original(paths, cache_root, **kwargs)
+        extract_.__name__ = extract_.__qualname__ = "extract"
+        extract_.__doc__ = original.__doc__
+        return extract_
+
+    _wrap(extract, "extract", _run)
     # Registered here rather than in install() because the registry is imported
     # from graphify.extract's own dependency graph; doing it at this point keeps
     # install() free of any import of core.

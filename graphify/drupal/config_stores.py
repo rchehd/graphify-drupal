@@ -34,6 +34,18 @@ class ConfigStore:
     language: str = ""
 
 
+def clear_caches() -> None:
+    """Forget every per-directory answer.
+
+    The caches hold for one `extract()` run. `graphify watch` and the MCP server
+    call it many times in one process, and a new `core.extension.yml`, split
+    entity, `folder:` edit, `*.info.yml` or `.graphifyrc` must be seen by the next
+    run; the seam calls this at the start of each.
+    """
+    for cached in (_owner, _rc_sync_dirs_from, _markers_under, _split_folders, _store_of_dir):
+        cached.cache_clear()
+
+
 def _in_tests(path: Path) -> bool:
     parts = path.parts
     if "tests" not in parts:

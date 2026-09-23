@@ -112,3 +112,26 @@ def test_config_directories_are_recognised_even_when_excluded(tmp_path):
     assert config_store(path) is None
     assert in_config_directory(path)
     assert not in_config_directory(_touch(tmp_path, "web/modules/custom/foo/foo.links.action.yml"))
+
+
+def test_a_new_marker_is_seen_once_the_caches_are_cleared(tmp_path):
+    """P1b final review, Important 3: watch/MCP call extract() many times per process."""
+    from graphify.drupal.config_stores import clear_caches
+
+    path = _touch(tmp_path, "config/sync/system.site.yml")
+    assert config_store(path) is None
+    _touch(tmp_path, "config/sync/core.extension.yml", "module: {}\n")
+    clear_caches()
+    assert config_store(path).kind == "sync"
+
+
+def test_every_extract_run_starts_with_fresh_store_caches(tmp_path):
+    from graphify.drupal.yaml_common import config_id
+    from graphify.extract import extract
+
+    path = _touch(tmp_path, "config/sync/system.site.yml")
+    first = extract([path], cache_root=tmp_path / ".c1", root=tmp_path)
+    assert config_id("system.site") not in {n["id"] for n in first["nodes"]}
+    _touch(tmp_path, "config/sync/core.extension.yml", "module: {}\n")
+    second = extract([path], cache_root=tmp_path / ".c2", root=tmp_path)
+    assert config_id("system.site") in {n["id"] for n in second["nodes"]}

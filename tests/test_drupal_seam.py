@@ -117,3 +117,53 @@ def test_the_seam_dispatches_configuration(tmp_path):
     path = tmp_path / "config/sync/system.site.yml"
     path.write_text("name: x\n", encoding="utf-8")
     assert extract._get_extractor(path) is extract_drupal_config
+
+
+def test_extract_is_wrapped_and_fails_loudly_when_it_disappears(monkeypatch):
+    install()
+    import graphify.extract as extract
+
+    assert getattr(extract.extract, "_drupal_patched", False)
+    monkeypatch.delattr(extract, "extract", raising=True)
+    monkeypatch.setattr(extract._get_extractor, "_drupal_patched", False, raising=False)
+    with pytest.raises(DrupalSeamError, match="graphify.extract.extract"):
+        _patch_extract(extract)
+
+
+
+def _two_copies(tmp_path: Path) -> Path:
+    files = {
+        "config/sync/core.extension.yml": "module:\n  system: 0\n",
+        "config/sync/system.site.yml": "name: Site\n",
+        "web/core/modules/system/system.info.yml": "name: System\ntype: module\n",
+        "web/core/modules/system/config/install/system.site.yml": "name: ''\n",
+    }
+    for rel, text in files.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text, encoding="utf-8")
+    return tmp_path / "web/core/modules/system/config/install/system.site.yml"
+
+
+def test_a_full_run_extracts_exactly_the_given_paths(tmp_path):
+    from graphify.extract import extract
+
+    shipped = _two_copies(tmp_path)
+    result = extract([shipped], cache_root=tmp_path / ".cache", root=tmp_path)
+    assert result["extracted_sources"] == [str(shipped)]
+
+
+def test_an_incremental_run_pulls_in_the_rest_of_the_collision_group(tmp_path):
+    """P1b final review, Critical 1: a lone copy would win its own collapse."""
+    from graphify.drupal.yaml_common import config_id
+    from graphify.extract import extract
+
+    shipped = _two_copies(tmp_path)
+    context = [{"id": config_id("system.site"), "label": "system.site",
+                "source_file": "config/sync/system.site.yml", "file_type": "code",
+                "type": "drupal_config"}]
+    result = extract([shipped], cache_root=tmp_path / ".cache", root=tmp_path,
+                     resolution_context_nodes=context)
+    assert sorted(Path(p).name for p in result["extracted_sources"]) == [
+        "system.site.yml", "system.site.yml"]
+    [site] = [n for n in result["nodes"] if n["id"] == config_id("system.site")]
+    assert site["store"] == "sync" and site["active"] is True

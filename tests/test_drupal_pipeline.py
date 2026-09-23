@@ -263,3 +263,62 @@ def test_removing_a_module_from_core_extension_changes_one_install_edge(tmp_path
     assert _relations(before) - _relations(after) == {
         (config_id("core.extension"), "installs_extension", extension_id("views"))}
     assert _relations(after) - _relations(before) == set()
+
+
+def _collision_site(root: Path) -> None:
+    """A synced + shipped copy of one config and one overridden service.
+
+    After the first build neither shadowing file owns a node in graph.json, so
+    core re-extracts each of them on every later run (its zero-node heal).
+    """
+    files = {
+        "web/core/lib/Drupal.php": "<?php\n",
+        "web/core/modules/system/system.info.yml": "name: System\ntype: module\n",
+        "web/core/modules/system/config/install/system.site.yml":
+            "name: ''\ndependencies:\n  module:\n    - system\n",
+        "config/sync/core.extension.yml": "module:\n  system: 0\n  zzz: 0\ntheme: {}\n",
+        "config/sync/system.site.yml": "name: Site\n",
+        "web/core/core.services.yml": "services:\n  foo.svc:\n    class: Drupal\\Core\\A\n",
+        "web/modules/custom/zzz/zzz.info.yml": "name: Z\ntype: module\n",
+        "web/modules/custom/zzz/zzz.services.yml":
+            "services:\n  foo.svc:\n    class: Drupal\\zzz\\B\n",
+    }
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+_STABLE_ATTRS = ("active", "store", "install_mode", "declared_in", "source_file",
+                 "class_name", "realm")
+
+
+def _attrs(graph: dict, node_id: str) -> dict:
+    [found] = [n for n in graph["nodes"] if n["id"] == node_id]
+    return {key: found.get(key) for key in _STABLE_ATTRS}
+
+
+def test_a_collapsed_node_keeps_its_attributes_across_reruns(tmp_path):
+    """P1b final review, Critical 1: the whole collision group is re-extracted together."""
+    from graphify.drupal.yaml_common import config_id, service_id
+
+    _collision_site(tmp_path)
+    site, svc = config_id("system.site"), service_id("foo.svc")
+    first = _run_cli(tmp_path)
+    assert _attrs(first, site)["active"] is True
+    assert _attrs(first, site)["store"] == "sync"
+    assert _attrs(first, svc)["class_name"] == "Drupal\\Core\\A"
+
+    second = _run_cli(tmp_path)
+    assert _attrs(second, site) == _attrs(first, site)
+    assert _attrs(second, svc) == _attrs(first, svc)
+    assert _relations(second) == _relations(first)
+
+    (tmp_path / "web/core/modules/system/config/install/system.site.yml").write_text(
+        "name: 'Changed'\ndependencies:\n  module:\n    - system\n", encoding="utf-8")
+    (tmp_path / "web/modules/custom/zzz/zzz.services.yml").write_text(
+        "services:\n  foo.svc:\n    class: Drupal\\zzz\\C\n", encoding="utf-8")
+    third = _run_cli(tmp_path)
+    assert _attrs(third, site) == _attrs(first, site)
+    assert _attrs(third, svc) == _attrs(first, svc)
+    assert _relations(third) == _relations(first)

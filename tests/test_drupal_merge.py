@@ -137,3 +137,43 @@ def test_unranked_duplicates_dont_get_gap_filled():
     assert kept["source_file"] == "web/core/core.services.yml"
     assert kept["class_name"] == "Core"
     assert "deprecated" not in kept
+
+
+def _write(root: Path, rel: str, text: str) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_the_collision_group_is_followed_transitively(tmp_path):
+    """a.services.yml shares x with b; b also declares y, which c declares too."""
+    from graphify.drupal.merge import collision_group
+
+    a = _write(tmp_path, "web/modules/a/a.services.yml", "services:\n  x: {class: A}\n")
+    _write(tmp_path, "web/modules/b/b.services.yml",
+           "services:\n  x: {class: B}\n  y: {class: B}\n")
+    _write(tmp_path, "web/modules/c/c.services.yml", "services:\n  y: {class: C}\n")
+    _write(tmp_path, "web/modules/d/d.services.yml", "services:\n  z: {class: D}\n")
+    context = [
+        {"id": service_id("x"), "source_file": "web/modules/b/b.services.yml",
+         "type": "drupal_service", "file_type": "code"},
+        {"id": service_id("y"), "source_file": "web/modules/b/b.services.yml",
+         "type": "drupal_service", "file_type": "code",
+         "declared_in": ["web/modules/b/b.services.yml", "web/modules/c/c.services.yml"]},
+        {"id": service_id("z"), "source_file": "web/modules/d/d.services.yml",
+         "type": "drupal_service", "file_type": "code"},
+        # A resolver's external node names the file that referenced it.
+        {"id": service_id("x"), "source_file": "web/modules/d/d.services.yml",
+         "type": "drupal_service", "file_type": "concept"},
+    ]
+    group = collision_group([a], context, tmp_path)
+    assert group[0] == a
+    assert sorted(p.parent.name for p in group) == ["a", "b", "c"]
+
+
+def test_without_context_the_group_is_the_given_paths(tmp_path):
+    from graphify.drupal.merge import collision_group
+
+    a = _write(tmp_path, "web/modules/a/a.services.yml", "services:\n  x: {class: A}\n")
+    assert collision_group([a], [], tmp_path) == [a]
