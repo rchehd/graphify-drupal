@@ -204,7 +204,9 @@ def extract_drupal_config(path: Path) -> dict[str, Any]:
 
         return extract_drupal_schema(path, store)
     if path.name == "recipe.yml":
-        return dict(_EMPTY)      # Task 5
+        from graphify.drupal.yaml_recipes import extract_drupal_recipe
+
+        return extract_drupal_recipe(path, store)
     data, error = load_drupal_yaml(path)
     if error:
         return {"nodes": [], "edges": [], "error": error}
