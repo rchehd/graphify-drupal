@@ -12,6 +12,8 @@ difference is most of core's container. Every family parses through here.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -180,9 +182,31 @@ def config_id(name: str) -> str:
     return make_id("drupal", "config", name)
 
 
+#: A type built only from lowercase word characters and `.`, e.g. `system.site`.
+#: `make_id` normalises any other type the same way it normalises this one --
+#: casefolding, then collapsing every run of non-word characters to `_` -- so a
+#: scheme that substitutes characters out of `*`/`+`/`:`/uppercase can still
+#: collide with a plain type that already looks like the substitution's output
+#: (`views.field.user` and `views_field_user` both normalise to
+#: `views_field_user`). No character-substitution scheme built from word
+#: characters is injective after that normalisation, so only a plain type keeps
+#: the direct id; anything else is disambiguated with a hash of its own name.
+_PLAIN_SCHEMA_TYPE = re.compile(r"^[a-z0-9]+(\.[a-z0-9]+)*$")
+
+
 def schema_id(type_: str) -> str:
-    # `*` would otherwise normalise away, merging `views.area.*` with `views_area`.
-    return make_id("drupal", "config_schema", type_.replace("*", "_wildcard_"))
+    if _PLAIN_SCHEMA_TYPE.fullmatch(type_):
+        return make_id("drupal", "config_schema", type_)
+    digest = hashlib.sha1(type_.encode("utf-8")).hexdigest()[:8]
+    return make_id("drupal", "config_schema", type_, digest)
+
+
+def config_patch_id(split: str, target: str) -> str:
+    return make_id("drupal", "config_patch", split, target)
+
+
+def config_translation_id(language: str, kind: str, split: str, name: str) -> str:
+    return make_id("drupal", "config_translation", language, kind, split, name)
 
 
 def recipe_id(directory: str) -> str:

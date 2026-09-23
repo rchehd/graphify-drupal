@@ -21,7 +21,15 @@ from graphify.drupal.config_stores import (
     config_name,
     config_store,
 )
-from graphify.drupal.yaml_common import config_id, edge, load_drupal_yaml, node, recipe_id
+from graphify.drupal.yaml_common import (
+    config_id,
+    config_patch_id,
+    config_translation_id,
+    edge,
+    load_drupal_yaml,
+    node,
+    recipe_id,
+)
 from graphify.drupal.yaml_extract import extension_id
 
 #: The collapse keeps the copy with the lowest rank (spec §6.1).
@@ -94,19 +102,41 @@ def _split_source(store: ConfigStore) -> str:
 
 
 def _patch(path: Path, store: ConfigStore, name: str, data: dict) -> dict[str, Any]:
+    # `config_id(name)` would collide across splits that patch the same target
+    # (`domain.record.forms_staff` is patched by both `prod` and `test`), so the
+    # node is keyed by split + target instead. No `_rank`: it is not a copy of a
+    # config object and must never enter a collapse group.
     target = name[len(PATCH_PREFIX):]
     keys = sorted(set(_key_paths(data.get("adding")) + _key_paths(data.get("removing"))))
+    own = config_patch_id(store.split, target)
+    source = _split_source(store)
+    nodes = [node(own, name, type="drupal_config_patch", layer="config", path=path, line=1,
+                  config_name=name, store="split", split=store.split, target_name=target,
+                  realm="custom")]
     edges = _Edges(path)
-    edges.add(_split_source(store), config_id(target), "overrides_config",
+    edges.add(source, config_id(target), "overrides_config",
               override_source="split", keys=keys, target_name=target)
-    return {"nodes": [], "edges": edges.items}
+    edges.add(source, own, "contains")
+    return {"nodes": nodes, "edges": edges.items}
 
 
 def _language_override(path: Path, store: ConfigStore, name: str, data: dict) -> dict[str, Any]:
+    # Keyed by language + store kind/split + name so two stores' overrides of the
+    # same config never collide. No `_rank`: never a collapse candidate.
+    own = config_translation_id(store.language, store.kind, store.split, name)
+    extra: dict[str, Any] = {"config_name": name, "language": store.language, "store": store.kind}
+    if store.kind in ("sync", "split"):
+        # The site's own export: project-owned whatever module it configures
+        # (same rule `_config_object` uses).
+        extra["realm"] = "custom"
+    nodes = [node(own, name, type="drupal_config_translation", layer="config",
+                  path=path, line=1, **extra)]
+    source = config_id(f"language.entity.{store.language}")
     edges = _Edges(path)
-    edges.add(config_id(f"language.entity.{store.language}"), config_id(name), "overrides_config",
+    edges.add(source, config_id(name), "overrides_config",
               override_source="language", keys=_key_paths(data), target_name=name)
-    return {"nodes": [], "edges": edges.items}
+    edges.add(source, own, "contains")
+    return {"nodes": nodes, "edges": edges.items}
 
 
 def _domain_override(edges: _Edges, name: str, data: dict) -> None:

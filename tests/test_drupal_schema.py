@@ -47,4 +47,21 @@ def test_a_wildcard_type_and_a_literal_type_get_distinct_ids():
     assert schema_id("views.area.*") != schema_id("views_area")
     assert schema_id("entity_reference_selection.default:*") != schema_id(
         "entity_reference_selection.default")
-    assert schema_id("views_area") == "drupal_config_schema_views_area"
+
+
+def test_a_plain_type_keeps_its_current_id():
+    assert schema_id("foo.settings") == "drupal_config_schema_foo_settings"
+
+
+def test_distinct_types_never_share_an_id():
+    """The corpus pairs that used to collide, plus every character class that can."""
+    pairs = [
+        ("views.field.user", "views_field_user"),
+        ("views.field.bulk_form", "views_field_bulk_form"),
+        ("Foo.bar", "foo.bar"),
+        ("views.area.*", "views.area"),
+        ("views.area", "views_area"),
+        ("views.area.*", "views_area"),
+    ]
+    for a, b in pairs:
+        assert schema_id(a) != schema_id(b), (a, b)

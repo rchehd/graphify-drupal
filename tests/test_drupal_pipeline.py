@@ -322,3 +322,35 @@ def test_a_collapsed_node_keeps_its_attributes_across_reruns(tmp_path):
     assert _attrs(third, site) == _attrs(first, site)
     assert _attrs(third, svc) == _attrs(first, svc)
     assert _relations(third) == _relations(first)
+
+
+def test_a_split_patch_file_is_stamped_and_not_re_queued(tmp_path):
+    """Task 11: a config_split patch used to emit zero nodes, so core's zero-node
+    heal (graphify/cli.py) left its manifest entry unstamped and re-queued it on
+    every run forever, whether or not the file had changed.
+
+    graph.json alone never says "this file was re-extracted"; the manifest is
+    the mechanism core actually keys re-extraction on (an empty `ast_hash` is
+    what triggers the re-queue), so this reads `graphify-out/manifest.json`
+    after a run and checks the patch file's entry is stamped like any other
+    file, instead of trying to observe the re-queue indirectly through timing.
+    """
+    import json
+
+    from graphify.drupal.yaml_common import config_patch_id
+
+    _site_corpus(tmp_path)
+    patch_rel = "config/splits/prod/config_split.patch.user.settings.yml"
+    node_id = config_patch_id("prod", "user.settings")
+
+    first = _run_cli(tmp_path)
+    [patch_node] = [n for n in first["nodes"] if n["id"] == node_id]
+
+    manifest = json.loads(
+        (tmp_path / "graphify-out" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest[patch_rel]["ast_hash"], "an unstamped entry is re-queued on every run"
+
+    second = _run_cli(tmp_path)
+    [patch_node_again] = [n for n in second["nodes"] if n["id"] == node_id]
+    assert patch_node_again == patch_node
+    assert _relations(second) == _relations(first)

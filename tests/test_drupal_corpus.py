@@ -326,9 +326,10 @@ def test_p1b_every_wildcard_schema_type_is_its_own_node(site_extraction):
     """1,806 top-level keys in 303 non-test schema files; `condition.plugin.
     entity_bundle:*` is declared twice, so 1,805 types, 150 of them wildcards.
 
-    A wildcard never shares an id with a literal type. Two literal pairs still
-    differ only by `.` against `_` and share an id; they are pinned by name so a
-    new collision fails here.
+    Every type is its own node (Task 11): a wildcard never shares an id with a
+    literal type, and two literal pairs that differ only by `.` against `_`
+    (`views.field.user`/`views_field_user`, `views.field.bulk_form`/
+    `views_field_bulk_form`) no longer collide either.
     """
     import collections
 
@@ -344,16 +345,43 @@ def test_p1b_every_wildcard_schema_type_is_its_own_node(site_extraction):
     by_id = collections.defaultdict(set)
     for type_ in types:
         by_id[schema_id(type_)].add(type_)
-    assert {i: s for i, s in by_id.items() if len(s) > 1} == {
-        schema_id("views.field.user"): {"views.field.user", "views_field_user"},
-        schema_id("views.field.bulk_form"): {"views.field.bulk_form", "views_field_bulk_form"},
-    }
+    # Task 11: no two distinct schema types may share a node id (0 collisions).
+    assert {i: s for i, s in by_id.items() if len(s) > 1} == {}
 
     schemas = {n["id"]: n for n in site_extraction["nodes"]
                if n.get("type") == "drupal_config_schema"}
-    assert len(schemas) == 1803
+    assert len(schemas) == 1805
     assert set(schemas) == set(by_id)
     for type_ in wildcards:
         assert (schemas[schema_id(type_)]["schema_type"], schemas[schema_id(type_)]["pattern"]) \
             == (type_, True)
     assert len([n for n in schemas.values() if n.get("pattern")]) == 150
+
+
+def test_p1b_every_config_store_file_yields_at_least_one_node(site_extraction):
+    """Task 11: a split patch or a language override used to return zero nodes,
+    which core's zero-node heal treats as un-extracted and re-queues forever.
+
+    Every file `config_store()` recognises (sync/split/recipe/install/optional/
+    schema, and now patch and language-override files too) must contribute at
+    least one node, unless its own YAML failed to parse.
+    """
+    import graphify  # noqa: F401
+    from graphify.drupal.config_stores import config_store
+    from graphify.drupal.yaml_common import load_drupal_yaml
+
+    store_files = [p for p in _p1b_files() if p.suffix == ".yml" and config_store(p) is not None]
+    declaring: set[str] = set()
+    for n in site_extraction["nodes"]:
+        if n.get("source_file"):
+            declaring.add(n["source_file"])
+        declaring.update(n.get("declared_in") or [])
+
+    zero_node = []
+    for path in store_files:
+        _, error = load_drupal_yaml(path)
+        if error:
+            continue
+        if path.relative_to(CORPUS).as_posix() not in declaring:
+            zero_node.append(path)
+    assert zero_node == []
