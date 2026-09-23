@@ -10,10 +10,17 @@ a boolean and nothing else from the file body.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
-from graphify.drupal.config_stores import SPLIT_PREFIX, ConfigStore, config_name, config_store
+from graphify.drupal.config_stores import (
+    PATCH_PREFIX,
+    SPLIT_PREFIX,
+    ConfigStore,
+    config_name,
+    config_store,
+)
 from graphify.drupal.yaml_common import config_id, edge, load_drupal_yaml, node, recipe_id
 from graphify.drupal.yaml_extract import extension_id
 
@@ -63,6 +70,58 @@ def _node_type(name: str) -> str:
     if name.startswith("domain.record."):
         return "drupal_domain"
     return "drupal_config"
+
+
+#: `fr`, `pt-br`, `zh-hans`: a leading segment that may be a langcode.
+_LANGCODE = re.compile(r"[a-z]{2,3}(-[a-z0-9]{2,8})?")
+
+
+def _key_paths(value: Any, prefix: str = "") -> list[str]:
+    """Dotted leaf key paths; a list is a leaf. Values are never returned."""
+    if not isinstance(value, dict):
+        return [prefix] if prefix else []
+    paths: list[str] = []
+    for key, inner in value.items():
+        if str(key) == "_core":
+            continue
+        dotted = f"{prefix}.{key}" if prefix else str(key)
+        paths.extend(_key_paths(inner, dotted) if isinstance(inner, dict) else [dotted])
+    return sorted(set(paths))
+
+
+def _split_source(store: ConfigStore) -> str:
+    return config_id(f"{SPLIT_PREFIX}{store.split}")
+
+
+def _patch(path: Path, store: ConfigStore, name: str, data: dict) -> dict[str, Any]:
+    target = name[len(PATCH_PREFIX):]
+    keys = sorted(set(_key_paths(data.get("adding")) + _key_paths(data.get("removing"))))
+    edges = _Edges(path)
+    edges.add(_split_source(store), config_id(target), "overrides_config",
+              override_source="split", keys=keys, target_name=target)
+    return {"nodes": [], "edges": edges.items}
+
+
+def _language_override(path: Path, store: ConfigStore, name: str, data: dict) -> dict[str, Any]:
+    edges = _Edges(path)
+    edges.add(config_id(f"language.entity.{store.language}"), config_id(name), "overrides_config",
+              override_source="language", keys=_key_paths(data), target_name=name)
+    return {"nodes": [], "edges": edges.items}
+
+
+def _domain_override(edges: _Edges, name: str, data: dict) -> None:
+    rest = name[len("domain.config."):]
+    domain, _, target = rest.partition(".")
+    if not domain or not target:
+        return
+    extra: dict[str, Any] = {}
+    segment, _, after = target.partition(".")
+    if after and _LANGCODE.fullmatch(segment):
+        # `<domain>.<langcode>.<config>` or `<domain>.<config starting fr.>`:
+        # the resolver keeps whichever target the corpus declares (Task 9).
+        extra = {"alt_target": config_id(after), "alt_target_name": after}
+    edges.add(config_id(f"domain.record.{domain}"), config_id(target), "overrides_config",
+              override_source="domain", keys=_key_paths(data), target_name=target, **extra)
 
 
 def _config_object(path: Path, store: ConfigStore, name: str, data: dict) -> dict[str, Any]:
@@ -127,6 +186,12 @@ def _config_object(path: Path, store: ConfigStore, name: str, data: dict) -> dic
                     edges.add(own, config_id(target), "splits_config",
                               split_kind=kind, target_name=target)
 
+    if store.kind == "split":
+        edges.add(_split_source(store), own, "overrides_config",
+                  override_source="split", whole=True, target_name=name)
+    if name.startswith("domain.config.") and store.kind in ("sync", "split"):
+        _domain_override(edges, name, data)
+
     return {"nodes": nodes, "edges": edges.items}
 
 
@@ -141,4 +206,10 @@ def extract_drupal_config(path: Path) -> dict[str, Any]:
     data, error = load_drupal_yaml(path)
     if error:
         return {"nodes": [], "edges": [], "error": error}
-    return _config_object(path, store, config_name(path), data or {})
+    name = config_name(path)
+    data = data or {}
+    if store.language:
+        return _language_override(path, store, name, data)
+    if store.kind == "split" and name.startswith(PATCH_PREFIX):
+        return _patch(path, store, name, data)
+    return _config_object(path, store, name, data)
