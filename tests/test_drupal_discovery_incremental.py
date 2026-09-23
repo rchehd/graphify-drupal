@@ -155,10 +155,70 @@ def test_load_cached_misses_a_forced_file(tmp_path, _isolated_discovery_state):
     discovery.prepare_run(root)
     assert extract.load_cached(target, root, cache_root=tmp_path) is None
     assert cache.load_cached(target, root, cache_root=tmp_path) is None
-    # A relative path is resolved against root before it is compared.
-    assert extract.load_cached(Path(FOO_BAR_FILE), root, cache_root=tmp_path) is None
     # A file the change does not affect still hits.
     assert extract.load_cached(other, root, cache_root=tmp_path) is not None
+
+
+def test_a_relative_path_is_resolved_as_core_resolves_it(tmp_path, monkeypatch, _isolated_discovery_state):
+    """Core reads a relative `path` against the working directory, whatever the
+    anchor `root` is. With the site as the working directory and its parent as
+    the anchor, unwrapped core serves the entry; the wrapper must miss it."""
+    from graphify import cache
+    from graphify.drupal import discovery, register
+
+    register.install()
+    import graphify.extract as extract
+
+    site = _bar_site(tmp_path / "site")
+    anchor = tmp_path
+    discovery.prepare_run(site)
+    other = "web/modules/custom/foo/foo.info.yml"
+    cache.save_cached(site / FOO_BAR_FILE, {"nodes": [{"id": "x"}], "edges": []}, anchor, cache_root=tmp_path)
+    cache.save_cached(site / other, {"nodes": [{"id": "y"}], "edges": []}, anchor, cache_root=tmp_path)
+    _rename_family(site)
+    discovery.prepare_run(site)
+
+    monkeypatch.chdir(site)
+    unwrapped = extract.load_cached.__wrapped__
+    assert unwrapped(Path(FOO_BAR_FILE), anchor, cache_root=tmp_path) is not None
+    assert extract.load_cached(Path(FOO_BAR_FILE), anchor, cache_root=tmp_path) is None
+    assert extract.load_cached(Path(other), anchor, cache_root=tmp_path) is not None
+
+
+def test_the_force_miss_set_survives_a_run_that_never_extracts(tmp_path, _isolated_discovery_state):
+    """A run interrupted after detect(), or one with nothing to extract, must
+    not lose the set: it carries over until an extract() completes."""
+    from graphify.drupal import discovery, register
+
+    register.install()
+    import graphify.extract as extract
+
+    root = _bar_site(tmp_path)
+    discovery.prepare_run(root)
+    _rename_family(root)
+    discovery.prepare_run(root)
+    discovery.prepare_run(root)                     # no registry change this time
+    assert (root / FOO_BAR_FILE).as_posix() in discovery.force_miss()
+
+    extract.extract([root / MANAGER], root=root, cache_root=tmp_path)
+    assert discovery.force_miss() == frozenset()
+    data = json.loads((root / "graphify-out" / "drupal-discovery.json").read_text(encoding="utf-8"))
+    assert data["force_miss"] == []
+    discovery.prepare_run(root)
+    assert discovery.force_miss() == frozenset()
+
+
+def test_a_carried_path_that_no_longer_exists_is_dropped(tmp_path, _isolated_discovery_state):
+    from graphify.drupal import discovery
+
+    root = _bar_site(tmp_path)
+    discovery.prepare_run(root)
+    _rename_family(root)
+    discovery.prepare_run(root)
+    (root / FOO_BAR_FILE).unlink()
+    discovery.prepare_run(root)
+    assert (root / FOO_BAR_FILE).as_posix() not in discovery.force_miss()
+    assert (root / FOO_BAZ_FILE).as_posix() in discovery.force_miss()
 
 
 def test_patch_cache_fails_loudly_when_load_cached_disappears(monkeypatch):

@@ -109,6 +109,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
 def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.config_stores import clear_caches
+    from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group
@@ -199,7 +200,11 @@ def _patch_extract(extract: ModuleType) -> None:
                 if len(widened) > len(given):
                     _strip_context(kwargs, widened[len(given):], anchor)
                     paths = widened
-            return original(paths, cache_root, **kwargs)
+            result = original(paths, cache_root, **kwargs)
+            # Only now are the forced files re-extracted; an exception above
+            # leaves the set in place for the next run to carry over.
+            clear_force_miss()
+            return result
         extract_.__name__ = extract_.__qualname__ = "extract"
         extract_.__doc__ = original.__doc__
         return extract_
@@ -290,7 +295,9 @@ def _force_miss_wrapper(original):
     def load_cached(path, root=Path("."), kind="ast", *args, **kwargs):
         if kind == "ast":
             forced = forced_paths()
-            if forced and _absolute(path, root).as_posix() in forced:
+            # Core reads a relative `path` against the working directory
+            # (cache.file_hash), not against `root`, so this does too.
+            if forced and _absolute(path, None).as_posix() in forced:
                 return None
         return original(path, root, kind, *args, **kwargs)
     load_cached.__name__ = load_cached.__qualname__ = "load_cached"

@@ -692,6 +692,28 @@ def current_registry() -> Registry | None:
     return _env_cache_registry
 
 
+def clear_force_miss() -> None:
+    """Mark this run's `force_miss()` set consumed, in process and in the file.
+
+    Called once an extraction has completed; until then the set stays in the
+    registry file, so the next `prepare_run` carries it over.
+    """
+    global _force_miss
+    _force_miss = frozenset()
+    path = os.environ.get(ENV_VAR)
+    if not path:
+        return
+    try:
+        target = Path(path)
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not data.get(_FORCE_MISS_KEY):
+            return
+        data[_FORCE_MISS_KEY] = []
+        target.write_text(json.dumps(data, sort_keys=True, indent=1), encoding="utf-8")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+
+
 def previous_registry() -> Registry | None:
     """The prior run's registry, as read by `prepare_run` before it overwrote
     the file. In-process only — a worker process never sees it, only the
@@ -762,8 +784,10 @@ def prepare_run(
     the same `.graphifyignore`/`.gitignore`/`--exclude` rules and noise-dir
     pruning, so an ignored module defines no type and is never descended.
 
-    The files the change from the previous registry affects (`affected_files`)
-    become this run's `force_miss()` set, kept in process and in the file.
+    The files the change from the previous registry affects (`affected_files`),
+    plus any set a previous run left unconsumed, become this run's
+    `force_miss()` set, kept in process and in the file until
+    `clear_force_miss()` is called after a completed extraction.
     """
     root = Path(root)
     if not _looks_like_drupal(root):
@@ -773,13 +797,18 @@ def prepare_run(
     target = out_dir(root, cache_root) / _REGISTRY_FILENAME
 
     previous: Registry | None = None
+    carried: set[str] = set()
     try:
-        previous = Registry.from_json(json.loads(target.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError, KeyError):
+        data = json.loads(target.read_text(encoding="utf-8"))
+        previous = Registry.from_json(data)
+        # A set no extract() consumed yet (an interrupted run, or one with
+        # nothing to extract) is carried over, minus files that are gone.
+        carried = {str(p) for p in data.get(_FORCE_MISS_KEY) or [] if Path(str(p)).exists()}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
         previous = None
 
     registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore))
-    forced = frozenset(affected_files(previous, registry))
+    forced = frozenset(affected_files(previous, registry) | carried)
 
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
