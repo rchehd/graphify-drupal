@@ -41,3 +41,10 @@ def test_the_extension_defines_its_schemas(tmp_path):
     result = extract_drupal_config(_write(tmp_path))
     assert (extension_id("foo"), "defines_schema", schema_id("foo.settings")) in {
         (e["source"], e["relation"], e["target"]) for e in result["edges"]}
+
+
+def test_a_wildcard_type_and_a_literal_type_get_distinct_ids():
+    assert schema_id("views.area.*") != schema_id("views_area")
+    assert schema_id("entity_reference_selection.default:*") != schema_id(
+        "entity_reference_selection.default")
+    assert schema_id("views_area") == "drupal_config_schema_views_area"

@@ -166,22 +166,6 @@ def _schema_edge(schema: str, config: dict, confidence: str) -> dict[str, Any]:
     }
 
 
-_EXTENSION_TYPES = frozenset({"drupal_module", "drupal_theme", "drupal_profile", "drupal_extension"})
-
-
-def _mark_installed(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    from graphify.drupal.yaml_common import config_id
-
-    core_extension = config_id("core.extension")
-    if not any(n.get("id") == core_extension for n in all_nodes):
-        return
-    installed = {e["target"] for e in all_edges
-                 if e.get("relation") == "installs_extension" and e.get("source") == core_extension}
-    for n in all_nodes:
-        if n.get("type") in _EXTENSION_TYPES:
-            n["installed"] = n.get("id") in installed
-
-
 def resolve_missing_targets(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -244,7 +228,6 @@ def resolve_missing_targets(
             created[target]["missing"] = True
 
     all_nodes.extend(created.values())
-    _mark_installed(all_nodes, all_edges)
 
 
 #: Kept as the previous name so an older registration keeps working.

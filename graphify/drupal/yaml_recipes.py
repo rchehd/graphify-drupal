@@ -6,7 +6,9 @@ recipe id. `install:` does not say module or theme, so it is one relation.
 
 Per pair, the more specific relation wins: install before import, action before
 import. `config.actions` whose arguments use `${…}` depend on recipe input, so
-the action is AMBIGUOUS.
+the action is AMBIGUOUS. A config *name* that uses `${…}` names no configuration
+until the recipe is applied: it becomes no edge, only an entry of the recipe's
+`templated_config` attribute.
 """
 from __future__ import annotations
 
@@ -27,11 +29,9 @@ def extract_drupal_recipe(path: Path, store: ConfigStore) -> dict[str, Any]:
     extra: dict[str, Any] = {"has_content": (path.parent / "content").is_dir()}
     if isinstance(data.get("type"), str):
         extra["recipe_type"] = data["type"]
-    nodes = [node(rid, str(data.get("name") or store.owner), type="drupal_recipe",
-                  layer="extension", path=path, line=1, **extra)]
-
     edges: list[dict[str, Any]] = []
     pairs: set[str] = set()
+    templated: set[str] = set()
 
     def add(target: str, relation: str, **attrs: Any) -> None:
         if target in pairs or target == rid:
@@ -50,6 +50,9 @@ def extract_drupal_recipe(path: Path, store: ConfigStore) -> dict[str, Any]:
     config = data.get("config") if isinstance(data.get("config"), dict) else {}
     actions = config.get("actions") if isinstance(config.get("actions"), dict) else {}
     for name, action in actions.items():
+        if "${" in str(name):
+            templated.add(str(name))
+            continue
         add(config_id(str(name)), "config_action", target_name=str(name),
             confidence="AMBIGUOUS" if "${" in repr(action) else "EXTRACTED",
             actions=sorted(str(k) for k in action) if isinstance(action, dict) else [])
@@ -59,5 +62,12 @@ def extract_drupal_recipe(path: Path, store: ConfigStore) -> dict[str, Any]:
             add(extension_id(str(ext)), "imports_config", target_name=str(ext), wildcard=True)
         elif isinstance(names, list):
             for name in names:
+                if "${" in str(name):
+                    templated.add(str(name))
+                    continue
                 add(config_id(str(name)), "imports_config", target_name=str(name))
+    if templated:
+        extra["templated_config"] = sorted(templated)
+    nodes = [node(rid, str(data.get("name") or store.owner), type="drupal_recipe",
+                  layer="extension", path=path, line=1, **extra)]
     return {"nodes": nodes, "edges": edges}

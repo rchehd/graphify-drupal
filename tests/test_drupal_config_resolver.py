@@ -62,7 +62,21 @@ def test_undeclared_p1b_targets_get_the_type_their_id_names():
     assert created[extension_id("claro")]["type"] == "drupal_extension"
 
 
-def test_installed_and_missing_follow_core_extension():
+def test_an_absent_extension_installed_by_core_extension_is_missing():
+    core_ext = config_id("core.extension")
+    nodes = [_cfg("core.extension"), {"id": extension_id("node"), "type": "drupal_module"}]
+    edges = [_edge(core_ext, "installs_extension", extension_id("node"), target_name="node"),
+             _edge(core_ext, "installs_extension", extension_id("gone"), target_name="gone")]
+    resolve_missing_targets([], nodes, edges)
+    by_id = {n["id"]: n for n in nodes}
+    assert by_id[extension_id("gone")]["missing"] is True
+    assert by_id[extension_id("gone")]["external"] is True
+    assert "missing" not in by_id[extension_id("node")]
+
+
+def test_no_node_carries_installed():
+    """`installed` would be written onto nodes of unchanged files, which an
+    incremental run never returns; the core.extension edges carry the fact."""
     core_ext = config_id("core.extension")
     nodes = [_cfg("core.extension"),
              {"id": extension_id("node"), "type": "drupal_module"},
@@ -70,17 +84,7 @@ def test_installed_and_missing_follow_core_extension():
     edges = [_edge(core_ext, "installs_extension", extension_id("node"), target_name="node"),
              _edge(core_ext, "installs_extension", extension_id("gone"), target_name="gone")]
     resolve_missing_targets([], nodes, edges)
-    by_id = {n["id"]: n for n in nodes}
-    assert by_id[extension_id("node")]["installed"] is True
-    assert by_id[extension_id("devel")]["installed"] is False
-    assert by_id[extension_id("gone")]["installed"] is True
-    assert by_id[extension_id("gone")]["missing"] is True
-
-
-def test_without_core_extension_nothing_carries_installed():
-    nodes = [{"id": extension_id("node"), "type": "drupal_module"}]
-    resolve_missing_targets([], nodes, [])
-    assert "installed" not in nodes[0]
+    assert [n["id"] for n in nodes if "installed" in n] == []
 
 
 def test_a_shipped_configs_missing_owner_is_named_from_its_store(tmp_path):

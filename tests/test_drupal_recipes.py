@@ -86,3 +86,29 @@ def test_recipe_config_defines_config_edge(tmp_path):
     assert edges[config_id("node.type.article")]["relation"] == "defines_config"
     assert edges[config_id("node.type.article")]["source"] == recipe_id("blog")
     assert edges[config_id("node.type.article")]["install_mode"] == "recipe"
+
+
+def test_a_templated_config_name_is_an_attribute_not_an_edge(tmp_path):
+    """`${…}` in a config *name* is unknowable until the recipe is applied."""
+    from graphify.drupal.resolvers import resolve_missing_targets
+
+    text = RECIPE.replace("      - node.type.article\n",
+                          "      - node.type.article\n      - 'core.entity_form_display.${bundle}'\n")
+    text += "    node.type.${node_type}:\n      createIfNotExists:\n        name: Test\n"
+    result = extract_drupal_config(_write(tmp_path, text))
+    [recipe] = result["nodes"]
+    assert recipe["templated_config"] == ["core.entity_form_display.${bundle}",
+                                          "node.type.${node_type}"]
+    assert not [e for e in result["edges"] if "${" in repr(e)]
+    assert config_id("node.type.article") in _by_target(result)
+
+    nodes, edges = list(result["nodes"]), list(result["edges"])
+    resolve_missing_targets([result], nodes, edges)
+    assert not [n for n in nodes if "${" in repr(n.get("config_name", ""))]
+    assert not [n for n in nodes if n["id"] in (config_id("node.type.${node_type}"),
+                                                config_id("core.entity_form_display.${bundle}"))]
+
+
+def test_a_recipe_without_templated_names_has_no_templated_attribute(tmp_path):
+    [recipe] = extract_drupal_config(_write(tmp_path))["nodes"]
+    assert "templated_config" not in recipe

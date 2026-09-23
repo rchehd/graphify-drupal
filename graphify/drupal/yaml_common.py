@@ -181,7 +181,8 @@ def config_id(name: str) -> str:
 
 
 def schema_id(type_: str) -> str:
-    return make_id("drupal", "config_schema", type_)
+    # `*` would otherwise normalise away, merging `views.area.*` with `views_area`.
+    return make_id("drupal", "config_schema", type_.replace("*", "_wildcard_"))
 
 
 def recipe_id(directory: str) -> str:
