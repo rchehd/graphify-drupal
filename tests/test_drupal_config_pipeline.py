@@ -72,3 +72,20 @@ def test_settings_php_keeps_its_php_nodes_and_gains_overrides(tmp_path):
     assert (settings_id("default/settings.php"), "overrides_config", config_id("system.site")) in {
         (e["source"], e["relation"], e["target"]) for e in result["edges"]}
     assert "Secret Name" not in repr(result)
+
+
+def test_synced_and_shipped_copies_are_one_active_node(tmp_path):
+    from graphify.extract import extract
+
+    paths = [
+        _touch(tmp_path, "config/sync/core.extension.yml", "module:\n  system: 0\n"),
+        _touch(tmp_path, "config/sync/system.site.yml", "name: Site\n"),
+        _touch(tmp_path, "web/core/modules/system/system.info.yml", "name: System\ntype: module\n"),
+        _touch(tmp_path, "web/core/modules/system/config/install/system.site.yml", "name: ''\n"),
+    ]
+    result = extract(paths, cache_root=tmp_path / ".cache", root=tmp_path)
+    [site] = [n for n in result["nodes"] if n["id"] == config_id("system.site")]
+    assert site["active"] is True
+    assert site["install_mode"] == "install"
+    assert site["declared_in"] == ["config/sync/system.site.yml",
+                                   "web/core/modules/system/config/install/system.site.yml"]

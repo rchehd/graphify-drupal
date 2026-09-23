@@ -19,6 +19,9 @@ from typing import Any
 #: Set by `yaml_common.node` on everything the Drupal extractors emit.
 _ORIGIN = "static_yaml"
 
+#: Nodes without a store rank sort after every ranked one and among themselves by path.
+_NO_RANK = 99
+
 
 def _relative(source_file: str, root: Path | None) -> str:
     """`declared_in` reaches graph.json as-is, so it must not carry the checkout path."""
@@ -33,8 +36,7 @@ def _relative(source_file: str, root: Path | None) -> str:
 def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = None) -> None:
     """Keep one node per Drupal id, in place.
 
-    The survivor is the declaration with the lowest `source_file`, so the choice
-    does not depend on extraction order. When there was more than one, every
+    The survivor is the copy with the lowest `_rank`, then the lowest `source_file`; attributes it lacks are taken from the other copies in that order. When there was more than one, every
     declaring file is kept in `declared_in`, relative to `root`.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -46,8 +48,15 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
     for group in groups.values():
         if len(group) < 2:
             continue
-        group.sort(key=lambda n: str(n.get("source_file", "")))
+        # Configuration ranks its stores (sync > split > recipe > optional >
+        # install, P1b spec §6.1); every other type has no rank and keeps the
+        # path order.
+        group.sort(key=lambda n: (n.get("_rank", _NO_RANK), str(n.get("source_file", ""))))
         survivor = group[0]
+        for other in group[1:]:
+            for key, value in other.items():
+                if key not in survivor and key != "_rank":
+                    survivor[key] = value
         survivor["declared_in"] = sorted(
             {_relative(str(n.get("source_file", "")), root) for n in group}
         )
@@ -55,3 +64,6 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
 
     if drop:
         nodes[:] = [n for n in nodes if id(n) not in drop]
+    for node in nodes:
+        if node.get("_origin") == _ORIGIN:
+            node.pop("_rank", None)

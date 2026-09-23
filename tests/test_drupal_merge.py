@@ -105,3 +105,23 @@ def test_injection_into_an_overridden_service_survives(tmp_path):
     assert (service_id("foo.clock"), "injects_service", service_id("datetime.time")) in {
         (e["source"], e["relation"], e["target"]) for e in result["edges"]
     }
+
+
+def test_the_lowest_rank_survives_and_gaps_are_filled():
+    nodes = [
+        _node("drupal_config_system_site", "web/core/modules/system/config/install/system.site.yml",
+              _rank=4, install_mode="install", active=False),
+        _node("drupal_config_system_site", "config/sync/system.site.yml", _rank=0, active=True),
+    ]
+    collapse_drupal_duplicates(nodes)
+    [kept] = nodes
+    assert kept["source_file"] == "config/sync/system.site.yml"
+    assert kept["active"] is True
+    assert kept["install_mode"] == "install"
+    assert "_rank" not in kept
+
+
+def test_rank_is_removed_from_single_nodes_too():
+    nodes = [_node("drupal_config_a", "config/sync/a.yml", _rank=0)]
+    collapse_drupal_duplicates(nodes)
+    assert "_rank" not in nodes[0]
