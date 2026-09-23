@@ -65,24 +65,33 @@ def learned_family(path: Path) -> tuple[str, PluginType] | None:
     # Imported here: `families` imports this module to build its dispatch table.
     from graphify.drupal.families import is_drupal_yaml
 
+    # Re-checked here rather than trusted to `families.drupal_extractor`'s own
+    # dispatch order: `learned_family` is a public function callers query
+    # directly (see the tests), so it must be correct standing alone, not just
+    # as a second opinion after `family_extractor` already ruled a P1 suffix out.
     if is_drupal_yaml(path):
         return None
 
-    by_name = _by_yaml_name(registry)
-    for yaml_name in sorted(by_name, key=len, reverse=True):
-        if yaml_name == middle:
-            return ext, by_name[yaml_name]
-    return None
+    # `middle` is fully determined by `ext` (fixed above as the first
+    # dot-segment) and the ".yml" suffix, so this is a lookup, not a search --
+    # a yaml_name with its own dots (`modeler_api.contexts` in
+    # `eca.modeler_api.contexts.yml`) is looked up whole, never split further.
+    found = _by_yaml_name(registry).get(middle)
+    return (ext, found) if found is not None else None
 
 
-def plugin_type_for_family(yaml_name: str) -> str | None:
-    """The type id for a P1 family suffix (`links.menu`, `breakpoints`, ...),
-    or None when there is no registry or no learned type reads that name."""
+def plugin_type_for_family(yaml_name: str) -> tuple[str, str] | None:
+    """`(type id, plugin type name)` for a P1 family suffix (`links.menu`,
+    `breakpoints`, ...), or None when there is no registry or no learned type
+    reads that name. Both are needed at the call site: the id is the edge's
+    `target`, the name is its `target_name` -- without the latter, an
+    unresolved target the resolver later materialises is labelled with its
+    raw id (`drupal_plugin_type_bar`) instead of the type's name (`bar`)."""
     registry = current_registry()
     if registry is None:
         return None
     found = _by_yaml_name(registry).get(yaml_name)
-    return type_id(found.plugin_type) if found is not None else None
+    return (type_id(found.plugin_type), found.plugin_type) if found is not None else None
 
 
 def extract_drupal_yaml_plugins(path: Path) -> dict[str, Any]:
@@ -120,6 +129,7 @@ def extract_drupal_yaml_plugins(path: Path) -> dict[str, Any]:
         nodes.append(node(pid, key, type="drupal_plugin", layer="plugin", path=path, line=line,
                           plugin_id=key, plugin_type=plugin_type.plugin_type, **extra))
         edges.append(edge(owner_id, pid, "provides_plugin", path=path, line=line))
-        edges.append(edge(pid, tid, "plugin_of_type", path=path, line=line))
+        edges.append(edge(pid, tid, "plugin_of_type", path=path, line=line,
+                          target_name=plugin_type.plugin_type))
 
     return {"nodes": nodes, "edges": edges}

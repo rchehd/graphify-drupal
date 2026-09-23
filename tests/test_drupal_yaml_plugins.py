@@ -35,6 +35,26 @@ FOO_BAR = (
 
 BAR_SERVICES = "services:\n  plugin.manager.bar:\n    class: Drupal\\bar\\BarManager\n"
 
+MULTI_DOT_MANAGER = r"""<?php
+namespace Drupal\modctx;
+
+use Drupal\Core\Plugin\Discovery\YamlDiscoveryDecorator;
+use Drupal\Core\Plugin\Discovery\YamlDiscovery;
+
+class ContextManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  protected function getDiscovery() {
+    if (!$this->discovery) {
+      $discovery = new AnnotatedClassDiscovery($this->subdir, $this->namespaces);
+      $discovery = new YamlDiscoveryDecorator($discovery, 'modeler_api.contexts', $this->moduleHandler->getModuleDirectories());
+      $this->discovery = new ContainerDerivativeDiscoveryDecorator($discovery);
+    }
+    return $this->discovery;
+  }
+}
+"""
+
+MODCTX_SERVICES = "services:\n  plugin.manager.modctx:\n    class: Drupal\\modctx\\ContextManager\n"
+
 DEFERRED_MANAGER = r"""<?php
 namespace Drupal\baz;
 
@@ -138,6 +158,47 @@ def test_learned_family_none_without_a_registry(tmp_path, _isolated_discovery_st
     assert learned_family(path) is None
 
 
+def test_learned_family_resolves_a_multi_dot_yaml_name(tmp_path, _isolated_discovery_state):
+    """`eca.modeler_api.contexts.yml`: `ext` is the first dot-segment ("eca"),
+    and everything between it and `.yml` — itself containing a dot — is the
+    yaml_name looked up as a whole, not split further."""
+    files = {
+        **_module("modctx", MODCTX_SERVICES, {"src/ContextManager.php": MULTI_DOT_MANAGER}),
+        **_module("eca", "services: {}\n"),
+        "web/modules/custom/eca/eca.modeler_api.contexts.yml": "one:\n  class: Drupal\\eca\\One\n",
+    }
+    root = _site(tmp_path, files)
+    registry = prepare_run(root)
+    assert registry.types["modctx"].yaml_name == "modeler_api.contexts"
+
+    path = root / "web/modules/custom/eca/eca.modeler_api.contexts.yml"
+    found = learned_family(path)
+    assert found is not None
+    owner, plugin_type = found
+    assert owner == "eca"
+    assert plugin_type.plugin_type == "modctx"
+
+
+def test_null_valued_plugin_definition_still_gets_a_node(tmp_path, _isolated_discovery_state):
+    files = {
+        **_module("bar", BAR_SERVICES, {"src/BarManager.php": YAML_MANAGER}),
+        **_module("foo", "services: {}\n"),
+        "web/modules/custom/foo/foo.bar.yml": "one:\n  class: Drupal\\foo\\One\ntwo:\n",
+    }
+    root = _site(tmp_path, files)
+    prepare_run(root)
+
+    result = extract_drupal_yaml_plugins(root / "web/modules/custom/foo/foo.bar.yml")
+    by_pid = {n["plugin_id"]: n for n in result["nodes"]}
+    assert set(by_pid) == {"one", "two"}
+    two = by_pid["two"]
+    assert set(two) - _UNIVERSAL == {"plugin_id", "plugin_type", "provider"}
+
+    rel = {(e["source"], e["relation"], e["target"]) for e in result["edges"]}
+    assert (extension_id("foo"), "provides_plugin", plugin_id("bar", "two")) in rel
+    assert (plugin_id("bar", "two"), "plugin_of_type", type_id("bar")) in rel
+
+
 def test_is_drupal_file_true_only_while_the_registry_is_set(tmp_path, _isolated_discovery_state):
     import os
 
@@ -175,26 +236,55 @@ def test_p1_menu_links_get_plugin_of_type_only_with_a_registry(tmp_path, _isolat
 
     root = _menu_site(tmp_path)
     prepare_run(root)
-    assert plugin_type_for_family("links.menu") == type_id("menu.link")
+    assert plugin_type_for_family("links.menu") == (type_id("menu.link"), "menu.link")
 
     with_registry = extract_drupal_menu_links(menu_path)
     lid = link_id("menu_link", "foo.admin")
     rel = {(e["source"], e["relation"], e["target"]) for e in with_registry["edges"]}
     assert (lid, "plugin_of_type", type_id("menu.link")) in rel
+    plugin_edge = next(e for e in with_registry["edges"] if e["relation"] == "plugin_of_type")
+    assert plugin_edge["target_name"] == "menu.link"
 
 
-def test_resolver_materialises_a_missing_plugin_type():
-    source = plugin_id("bar", "one")
-    tid = type_id("bar")
-    nodes = [{"id": source, "type": "drupal_plugin", "label": "one"}]
-    edges = [{"source": source, "relation": "plugin_of_type", "target": tid, "target_name": "bar",
-              "source_file": "web/modules/custom/foo/foo.bar.yml", "confidence": "EXTRACTED"}]
+def test_resolver_materialises_missing_plugin_types_labelled_by_name(tmp_path, _isolated_discovery_state):
+    """Through the real extractor path, not a fabricated edge dict: a
+    learned-family plugin file and a P1 links file, neither of whose type's
+    manager PHP file is itself passed to any extractor -- the drupal_plugin_type
+    node only ever exists as something the resolver materialises. Regression
+    for the bug where the three `plugin_of_type` call sites omitted
+    `target_name`, so the materialised node was labelled with its raw id
+    (`drupal_plugin_type_bar`) instead of the plugin type's name (`bar`)."""
+    files = {
+        **_module("bar", BAR_SERVICES, {"src/BarManager.php": YAML_MANAGER}),
+        **_module("foo", "services: {}\n"),
+        "web/modules/custom/foo/foo.bar.yml": FOO_BAR,
+        "web/modules/custom/foo/foo.links.menu.yml":
+            "foo.admin:\n  title: Foo\n  route_name: foo.settings\n",
+        "web/core/core.services.yml": CORE_SERVICES,
+        "web/core/lib/Drupal/Core/Menu/MenuLinkManagerInterface.php": MENU_LINK_INTERFACE,
+        "web/core/lib/Drupal/Core/Menu/MenuLinkManager.php": MENU_LINK_MANAGER,
+    }
+    root = _site(tmp_path, files)
+    prepare_run(root)
+
+    plugins = extract_drupal_yaml_plugins(root / "web/modules/custom/foo/foo.bar.yml")
+    links = extract_drupal_menu_links(root / "web/modules/custom/foo/foo.links.menu.yml")
+    nodes = list(plugins["nodes"]) + list(links["nodes"])
+    edges = list(plugins["edges"]) + list(links["edges"])
+
     resolve_missing_targets([], nodes, edges)
-    created = next(n for n in nodes if n["id"] == tid)
-    assert created["type"] == "drupal_plugin_type"
-    assert created["layer"] == "plugin"
-    assert created["missing"] is True
-    assert created["external"] is True
+
+    by_id = {n["id"]: n for n in nodes}
+    bar_type = by_id[type_id("bar")]
+    assert bar_type["type"] == "drupal_plugin_type"
+    assert bar_type["layer"] == "plugin"
+    assert bar_type["missing"] is True
+    assert bar_type["external"] is True
+    assert bar_type["label"] == "bar"          # not the raw id "drupal_plugin_type_bar"
+
+    menu_link_type = by_id[type_id("menu.link")]
+    assert menu_link_type["missing"] is True
+    assert menu_link_type["label"] == "menu.link"
 
 
 def test_pipeline_has_no_dangling_endpoints_for_the_new_relations(tmp_path, _isolated_discovery_state):

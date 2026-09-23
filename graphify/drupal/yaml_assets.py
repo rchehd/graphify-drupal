@@ -133,6 +133,8 @@ def extract_drupal_breakpoints(path: Path) -> dict[str, Any]:
                           layer="presentation", path=path, line=line, **extra))
         edges.append(edge(owner_id, bid, "declares_breakpoint", path=path, line=line))
         if plugin_type:
-            edges.append(edge(bid, plugin_type, "plugin_of_type", path=path, line=line))
+            type_id_, type_name = plugin_type
+            edges.append(edge(bid, type_id_, "plugin_of_type", path=path, line=line,
+                              target_name=type_name))
 
     return {"nodes": nodes, "edges": edges}

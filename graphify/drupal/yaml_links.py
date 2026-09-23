@@ -72,7 +72,8 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str, family:
                           type=node_type, layer="routing", path=path, line=line, **extra))
         add_edge(owner_id, lid, declares, line)
         if plugin_type:
-            add_edge(lid, plugin_type, "plugin_of_type", line)
+            type_id_, type_name = plugin_type
+            add_edge(lid, type_id_, "plugin_of_type", line, target_name=type_name)
 
         if isinstance(route, str) and route:
             add_edge(lid, route_id(route), "links_to_route", line, target_name=route)
