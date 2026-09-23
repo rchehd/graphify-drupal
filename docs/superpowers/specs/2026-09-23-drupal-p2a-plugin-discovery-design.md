@@ -25,8 +25,8 @@ presented as "absent".
 | Measured | core | contrib | custom | total |
 |---|---|---|---|---|
 | services with `parent: default_plugin_manager` | 21 | 44 | 2 | 67 |
-| concrete plugin-manager classes (full-tree scan) | — | — | — | 117 |
-| … reached from `*.services.yml` by class → PSR-4 → `extends` chain | — | — | — | 117 − 3 |
+| concrete plugin-manager classes (full-tree scan) | — | — | — | 117 (measured 122, §8) |
+| … reached from `*.services.yml` by class → PSR-4 → `extends` chain | — | — | — | 117 − 3 (measured 118, §8) |
 | managers overriding `getDiscovery()` | 14 | 4 | 0 | 18 |
 | YAML plugin families read by a manager, not P1's | — | — | — | 14 families, 72 files, 260 plugins |
 | module-root `*.yml` no P1/P1b family claims | — | — | — | 243 (80 are `.gitlab-ci.yml`) |
@@ -38,10 +38,15 @@ The three managers the services chain misses, and why:
 | `migrate_drupal`'s `MigrationPluginManager` | swapped in by `ServiceProvider::alter()` in PHP |
 | `MetatagViewsCachePluginManager`, `backup_migrate\Core\Plugin\PluginManager` | not services; constructed with `new` |
 
+Corrected in §8: `backup_migrate`'s `PluginManager` is not a Drupal manager; the
+chain also misses `mailsystem`'s `MailsystemManager` and `symfony_mailer`'s
+`MailManagerReplacement`, both swapped in by a `ServiceProvider::alter()`.
+
 Plus two shapes a naive chain would miss, present on the corpus:
 `MenuLinkManager` is a manager only through `implements MenuLinkManagerInterface`
 (which extends `PluginManagerInterface`), and `Drupal\ckeditor5_font\…` lives in
-module `ckeditor5_plugin_pack_font`, so PSR-4 by machine name cannot find it.
+module `ckeditor5_plugin_pack_font`, so PSR-4 by machine name cannot find it
+(corrected in §8: that class is absent from the corpus — a dead service).
 
 `YamlDiscovery` is also used by classes that are **not** plugin managers:
 `RouteBuilder` (`routing`), `PermissionHandler` (`permissions`), `MigrationState`
@@ -127,10 +132,25 @@ so they obey the same "a file owns its nodes" rule as everything else.
 
 `discovery.build_registry(web_root) -> Registry`:
 
+0. **Only Drupal trees.** A registry is built only when the scan root has a
+   Drupal marker: a web root at, below or above it (step 1), or a `*.info.yml`
+   directly in it (a single extension checkout). Any other tree is not walked:
+   no registry, no `drupal-discovery.json`, no inventory — and a stale
+   `drupal-inventory.json` in the out dir is removed.
 1. **Web root.** The scan root if it holds `core/lib/Drupal.php`; else its
    `web/` or `docroot/` child if that does; else the nearest ancestor that
    does; else none — the scan root is used alone and the inventory records
    `no_drupal_core`.
+
+   **Scope.** The walk honours core's ignore rules
+   (`graphify.detect.ignored_predicate` with `detect`'s `extra_excludes` and
+   `gitignore`): an ignored directory is never descended, an ignored file never
+   read. On a Drupal tree this costs one extra ignore evaluation per ignored
+   directory. When the web root is an ancestor of the scan root the walk covers
+   the web root, outside the scan root, and those paths are not subject to the
+   scan's ignore rules (the predicate is anchored at the scan root). A
+   composer-managed site that gitignores `web/core` and `web/modules/contrib`
+   learns only its custom managers unless run with `--no-gitignore` (§8).
 2. **Extensions.** Every `<name>.info.yml` gives a machine name and directory;
    PSR-4 maps `Drupal\<name>\` → `<dir>/src`, `Drupal\Core\` →
    `core/lib/Drupal/Core`, `Drupal\Component\` → `core/lib/Drupal/Component`.
@@ -151,9 +171,19 @@ so they obey the same "a file owns its nodes" rule as everything else.
    `YamlDirectoryDiscovery` (directory discovery: `deferred_to` P6 when the
    manager is migrations', else `discovery: dynamic`), any other discovery
    class (`dynamic`); `alterInfo('<name>')`. Inherited `getDiscovery()` from a
-   parent manager class in the chain counts.
+   parent manager class in the chain counts. A discovery built in
+   `__construct()` (assigned to `$this->discovery`, as `modeler_api`'s managers
+   do) is read the same way; when a class has both, `getDiscovery()` wins.
+   `read_php_class` reads the declaration named after the file (PSR-4), else
+   the first one, so a BC shim declared before the class does not win.
 7. **Deferred families** are a fixed table: `component` (SDC) → P5, the
-   migrations manager and `migrate_drupal` → P6.
+   migrations manager and `migrate_drupal` → P6. A deferred type is never
+   `dynamic` and never `managers_unresolved`: it is listed as deferred (both
+   families are YAML-defined, and P5/P6 read them).
+8. **Service providers.** A `*ServiceProvider.php` whose `alter()` calls
+   `->setClass()` is a `service_provider_alter` entry; each class it sets that
+   is a manager no type covers gets its own entry of that reason, naming the
+   class (P3 follows it).
 
 Performance budget: under 5 seconds on the corpus; measured in the plan.
 
@@ -172,6 +202,8 @@ the parent's in-process registry. The `detect` wrapper writes
 `drupal-discovery.json` and sets `GRAPHIFY_DRUPAL_DISCOVERY` to its absolute
 path; `discovery.current_registry()` returns the in-process registry, else loads
 that file once per process. Both `fork` and `spawn` inherit the environment.
+The file also carries `force_miss` (§5.5), so a spawn/forkserver worker, which
+re-checks the cache before extracting, misses the same files as the parent.
 
 ### 5.4 Plugin-type nodes come from a synthetic file
 
@@ -199,6 +231,10 @@ extension roots, and for every changed manager its class file, are:
 
 A newly learned family needs neither: its files had no nodes, and core
 re-queues zero-node files.
+
+The forced set is kept in `drupal-discovery.json` (`force_miss`) and carried
+into the next run's set until an `extract()` completes: an interrupted run, or a
+`detect` with nothing to extract, does not lose it.
 
 ### 5.6 Watch
 
@@ -228,7 +264,8 @@ raise the LLM `needs_update` flag.
 
 A wrapper on `report.generate` appends a "Drupal coverage" section rendered
 from the inventory (from process state, else `<out>/drupal-inventory.json`
-beside the report).
+beside the report). A non-Drupal run removes `drupal-inventory.json` from the
+out dir, so a stale one cannot resurrect the section.
 
 ### 5.8 Errors
 
@@ -265,3 +302,61 @@ missing.
   as stale plugin nodes, which acceptance criterion 6 tests.
 - **tree-sitter PHP grammar drift** upstream: pinned by core's lockfile, and the
   seam's PHP reads are covered by unit tests on real manager shapes.
+
+## 8. Measured
+
+On `/home/user/Projects/FormsRemote`, 2026-09-23 (plan Tasks 2 and 9; the corpus
+acceptance tests are `tests/test_drupal_corpus.py::test_p2a_*`). Everything is
+measured with `--no-gitignore` (`prepare_run(..., gitignore=False)`) unless
+stated, because of the first row.
+
+| Measured | Value |
+|---|---|
+| types with the corpus's own `.gitignore` honoured (the default) | **2** — `system_type`, `webform_integration_type`, both custom; no `yaml_name`, so no P1 node gets `plugin_of_type` (`.gitignore` lists `/web/core` and `/web/modules/contrib`) |
+| plugin types | 143: 140 registered, 3 second-net |
+| distinct manager classes behind them | 121: 118 registered, 3 second-net (5 classes back several services: `ViewsPluginManager`/`ViewsHandlerManager` 23 `views.*`, `MigratePluginManager` 2, `KeyPluginManager` 3, `BetterExposedFiltersWidgetManager` 3) |
+| `discovery` | annotation 76, mixed 35, yaml 20, attribute 9, dynamic 3 |
+| deferred types | `sdc` → P5; `migration` and `class:Drupal\migrate_drupal\MigrationPluginManager` → P6 |
+| `by_yaml_name` families | 19: the 14 learned families of §2 (the three `modeler_api.*` need rule 6's `__construct()` reading) and P1's 5; not `routing`, `permissions` or `migrate_drupal` |
+| concrete manager classes, full-tree scan (criterion 1) | 122: the 121 type classes and `symfony_mailer`'s `MailManagerReplacement` — every one a type or a `managers_unresolved` entry |
+| `managers_unresolved` | 22: `service_provider_alter` 14, `dynamic_discovery` 3, `not_a_service` 3, `parse_error` 1, `psr4_unresolved` 1 |
+| extension-root `<ext>.<name>.yml` files (criterion 2) | 1,081: P1/P1b 1,005, learned 72, deferred 0, unrecognised 4 — each in exactly one bucket |
+| learned-family files / YAML plugins (criterion 3) | 72 / 260, as §2 |
+| P1 plugin nodes with one `plugin_of_type` target (criterion 4) | 924 of 924 |
+| `drupal_plugin` attributes outside §4.1 (criterion 5) | none |
+| full `detect` inventory summary | unrecognised 4 families / 4 files (`permission`, `plugin_type`, `service`, `starterkit`), deferred 285 files (`component` 33, `migrations` 252), filtered 897 |
+| `build_registry` (criterion 8) | 2.0–3.0 s (load ≈ 3.5 on 14 cores); 2.4–2.5 s in Task 2 at lower load |
+| `prepare_run` (what `detect` pays), whole tree | ≈ 5 s: the build plus core's ignore predicate on every walked file and directory; ≈ 0.8 s with the `.gitignore` honoured |
+
+Differences from §2, and why:
+
+- **117 → 122 concrete managers, 114 → 118 registered classes.** §2's figures
+  were a hand count. The extra registered classes are managers a manual count
+  can leave out: `EntityTypeManager`, `TypedDataManager` and
+  `TypedConfigManager` (all extend `DefaultPluginManager`), and webprofiler's
+  `EntityTypeManagerWrapper` and `MailManagerWrapper`, which decorate core
+  managers (types `webprofiler.debug.entity_type.manager`,
+  `webprofiler.debug.mail_manager`). 143 types, not 117 plus the second net,
+  because a type is per service.
+- **`backup_migrate\Core\Plugin\PluginManager` is not a Drupal manager.** It
+  implements backup_migrate's own `PluginManagerInterface`, which extends
+  nothing.
+- **`mailsystem\MailsystemManager` is a second-net manager** §2 does not list
+  (extends `MailManager`, swapped in by `MailsystemServiceProvider::alter()`).
+- **`symfony_mailer\MailManagerReplacement`** is swapped in by
+  `SymfonyMailerServiceProvider::alter()` and is neither a service nor
+  `*Manager.php`; the full-tree scan found it silent, so §5.1 rule 8 now names
+  a manager a provider sets.
+- **`Drupal\ckeditor5_font\FontColorsManager` is absent from the corpus** — the
+  module ships only `src/Plugin/CKEditor5Plugin/*`, so it is a dead service
+  (`psr4_unresolved`), not a PSR-4-by-machine-name problem.
+- The `parse_error` is `azure_oauth_sso`'s service class `BaseOAuth`, a trait.
+- `dynamic_discovery`: `TypedConfigManager` (schema discovery built outside a
+  `new`), `ConstraintManager` (`parent::getDiscovery()` wrapped in a static
+  decorator), `MigrateSourcePluginManager`
+  (`AttributeDiscoveryWithAnnotationsAutomatedProviders`, whose short name is
+  not in the table).
+- Four P1 plugin nodes are declared by two files each (collapsed to one node,
+  `declared_in` of 2) and so carry two identical `plugin_of_type` edges; the
+  reader folds parallel edges of one relation, so the graph has one.
+

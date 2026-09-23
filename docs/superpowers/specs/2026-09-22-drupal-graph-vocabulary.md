@@ -174,6 +174,36 @@ node from the AST layer carries an `alters_container` edge to its module.
 dynamic`. The value `dynamic` is an explicit statement that static analysis
 cannot enumerate this type's instances and the container is authoritative.
 
+`<id>` is the manager's service id without a leading `plugin.manager.`
+(`block`, `menu.link`); a service id without that prefix is used whole; a
+manager that is not a service uses `class:<FQCN>`. Label `<id>`. The node is
+emitted by the extraction of the manager's class file, so `source_file`/
+`source_location` point at the class declaration (P2a spec §5.4).
+
+| Attribute | Value |
+|---|---|
+| `plugin_type` | `<id>` |
+| `discovery` | `annotation`, `attribute`, `yaml`, `mixed` (more than one), or `dynamic` (a discovery built in `getDiscovery()` or `__construct()` that is not statically readable) |
+| `manager_class` | FQCN |
+| `registered` | `true` when a `*.services.yml` service reaches the class, else `false` |
+| `manager_service` | the service id; absent when not registered |
+| `subdir` | `Plugin/Block`, from `parent::__construct`'s first argument when a literal |
+| `interface`, `annotation_class`, `attribute_class` | FQCNs from `parent::__construct`, when literal or `::class` |
+| `yaml_name` | the `YamlDiscovery`/`YamlDiscoveryDecorator` name, when any |
+| `alter_hook` | the `alterInfo('x')` literal, when any (a hook node comes in P2b) |
+| `deferred_to` | `P5` for SDC, `P6` for migrations; a deferred type is never `dynamic` |
+
+Empty attributes are omitted.
+
+`drupal_plugin` (P2a: YAML-discovered plugins of a learned type whose family no
+other phase owns — one per top-level key of `<ext>.<yaml_name>.yml`) carries,
+beyond the universal attributes, exactly `plugin_id`, `plugin_type`,
+`provider` (the owning extension), and `class_name`/`deriver` when the
+definition has `class:`/`deriver:`. Labels, weights and settings are values and
+never reach the graph. P1's menu links, local tasks, local actions, contextual
+links and breakpoints are YAML-discovered plugins too; they keep their own node
+types and gain a `plugin_of_type` edge instead.
+
 ### 3.5 Hooks — `layer: hook`
 
 | Type | ID | Source |
@@ -292,13 +322,23 @@ parallel taxonomy.
 
 | Relation | Source → target | Attributes |
 |---|---|---|
-| `defines_plugin_type` | module → plugin_type | the manager service and its class |
+| `defines_plugin_type` | module → plugin_type | `owner`; the manager service and class are node attributes |
 | `plugin_manager_for` | service → plugin_type | |
 | `provides_plugin` | module → plugin | |
 | `plugin_of_type` | plugin → plugin_type | |
 | `plugin_implemented_by` | plugin → PHP class | |
 | `derives_plugins` | plugin → deriver class | `deriver:` in annotation/attribute |
 | `configures_plugin` | config → plugin | e.g. `block.block.*` → block plugin, `field.field.*` → formatter |
+
+P2a emits the first four. `defines_plugin_type` comes from the manager's owner
+(the extension of its services file, or of its class file when it is not a
+service; `core` for `core/lib` and `core.services.yml`); `plugin_manager_for`
+only for registered managers; `plugin_of_type` from every `drupal_plugin` and
+from every P1 menu link, local task, local action, contextual link and
+breakpoint whose family is some learned type's `yaml_name`. The plugin's class
+and deriver are recorded as `class_name`/`deriver` attributes until PHP class
+nodes can be bound: `plugin_implemented_by` and `derives_plugins` come in P4
+(with PHP-discovered plugins), `configures_plugin` in P6.
 
 ### 4.5 Hooks
 
@@ -443,11 +483,45 @@ and why divergence between the two is recorded rather than resolved.
 ### 5.3 Ordering constraint: classification runs before PHP
 
 `detect.classify_file()` runs before any PHP is parsed, so a learned YAML pattern
-cannot influence classification in the same pass. A **pre-pass** scans only
-`*.services.yml` and plugin-manager classes, writes
-`graphify-out/drupal-discovery.json`, and that file feeds classification.
-Services files number in the dozens, so the pre-pass costs seconds and is
-invalidated by content hash.
+must exist before the first file is classified. The registry is therefore
+**built at the start of every `detect`** (a wrapper on `detect.detect`), from
+`*.services.yml` and plugin-manager classes only — about 2–3 s on the reference
+corpus (P2a spec §8).
+
+`graphify-out/drupal-discovery.json` is an **output**, not an input. It is never
+trusted as a cache of the registry: an input cache would need invalidating on
+every services file, every manager class and every `.info.yml`, and a stale
+entry would silently misclassify YAML. It exists for two readers:
+
+- **extraction workers** — core extracts in a `ProcessPoolExecutor`, and a
+  worker never runs `detect`; the wrapper sets `GRAPHIFY_DRUPAL_DISCOVERY` to the
+  file's absolute path and `current_registry()` loads it once per process. The
+  file also carries `force_miss`, the files a changed registry forces out of the
+  AST cache, so spawn/forkserver workers see it too; the set is carried across
+  runs until an `extract()` completes;
+- **the next run** — read before it is overwritten, it is the previous registry
+  the change detection compares against (P2a spec §5.5).
+
+Scope rules:
+
+- a registry is built only when the tree has a Drupal marker — a web root
+  (`core/lib/Drupal.php`) at, below (`web/`, `docroot/`) or above the scan
+  root, or a `*.info.yml` directly in the scan root; any other tree is not
+  walked, gets no registry file and no inventory;
+- the walk honours core's ignore rules (`graphify.detect.ignored_predicate`
+  with `detect`'s own `extra_excludes` and `gitignore`), so an ignored module
+  defines no type. On a Drupal tree this costs one extra ignore evaluation per
+  ignored directory. A composer-managed site usually gitignores `web/core` and
+  `web/modules/contrib`; measuring such a site needs `--no-gitignore`
+  (P2a spec §8);
+- when the web root is an **ancestor** of the scan root, the registry walks the
+  web root, outside the scan root, and those paths are not subject to the
+  scan's ignore rules (core's predicate is anchored at the scan root).
+
+`graphify-out/drupal-inventory.json` is written beside it on every Drupal run —
+what discovery did not recognise (§5.1's third bucket), the deferred families
+and the unresolved managers — and rendered as the "Drupal coverage" section of
+`GRAPH_REPORT.md`. A non-Drupal run removes a stale one.
 
 ### 5.4 Learning hooks
 

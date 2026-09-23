@@ -203,7 +203,8 @@ working graph.
 | **P0** | Foundation | subpackage, `register()` seam and its assertions, configurable `realm`, CI allow-list check, one extractor end to end |
 | **P1** | Module-owned YAML | services, routing, permissions, libraries, links, breakpoints — 1,383 files on the reference corpus |
 | **P1b** | Configuration | config entities, **config_split**, domains, profiles, recipes, config `dependencies:`, `core.extension.yml` — 629 files |
-| **P2** | Discovery registry | plugin-manager pre-pass, learned plugin types, hook discovery from `*.api.php` and invocation sites, unrecognised-family inventory |
+| **P2a** | Plugin discovery | plugin-type registry learned from the site's managers at the start of every `detect`, YAML-discovered plugins of learned types, `plugin_of_type` for P1's links and breakpoints, the unrecognised-family inventory and its `GRAPH_REPORT.md` section, `watch` rebuilds on Drupal YAML — see the P2a spec |
+| **P2b** | Hook discovery | hooks from `*.api.php` and invocation sites, `alter_hook` as a hook node |
 | **P3** | Container producer | runner detection, `drush ev`, the artifact, merge as a distinct step with a divergence log |
 | **P4** | PHP semantics | annotations and attributes, plugin instances against learned types, procedural and `#[Hook]` implementations, forms, events, entity-type handlers, `\Drupal::service()` |
 | **P5** | Presentation | theme hooks, templates, preprocess, override chain, SDC, library attachment |
@@ -222,7 +223,15 @@ working graph.
   directory, names its owner inside the file, and moves part of itself outside
   `config/sync` via `config_split`. See the P1 spec §2.
 - **P2 before P4.** Classification of custom YAML depends on the learned
-  registry, and the registry pre-pass must precede `detect` (vocabulary §5.3).
+  registry, so the registry is built at the start of every `detect`, before
+  any file is classified (vocabulary §5.3). P2 is split: P2a (plugins) needs
+  only YAML and manager classes; P2b (hooks) reads `*.api.php` and invocation
+  sites.
+- **The `watch` YAML gap moved from P7 to P2a.** `.yml` is not in core's
+  `_CODE_EXTENSIONS`, so a YAML-only batch never rebuilt the graph, only set
+  the LLM `needs_update` flag — a P1/P1b gap. Once a changed services file can
+  change the plugin registry it could no longer wait for P7; P2a wraps
+  `watch._batch_triggers_rebuild` and `watch._has_non_code` (P2a spec §5.6).
 - **P3 before P4.** The container is the largest measured gain — 4 of 5
   `shortest_path` misses in the benchmark's G02 — and it is independent of the
   PHP work, because container edges reference service ids and PHP class nodes
