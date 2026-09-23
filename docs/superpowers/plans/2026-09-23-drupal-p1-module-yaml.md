@@ -1585,6 +1585,11 @@ foo.settings_tab:
   title: 'Settings'
   route_name: foo.settings
   base_route: foo.settings
+foo.advanced_tab:
+  title: 'Advanced'
+  route_name: foo.advanced
+  base_route: foo.settings
+  parent_id: foo.settings_tab
 """
 
 ACTION = """\
@@ -1621,15 +1626,35 @@ def test_menu_link_reaches_its_route_and_menu(tmp_path):
     assert (extension_id("foo"), "declares_menu_link", lid) in rel
     assert (lid, "links_to_route", route_id("foo.settings")) in rel
     assert (lid, "in_menu", menu_id("admin")) in rel
+    menu = next(n for n in result["nodes"] if n["id"] == menu_id("admin"))
+    assert menu["type"] == "drupal_menu"
     assert (lid, "parent_link", link_id("menu_link", "system.admin_config")) in rel
 
 
 def test_local_task_carries_base_route(tmp_path):
     result = extract_drupal_local_tasks(_write(tmp_path, "foo.links.task.yml", TASK))
+    lid = link_id("local_task", "foo.advanced_tab")
+    rel = _rel(result)
+    assert (lid, "links_to_route", route_id("foo.advanced")) in rel
+    assert (lid, "base_route", route_id("foo.settings")) in rel
+
+
+def test_default_tab_keeps_links_to_route_and_is_marked(tmp_path):
+    """route_name == base_route is the tab shown by default: one edge, one flag."""
+    result = extract_drupal_local_tasks(_write(tmp_path, "foo.links.task.yml", TASK))
     lid = link_id("local_task", "foo.settings_tab")
     rel = _rel(result)
     assert (lid, "links_to_route", route_id("foo.settings")) in rel
-    assert (lid, "base_route", route_id("foo.settings")) in rel
+    assert (lid, "base_route", route_id("foo.settings")) not in rel
+    tab = next(n for n in result["nodes"] if n["id"] == lid)
+    assert tab["default_tab"] is True
+
+
+def test_local_task_parent_is_parent_id(tmp_path):
+    """Local tasks name their parent with `parent_id`, menu links with `parent`."""
+    result = extract_drupal_local_tasks(_write(tmp_path, "foo.links.task.yml", TASK))
+    assert (link_id("local_task", "foo.advanced_tab"), "parent_link",
+            link_id("local_task", "foo.settings_tab")) in _rel(result)
 
 
 def test_one_relation_per_ordered_pair_when_route_equals_base_route(tmp_path):
@@ -1660,7 +1685,28 @@ def test_no_family_emits_an_extension_or_route_node(tmp_path):
     ids = {n["id"] for n in result["nodes"]}
     assert extension_id("foo") not in ids
     assert route_id("foo.settings") not in ids
+
+
+def test_a_menu_named_by_two_files_is_one_node(tmp_path):
+    """Menus are global, like tags; the seam collapses the two declarations."""
+    from graphify.extract import extract
+
+    paths = [
+        _write(tmp_path, "foo.links.menu.yml", MENU),
+        _write(tmp_path.joinpath("b"), "bar.links.menu.yml",
+               MENU.replace("foo.admin", "bar.admin")),
+    ]
+    result = extract(paths, root=tmp_path)
+    menus = [n for n in result["nodes"] if n.get("type") == "drupal_menu"]
+    assert [n["id"] for n in menus] == [menu_id("admin")]
 ```
+
+> Revised during execution. The first draft asserted both `links_to_route` and
+> `base_route` on one pair while also asserting one relation per pair; a default
+> tab (`route_name == base_route`) now keeps `links_to_route` and sets
+> `default_tab: true`. `in_menu` pointed at a menu node nothing emitted; the menu
+> link now emits `drupal_menu` and the seam collapses the copies (Task 5b).
+> Local tasks name their parent `parent_id`, not `parent`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1685,7 +1731,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from graphify.drupal.families import extension_owner
 from graphify.drupal.yaml_common import (
     edge,
     key_lines,
@@ -1705,11 +1750,15 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
     if not data:
         return {"nodes": [], "edges": []}
 
+    # Imported here: `families` imports this module to build its table.
+    from graphify.drupal.families import extension_owner
+
     owner_id = extension_id(extension_owner(path))
     lines = key_lines(path.read_text(encoding="utf-8", errors="replace"))[0]
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
+    menus: set[str] = set()
 
     def add_edge(source: str, target: str, relation: str, line: int) -> None:
         # One relation per ordered pair: a local task whose route_name equals its
@@ -1729,23 +1778,35 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
         for key in ("weight", "group", "deriver"):
             if key in definition:
                 extra[key] = definition[key]
+        route = definition.get("route_name")
+        base = definition.get("base_route")
+        # The tab a base route shows by default. Its links_to_route and
+        # base_route edges would share one pair, so the second is a flag.
+        if isinstance(base, str) and base and base == route:
+            extra["default_tab"] = True
         nodes.append(node(lid, str(definition.get("title") or plugin_id),
                           type=node_type, layer="routing", path=path, line=line, **extra))
         add_edge(owner_id, lid, declares, line)
 
-        route = definition.get("route_name")
         if isinstance(route, str) and route:
             add_edge(lid, route_id(route), "links_to_route", line)
 
-        base = definition.get("base_route")
-        if isinstance(base, str) and base:
+        if isinstance(base, str) and base and base != route:
             add_edge(lid, route_id(base), "base_route", line)
 
         menu = definition.get("menu_name")
         if isinstance(menu, str) and menu:
-            add_edge(lid, menu_id(menu), "in_menu", line)
+            # Menus are declared by configuration (P1b), but named here; the
+            # seam collapses the copies every links file makes (merge.py).
+            mid = menu_id(menu)
+            if mid not in menus:
+                menus.add(mid)
+                nodes.append(node(mid, menu, type="drupal_menu", layer="routing",
+                                  path=path, line=line))
+            add_edge(lid, mid, "in_menu", line)
 
-        parent = definition.get("parent")
+        # Menu links say `parent`, local tasks `parent_id`.
+        parent = definition.get("parent") or definition.get("parent_id")
         if isinstance(parent, str) and parent:
             add_edge(lid, link_id(kind, parent), "parent_link", line)
 
@@ -1778,7 +1839,17 @@ def extract_drupal_contextual_links(path: Path) -> dict[str, Any]:
 - [ ] **Step 5: Run tests**
 
 Run: `uv run pytest tests/test_drupal_links.py -q`
-Expected: PASS, 6 tests
+Expected: PASS, 9 tests
+
+- [ ] **Step 5b: Verify on the reference corpus**
+
+Per file: menu 312, task 437, action 110, contextual 34 links, 0 errors. Action
+has 112 top-level keys; the other 2 belong to
+`menu_test/config/install/menu_test.links.action.yml`, a config object whose name
+happens to end in a family suffix (P1b's concern). Through `extract()`: 9
+`drupal_menu` nodes, 0 salted ids; dangling link edges (`links_to_route` 130,
+`base_route` 49, `appears_on_route` 28, `parent_link` 2) are dynamic entity routes
+and derivative parents, left for Task 7.
 
 - [ ] **Step 6: Commit**
 

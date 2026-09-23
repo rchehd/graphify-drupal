@@ -162,18 +162,18 @@ so `x.links.menu.yml` is never read as family `menu`.
 | `*.routing.yml` | 293 | **1,533** | `drupal:route:<name>` |
 | `*.libraries.yml` | 241 | **1,066** | `drupal:library:<owner>/<name>` |
 | `*.permissions.yml` | 133 | **355** | `drupal:permission:<string>` |
-| `*.links.task.yml` | 117 | 437 | `drupal:local_task:<id>` |
-| `*.links.menu.yml` | 131 | 312 | `drupal:menu_link:<id>` |
-| `*.links.action.yml` | 65 | 112 | `drupal:local_action:<id>` |
+| `*.links.task.yml` | 117 | **437** | `drupal:local_task:<id>` |
+| `*.links.menu.yml` | 131 | **312** | `drupal:menu_link:<id>` |
+| `*.links.action.yml` | 65 | **110** | `drupal:local_action:<id>` |
 | `*.breakpoints.yml` | 9 | **36** | `drupal:breakpoint:<owner>:<name>` |
-| `*.links.contextual.yml` | 19 | 34 | `drupal:contextual_link:<id>` |
-| **total** | **1,383** | **6,090** | |
+| `*.links.contextual.yml` | 19 | **34** | `drupal:contextual_link:<id>` |
+| **total** | **1,383** | **6,088** | |
 
 Entries count the nodes an extractor emits, not top-level YAML keys. The
 first draft counted keys, which scored 15 parameters-only service files,
 11 `route_callbacks` and 27 `permission_callbacks` sections as entries.
-Rows in bold are confirmed by an extractor; the rest are still key counts
-and are rechecked when their family lands.
+Every row is now confirmed by its extractor. Local actions have 112 keys; 2
+belong to a config object whose file name ends in `.links.action.yml` (see §9).
 
 ### 5.1 Services
 
@@ -233,7 +233,12 @@ recognising them *as plugins* belongs to P2's discovery registry.
 | `links_to_route` | `route_name:` → route |
 | `in_menu` | `menu_name:` → `drupal:menu:<id>` |
 | `base_route` | local task → route |
-| `parent_link` | `parent:` → link |
+| `parent_link` | `parent:` (menu link) / `parent_id:` (local task) → link |
+
+A local task whose `base_route` equals its `route_name` is the tab its base route
+shows by default: it keeps `links_to_route` and carries `default_tab: true`, since
+both edges would share one pair. A menu link emits the `drupal:menu:<id>` node it
+names; menus are declared by configuration (P1b), and the copies collapse (§3.4).
 
 `links_to_route` and `base_route` are the edges that make this family worth the
 phase: they connect the UI surface to the routing table, and both endpoints are
@@ -271,7 +276,7 @@ breakpoints), `yaml_access.py` (permissions), `yaml_links.py`. The existing
 | | Nodes |
 |---|---:|
 | after P0 | 1,169 |
-| P1 primary entities | +6,090 |
+| P1 primary entities | +6,088 |
 | tags, menus, parameters | ~+150 |
 | **after P1** | **≈7,400** |
 
@@ -323,7 +328,7 @@ Measured against the reference corpus, not a fixture.
 | Risk | Mitigation |
 |---|---|
 | The tolerant loader masks a real parse error | The multi-constructor applies only to `!`-prefixed tags. Structural errors still raise and are reported, as the malformed core fixture demonstrates. |
-| A family suffix collides with a config filename (`system.menu.main.yml` vs a `*.menu.yml` family) | Family keys are full compound suffixes and the table is matched longest-first. `*.links.menu.yml` is a key; `*.menu.yml` is not. Criterion 4 catches a regression. |
+| A family suffix collides with a config filename (`system.menu.main.yml` vs a `*.menu.yml` family) | Family keys are full compound suffixes and the table is matched longest-first. `*.links.menu.yml` is a key; `*.menu.yml` is not. Criterion 4 catches a regression. One real case remains: `menu_test/config/install/menu_test.links.action.yml` is a config object; it yields no nodes. Excluding `config/install|optional` from the family table belongs to P1b. |
 | Service ids collide across extensions | Drupal service ids are globally unique by definition — the container is flat. Criterion 6 catches a violation. |
 | Node count pushes visualisation over the edge | Anticipated, not solved here. Criterion 7 keeps the filter attributes intact so P7 can generate slices. |
 
