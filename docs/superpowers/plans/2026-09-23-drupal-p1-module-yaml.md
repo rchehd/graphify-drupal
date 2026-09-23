@@ -19,7 +19,8 @@
 - At most one relation per ordered node pair.
 - Node ids come from `graphify.ids.make_id`.
 - **Never parse with `yaml.safe_load`.** Use `load_drupal_yaml` from Task 1; `safe_load` silently loses 692 services including most of `core.services.yml`.
-- **`*.info.yml` is the only family that emits `drupal:extension:*` nodes.** Every other family references the owner and creates nothing; graphify splits an id declared by two files.
+- **`*.info.yml` is the only family that emits `drupal:extension:*` nodes.** Every other family references the owner and creates nothing.
+- **Drupal ids are global.** Core salts apart any id two files declare; the seam collapses `static_yaml` duplicates first (Task 5b). An extractor unit test cannot see this — a node another file may also declare needs a test through `graphify.extract.extract`.
 - **Only emit an edge when this phase declares both endpoints.** A PHP FQN or a CSS/JS path is stored as a node attribute, not as an edge.
 
 Reference corpus for every measured criterion: `/home/user/Projects/FormsRemote`.
@@ -374,7 +375,7 @@ print('services:', total, 'errors:', len(bad))
 
 Expected: `services: 2320 errors: 0`. Anything near 1,628 means the loader is not
 being used. (2320 overcounts: `data.get('services', data)` scores each of the 15
-parameters-only files as one entry. The true service count is 2,305 — see Task 3.)
+parameters-only files as one entry. The loader yields 2,305 `services:` entries, 2,205 once `_defaults` is excluded — see Task 5b.)
 
 - [ ] **Step 6: Commit**
 
@@ -891,7 +892,8 @@ print('service nodes:', n, 'edges:', e, 'errors:', errs)
 "
 ```
 
-Expected: `service nodes: 2305`, `errors: 0`.
+Expected: `service nodes: 2205`, `errors: 0`. (2,305 before `_defaults` — Symfony file
+configuration in 100 files — was excluded; see Task 5b.)
 
 - [ ] **Step 8: Commit**
 
@@ -1509,6 +1511,36 @@ git commit -m "feat(drupal): extract asset libraries, their dependencies, and br
 
 ---
 
+### Task 5b: One node per Drupal id (added during execution)
+
+Found while reviewing Task 6: core's `_disambiguate_colliding_node_ids` salts an
+id apart whenever two source files declare it. Every extractor unit test passed
+because none of them runs the whole pipeline. On the reference corpus the result
+was 57 service tags as over 300 nodes, 14 overridden services and 4 routes split
+in two, and every edge written against the bare id dropped. Task 6's menu nodes
+would have gone the same way.
+
+**Files:**
+- Create: `graphify/drupal/merge.py` — `collapse_drupal_duplicates(nodes, root)`
+- Modify: `graphify/drupal/register.py` — wrap `graphify.extract._disambiguate_colliding_node_ids`
+- Modify: `graphify/drupal/yaml_services.py` — skip `_defaults` / `_instanceof`
+- Test: `tests/test_drupal_merge.py` (unit + two tests through `extract()`),
+  `tests/test_drupal_seam.py`, `tests/test_drupal_services.py`
+
+Rules: only `_origin: static_yaml` nodes are touched; the survivor is the
+declaration with the lowest `source_file`; `declared_in` lists every declaring
+file relative to the scan root (it reaches graph.json verbatim). The wrapper
+raises `DrupalSeamError` if the core function disappears.
+
+Also fixed here: `_defaults` under `services:` was emitted as a service in 100
+files.
+
+Measured through `extract()` on the reference corpus: 0 salted Drupal ids;
+2,191 service nodes from 2,205 declarations; 1,529 routes from 1,533; 1,137
+extensions from 1,140 `*.info.yml`.
+
+---
+
 ### Task 6: Links
 
 Four families, one module: they share a shape, and `links_to_route` is the same
@@ -2003,7 +2035,7 @@ def test_criterion_1_only_the_malformed_core_fixture_fails(corpus_extraction):
 
 def test_criterion_2_the_tolerant_loader_finds_every_service(corpus_extraction):
     services = [n for n in corpus_extraction["nodes"] if n["type"] == "drupal_service"]
-    assert len(services) == 2305, "1628 means safe_load crept back in"
+    assert len(services) == 2191, "1628 means safe_load crept back in"
 
 
 def test_criterion_3_no_family_file_is_dropped_as_a_secret():
@@ -2023,7 +2055,8 @@ def test_criterion_4_only_info_yml_declares_extensions(corpus_extraction):
         n for n in corpus_extraction["nodes"]
         if n["type"] in ("drupal_module", "drupal_theme", "drupal_profile")
     ]
-    assert len(declared) == 1140
+    # 1,140 files; three pairs are core's name-collision fixtures, one node each.
+    assert len(declared) == 1137
     assert all(n["source_file"].endswith(".info.yml") for n in declared)
 
 
@@ -2037,14 +2070,16 @@ def test_criterion_5_nothing_dangles_after_the_resolver(corpus_extraction):
     assert [e["relation"] for e in edges if e["target"] not in ids] == []
 
 
-def test_criterion_6_every_entity_has_exactly_one_declaring_edge(corpus_extraction):
+def test_criterion_6_every_entity_is_owned_once_per_declaring_file(corpus_extraction):
     import collections
 
     declares = collections.Counter(
         e["target"] for e in corpus_extraction["edges"] if e["relation"].startswith("declares_")
     )
-    multiply_owned = {t: n for t, n in declares.items() if n > 1}
-    assert multiply_owned == {}
+    declared_in = {n["id"]: len(n.get("declared_in") or [n]) for n in corpus_extraction["nodes"]}
+    # More than one owner only where that many files declare the entity (Task 5b).
+    mismatched = {t: n for t, n in declares.items() if n > 1 and n != declared_in.get(t)}
+    assert mismatched == {}
 
 
 def test_criterion_7_every_node_is_filterable(corpus_extraction):
@@ -2133,6 +2168,6 @@ git commit -m "test(drupal): assert P1's acceptance criteria against a real Drup
 ## Definition of done
 
 - `uv run --frozen pytest tests/ -q` green apart from the four known `openai` failures.
-- `tests/test_drupal_corpus.py` passes against the reference corpus: 2,305 services, 1,140 extensions declared only by `*.info.yml`, zero family files dropped as secrets, zero dangling edges, zero `realm: unknown`.
+- `tests/test_drupal_corpus.py` passes against the reference corpus: 2,191 services, 1,140 extensions declared only by `*.info.yml`, zero family files dropped as secrets, zero dangling edges, zero `realm: unknown`.
 - `git log v8..HEAD --grep '^core:'` gained **no** new entries — P1 touches nothing upstream owns.
 - The graph carries roughly 7,600 nodes, and the `realm: custom` slice is small enough to render un-aggregated.

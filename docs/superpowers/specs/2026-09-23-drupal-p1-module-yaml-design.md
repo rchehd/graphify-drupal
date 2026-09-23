@@ -61,7 +61,7 @@ The first is **Drupal core's main service file**. Measured:
 | Loader | Services parsed |
 |---|---:|
 | `yaml.safe_load` | 1,628 |
-| tolerant loader | **2,305** |
+| tolerant loader | **2,205** |
 
 P1 therefore parses with a `SafeLoader` subclass carrying a multi-constructor
 for `!`, so any custom tag yields its underlying scalar, sequence or mapping
@@ -103,6 +103,23 @@ owning extension from its edges and creates nothing. Where an owner has no
 `*.info.yml` in the corpus, the existing cross-file resolver materialises it, as
 it already does for undeclared dependency targets.
 
+### 3.4 Every Drupal id is global
+
+§3.3 is the special case of a wider fact, found while building the link
+families: core's id-remap pass (`_disambiguate_colliding_node_ids`) salts apart
+*any* id that two files declare. That is right for two same-named functions and
+wrong for Drupal, whose container, routing table and tag vocabulary are global.
+On the reference corpus it turned 57 service tags into over 300 nodes, split the
+14 services and 4 routes that a test module overrides, and stranded every edge
+written against the bare id, which core then drops without a word.
+
+So the seam wraps that pass: nodes with `_origin: static_yaml` are collapsed to
+one per id first — the declaration with the lowest path survives, and every
+declaring file is kept in `declared_in` — and core receives a list with no
+Drupal collision in it. Other producers' nodes are untouched. §3.3 still holds,
+because an extension node created outside `*.info.yml` would carry the wrong
+attributes, but splitting is no longer the reason.
+
 ---
 
 ## 4. Scope
@@ -141,7 +158,7 @@ so `x.links.menu.yml` is never read as family `menu`.
 
 | Family | Files | Entries | Primary node |
 |---|---:|---:|---|
-| `*.services.yml` | 375 | **2,305** | `drupal:service:<id>` |
+| `*.services.yml` | 375 | **2,205** | `drupal:service:<id>` |
 | `*.routing.yml` | 293 | **1,533** | `drupal:route:<name>` |
 | `*.libraries.yml` | 241 | **1,066** | `drupal:library:<owner>/<name>` |
 | `*.permissions.yml` | 133 | **355** | `drupal:permission:<string>` |
@@ -150,7 +167,7 @@ so `x.links.menu.yml` is never read as family `menu`.
 | `*.links.action.yml` | 65 | 112 | `drupal:local_action:<id>` |
 | `*.breakpoints.yml` | 9 | **36** | `drupal:breakpoint:<owner>:<name>` |
 | `*.links.contextual.yml` | 19 | 34 | `drupal:contextual_link:<id>` |
-| **total** | **1,383** | **6,190** | |
+| **total** | **1,383** | **6,090** | |
 
 Entries count the nodes an extractor emits, not top-level YAML keys. The
 first draft counted keys, which scored 15 parameters-only service files,
@@ -254,9 +271,9 @@ breakpoints), `yaml_access.py` (permissions), `yaml_links.py`. The existing
 | | Nodes |
 |---|---:|
 | after P0 | 1,169 |
-| P1 primary entities | +6,190 |
+| P1 primary entities | +6,090 |
 | tags, menus, parameters | ~+150 |
-| **after P1** | **≈7,500** |
+| **after P1** | **≈7,400** |
 
 Already past graphify's ~5,000-node aggregation threshold, which the vocabulary
 anticipated. P1 does not need to solve that — but it must not make it worse, so
@@ -274,19 +291,23 @@ Measured against the reference corpus, not a fixture.
    `core/tests/.../invalid_file.libraries.yml`, which is deliberately malformed —
    and it returns an error dict rather than raising. The two Symfony-tag files
    parse.
-2. **Services.** 2,305 service nodes, not 1,628. The gap is the whole point of
-   the tolerant loader.
+2. **Services.** 2,191 service nodes — 2,205 declarations, 14 of them overrides
+   of a service declared elsewhere — not 1,628. The gap is the whole point of
+   the tolerant loader. `_defaults` (100 files) is Symfony file configuration,
+   not a service.
 3. **Secret screen.** Zero of the 1,383 files are dropped, including the three
    `token.*` ones. `token.yml`, `token.json`, `credentials.yaml`, `secrets.yml`
    are still dropped.
-4. **One declarer.** Exactly 1,140 `drupal:extension:*` nodes carry a
-   `source_file` ending in `.info.yml`; no other family declares one. The split-id
-   count stays at 6 — core's own collision fixtures — and no edge points at any of
-   them.
+4. **One declarer.** Exactly 1,137 `drupal:extension:*` nodes carry a
+   `source_file` ending in `.info.yml`; no other family declares one. The 1,140
+   files include three pairs that are core's own name-collision fixtures
+   (`evil`, `name_collision_test`, `drupal_system_listing_compatible_test`); each
+   pair is one node with both files in `declared_in`. No Drupal id is salted.
 5. **No dangling.** Every edge P1 emits has both endpoints present after the
    cross-file resolver runs.
-6. **Ownership.** Every service, route, permission, library and link has exactly
-   one `declares_*` edge from an extension.
+6. **Ownership.** Every service, route, permission, library and link has at
+   least one `declares_*` edge from an extension, and more than one only when its
+   `declared_in` names that many files.
 7. **Realm.** Every P1 node carries `realm` and `layer`; zero `realm: unknown`
    for files under a resolved extension.
 8. **Incremental.** Editing one `*.services.yml` changes only edges sourced from
