@@ -11,6 +11,7 @@ happen in the pipeline, and a per-file loop would test neither.
 from __future__ import annotations
 
 import collections
+import contextlib
 import os
 from pathlib import Path
 
@@ -385,3 +386,247 @@ def test_p1b_every_config_store_file_yields_at_least_one_node(site_extraction):
         if path.relative_to(CORPUS).as_posix() not in declaring:
             zero_node.append(path)
     assert zero_node == []
+
+
+# -- P2a: plugin discovery (spec 2026-09-23-drupal-p2a-plugin-discovery §6) ----
+#
+# The registry is built the way `detect()` builds it (`prepare_run`), into a
+# temporary out dir so the corpus gains no graphify-out/. Everything
+# `prepare_run` sets for the process (the in-memory registry, the env var a
+# worker reads, the env-file cache) is restored before the fixture returns, so
+# no other test -- in this module or any other -- sees this run's registry.
+# A test that needs the registry live puts it back with `_live(registry)`.
+
+
+#: Every key `yaml_common.node` writes, plus what the pipeline adds to a node:
+#: `declared_in` (merge.py's collapse of an id several files declare).
+_UNIVERSAL_NODE_KEYS = frozenset({
+    "id", "label", "file_type", "type", "layer", "realm", "_origin",
+    "source_file", "source_location", "declared_in",
+})
+_PLUGIN_KEYS = frozenset({"plugin_id", "plugin_type", "provider", "class_name", "deriver"})
+_P1_PLUGIN_NODE_TYPES = ("drupal_menu_link", "drupal_local_task", "drupal_local_action",
+                         "drupal_contextual_link", "drupal_breakpoint")
+_MANAGER_ROOTS = frozenset({"Drupal\\Core\\Plugin\\DefaultPluginManager",
+                            "Drupal\\Component\\Plugin\\PluginManagerInterface"})
+_SCAN_PRUNED = frozenset({"vendor", "node_modules", "tests", "Tests"})
+
+
+@contextlib.contextmanager
+def _restored_discovery_state():
+    """Undo what `prepare_run` sets directly (see test_drupal_discovery_seam's
+    `_isolated_discovery_state`, whose teardown this mirrors)."""
+    from graphify.drupal import discovery
+    from graphify.drupal.inventory import set_current_inventory
+
+    had = discovery.ENV_VAR in os.environ
+    saved = os.environ.get(discovery.ENV_VAR)
+    try:
+        yield
+    finally:
+        discovery.set_current(None, None)
+        set_current_inventory(None)
+        discovery._env_cache_path = None
+        discovery._env_cache_mtime = None
+        discovery._env_cache_registry = None
+        discovery._env_cache_force_miss = frozenset()
+        if had:
+            os.environ[discovery.ENV_VAR] = saved
+        else:
+            os.environ.pop(discovery.ENV_VAR, None)
+
+
+@contextlib.contextmanager
+def _live(registry):
+    """`registry` as this process's current one, for the duration of a block."""
+    from graphify.drupal import discovery
+
+    with _restored_discovery_state():
+        os.environ.pop(discovery.ENV_VAR, None)
+        discovery.set_current(registry)
+        yield
+
+
+@pytest.fixture(scope="module")
+def p2a(family_files, tmp_path_factory):
+    """The registry `detect()` would build for the corpus, and one extraction
+    of every file it makes graph-bearing: P1's families, the learned-family
+    files and the manager class files (which carry the type nodes)."""
+    import graphify  # noqa: F401
+    from graphify.drupal.discovery import prepare_run
+    from graphify.drupal.yaml_plugins import learned_family
+    from graphify.extract import extract
+
+    out = tmp_path_factory.mktemp("p2a-out")
+    with _restored_discovery_state():
+        # The corpus's own .gitignore excludes /web/core and /web/modules/contrib
+        # (composer-managed), so a default run learns almost nothing; the spec's
+        # measurements are of the whole tree, i.e. `--no-gitignore`.
+        registry = prepare_run(CORPUS, cache_root=out, gitignore=False)
+        assert registry is not None
+        learned = sorted(Path(p) for p in registry.root_yaml if learned_family(Path(p)))
+        managers = sorted(Path(p) for p in registry.by_class_file())
+        paths = sorted({*family_files, *learned, *managers})
+        extraction = extract(paths, cache_root=out, root=CORPUS)
+    return {"registry": registry, "learned": learned, "managers": managers,
+            "extraction": extraction}
+
+
+def _scan_managers() -> set[str]:
+    """Spec §2's full-tree scan, independent of PSR-4 and of services: every
+    class under `web/` outside pruned trees, resolved against every other
+    class the scan read. The two roots themselves are not managers of a type."""
+    import graphify  # noqa: F401
+    from graphify.drupal.php_classes import read_php_class
+
+    classes = {}
+    for dirpath, dirnames, filenames in os.walk(CORPUS / "web"):
+        dirnames[:] = [d for d in dirnames if d not in _SCAN_PRUNED and not d.startswith(".")]
+        for name in filenames:
+            if not name.endswith(".php"):
+                continue
+            path = Path(dirpath) / name
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if "extends" not in text and "implements" not in text:
+                continue
+            cls = read_php_class(path)
+            if cls is not None:
+                classes.setdefault(cls.fqcn, cls)
+
+    memo: dict[str, bool] = {}
+
+    def reaches(fqcn: str, depth: int = 0) -> bool:
+        if fqcn in _MANAGER_ROOTS:
+            return True
+        if fqcn in memo or depth > 16:
+            return memo.get(fqcn, False)
+        memo[fqcn] = False
+        cls = classes.get(fqcn)
+        memo[fqcn] = cls is not None and any(
+            reaches(p, depth + 1) for p in (*cls.extends, *cls.implements))
+        return memo[fqcn]
+
+    return {f for f, c in classes.items()
+            if c.kind == "class" and f not in _MANAGER_ROOTS and reaches(f)}
+
+
+def test_p2a_criterion_1_no_silent_manager(p2a):
+    registry = p2a["registry"]
+    known = ({t.manager_class for t in registry.types.values()}
+             | {u["class"] for u in registry.unresolved})
+    scanned = _scan_managers()
+    # 121 type classes, plus symfony_mailer's MailManagerReplacement, which only
+    # SymfonyMailerServiceProvider::alter() installs (a service_provider_alter entry).
+    assert len(scanned) == 122
+    assert sorted(scanned - known) == []
+    assert collections.Counter(u["reason"] for u in registry.unresolved) == {
+        "service_provider_alter": 14, "dynamic_discovery": 3, "not_a_service": 3,
+        "parse_error": 1, "psr4_unresolved": 1}
+
+
+def _family_of(path: Path, registry) -> str:
+    for ext, directory in registry.extensions.items():
+        if Path(directory) == path.parent and path.name.startswith(f"{ext}."):
+            return path.name[len(ext) + 1:-len(".yml")]
+    return ""
+
+
+def test_p2a_criterion_2_every_root_yaml_file_is_in_exactly_one_bucket(p2a):
+    from graphify.drupal.config_stores import is_config_yaml
+    from graphify.drupal.families import family_extractor
+    from graphify.drupal.inventory import DEFERRED_FAMILIES, build_inventory
+    from graphify.drupal.yaml_plugins import learned_family
+
+    registry = p2a["registry"]
+    files = [Path(p) for p in registry.root_yaml]
+    with _live(registry):
+        inventory = build_inventory(registry, set(registry.root_yaml), CORPUS)
+        unrecognised = {e["family"] for e in inventory["unrecognised_yaml"]}
+        buckets = collections.Counter()
+        misplaced = []
+        for path in files:
+            claims = [
+                name for name, claimed in (
+                    ("p1", family_extractor(path) is not None or is_config_yaml(path)),
+                    ("learned", learned_family(path) is not None),
+                    ("deferred", _family_of(path, registry) in DEFERRED_FAMILIES),
+                    ("unrecognised", _family_of(path, registry) in unrecognised),
+                ) if claimed
+            ]
+            if len(claims) != 1:
+                misplaced.append((path.relative_to(CORPUS).as_posix(), claims))
+            else:
+                buckets[claims[0]] += 1
+    assert misplaced == []
+    assert buckets["unrecognised"] == inventory["summary"]["unrecognised_files"]
+    assert sum(buckets.values()) == len(files)
+    # No root-level file is deferred: SDC and migrations live below the root.
+    assert buckets == {"p1": 1005, "learned": 72, "unrecognised": 4}
+
+
+def test_p2a_criterion_3_counts(p2a):
+    registry = p2a["registry"]
+    types = registry.types.values()
+    assert len(registry.types) == 143
+    assert sum(1 for t in types if t.registered) == 140
+    assert len({t.class_file for t in types}) == 121
+    assert len(p2a["learned"]) == 72
+    plugins = [n for n in p2a["extraction"]["nodes"] if n.get("type") == "drupal_plugin"]
+    assert len(plugins) == 260
+    type_nodes = [n for n in p2a["extraction"]["nodes"] if n.get("type") == "drupal_plugin_type"]
+    assert len(type_nodes) == 143
+
+
+def test_p2a_criterion_4_every_p1_plugin_has_one_type(p2a):
+    extraction = p2a["extraction"]
+    out = collections.Counter(e["source"] for e in extraction["edges"]
+                              if e["relation"] == "plugin_of_type")
+    targets = collections.defaultdict(set)
+    for e in extraction["edges"]:
+        if e["relation"] == "plugin_of_type":
+            targets[e["source"]].add(e["target"])
+    p1 = [n for n in extraction["nodes"]
+          if n.get("type") in _P1_PLUGIN_NODE_TYPES and not n.get("external")]
+    assert len(p1) == 924
+    assert {n["id"]: sorted(targets[n["id"]]) for n in p1 if len(targets[n["id"]]) != 1} == {}
+    # A plugin several files declare (merge.py's collapse keeps one node) keeps
+    # one identical edge per declaring file; the reader folds parallel edges of
+    # one relation into one, so the graph still has exactly one.
+    assert {n["id"]: out[n["id"]] for n in p1
+            if out[n["id"]] != len(n.get("declared_in") or [n])} == {}
+
+
+def test_p2a_criterion_5_no_plugin_carries_a_value(p2a):
+    allowed = _UNIVERSAL_NODE_KEYS | _PLUGIN_KEYS
+    plugins = [n for n in p2a["extraction"]["nodes"] if n.get("type") == "drupal_plugin"]
+    assert plugins
+    assert {n["id"]: sorted(set(n) - allowed) for n in plugins if set(n) - allowed} == {}
+
+
+def test_p2a_the_default_scope_follows_the_corpus_gitignore(tmp_path):
+    """Controller ruling 4: the registry walks what `detect()` scans. The
+    corpus's .gitignore lists /web/core and /web/modules/contrib, so a run
+    that honours it learns only the two custom managers' types, and no P1
+    family has a type to point `plugin_of_type` at. `--no-gitignore` is how
+    such a site is measured (the fixture above)."""
+    import graphify  # noqa: F401
+    from graphify.drupal.discovery import prepare_run
+
+    with _restored_discovery_state():
+        registry = prepare_run(CORPUS, cache_root=tmp_path)
+    assert registry is not None
+    assert sorted(registry.types) == ["system_type", "webform_integration_type"]
+    assert {t.owner for t in registry.types.values()} == {
+        "webform_integrations", "webform_integrations_database"}
+    assert registry.by_yaml_name() == {}
+
+
+def test_p2a_criterion_8_registry_build_is_under_five_seconds():
+    import time
+
+    import graphify  # noqa: F401
+    from graphify.drupal.discovery import build_registry
+
+    started = time.perf_counter()
+    build_registry(CORPUS)
+    assert time.perf_counter() - started < 5.0
