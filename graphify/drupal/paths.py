@@ -24,6 +24,10 @@ DEFAULT_REALM_RULES: dict[str, tuple[str, ...]] = {
         "*/core/profiles/*",
         "*/core/lib/*",
         "*/core/tests/*",
+        # The `core` pseudo-extension has no *.info.yml; its own files sit
+        # directly in core/, and core/assets holds the scaffold copies it ships.
+        "*/core/core.*.yml",
+        "*/core/assets/*",
     ),
     "contrib": ("*/modules/contrib/*", "*/themes/contrib/*", "*/profiles/contrib/*"),
     "custom": (

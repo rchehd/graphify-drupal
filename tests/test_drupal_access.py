@@ -96,3 +96,9 @@ def test_neither_family_emits_an_extension_node(tmp_path):
     ):
         result = fn(_write(tmp_path, name, text))
         assert not any(n["id"] == extension_id("foo") for n in result["nodes"])
+
+
+def test_permission_requirement_carries_a_readable_target_name(tmp_path):
+    result = extract_drupal_routing(_write(tmp_path, "foo.routing.yml", ROUTING))
+    names = {e.get("target_name") for e in result["edges"] if e["relation"] == "requires_permission"}
+    assert names == {"administer foo", "view foo"}

@@ -92,7 +92,8 @@ def extract_drupal_libraries(path: Path) -> dict[str, Any]:
             if (lid, target) in seen_pairs or target == lid:
                 continue
             seen_pairs.add((lid, target))
-            edges.append(edge(lid, target, "library_depends_on", path=path, line=line))
+            edges.append(edge(lid, target, "library_depends_on", path=path, line=line,
+                              target_name=dependency))
 
     return {"nodes": nodes, "edges": edges}
 

@@ -139,7 +139,7 @@ def _register_resolvers() -> None:
     nothing: `resolver_registry.register` exists for exactly this.
     """
     from graphify import resolver_registry
-    from graphify.drupal.resolvers import resolve_missing_extensions
+    from graphify.drupal.resolvers import resolve_missing_targets
 
     if any(r.name == "drupal" for r in resolver_registry.registered_resolvers()):
         return
@@ -147,7 +147,7 @@ def _register_resolvers() -> None:
         resolver_registry.LanguageResolver(
             name="drupal",
             suffixes=frozenset({".yml"}),
-            resolve=resolve_missing_extensions,
+            resolve=resolve_missing_targets,
         )
     )
 

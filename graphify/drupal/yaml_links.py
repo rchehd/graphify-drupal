@@ -41,13 +41,13 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
     seen_pairs: set[tuple[str, str]] = set()
     menus: set[str] = set()
 
-    def add_edge(source: str, target: str, relation: str, line: int) -> None:
+    def add_edge(source: str, target: str, relation: str, line: int, **extra: Any) -> None:
         # One relation per ordered pair: a local task whose route_name equals its
         # base_route would otherwise emit two, and the reader silently keeps one.
         if source == target or (source, target) in seen_pairs:
             return
         seen_pairs.add((source, target))
-        edges.append(edge(source, target, relation, path=path, line=line))
+        edges.append(edge(source, target, relation, path=path, line=line, **extra))
 
     for plugin_id, definition in data.items():
         plugin_id = str(plugin_id)
@@ -70,10 +70,10 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
         add_edge(owner_id, lid, declares, line)
 
         if isinstance(route, str) and route:
-            add_edge(lid, route_id(route), "links_to_route", line)
+            add_edge(lid, route_id(route), "links_to_route", line, target_name=route)
 
         if isinstance(base, str) and base and base != route:
-            add_edge(lid, route_id(base), "base_route", line)
+            add_edge(lid, route_id(base), "base_route", line, target_name=base)
 
         menu = definition.get("menu_name")
         if isinstance(menu, str) and menu:
@@ -84,16 +84,16 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
                 menus.add(mid)
                 nodes.append(node(mid, menu, type="drupal_menu", layer="routing",
                                   path=path, line=line))
-            add_edge(lid, mid, "in_menu", line)
+            add_edge(lid, mid, "in_menu", line, target_name=menu)
 
         # Menu links say `parent`, local tasks `parent_id`.
         parent = definition.get("parent") or definition.get("parent_id")
         if isinstance(parent, str) and parent:
-            add_edge(lid, link_id(kind, parent), "parent_link", line)
+            add_edge(lid, link_id(kind, parent), "parent_link", line, target_name=parent)
 
         for appears in definition.get("appears_on") or []:
             if isinstance(appears, str) and appears:
-                add_edge(lid, route_id(appears), "appears_on_route", line)
+                add_edge(lid, route_id(appears), "appears_on_route", line, target_name=appears)
 
     return {"nodes": nodes, "edges": edges}
 

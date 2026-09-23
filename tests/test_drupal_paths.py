@@ -33,6 +33,12 @@ def test_machine_name_is_the_stem_before_info():
 
 @pytest.mark.parametrize("path, expected", [
     ("/p/core/modules/node/node.info.yml", "core"),
+    # The `core` pseudo-extension's own files, and the scaffold copies core ships.
+    ("/p/web/core/core.services.yml", "core"),
+    ("/p/web/core/core.libraries.yml", "core"),
+    ("/p/web/core/assets/scaffold/files/default.services.yml", "core"),
+    # Site-level files belong to no extension; unknown is the honest answer.
+    ("/p/web/sites/default/default.services.yml", "unknown"),
     ("/p/web/core/modules/node/node.info.yml", "core"),
     ("/p/web/modules/contrib/token/token.info.yml", "contrib"),
     ("/p/docroot/themes/contrib/olivero/olivero.info.yml", "contrib"),

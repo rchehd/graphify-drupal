@@ -78,11 +78,11 @@ def extract_drupal_routing(path: Path) -> dict[str, Any]:
     edges: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
 
-    def add_edge(source: str, target: str, relation: str, line: int) -> None:
+    def add_edge(source: str, target: str, relation: str, line: int, **extra: Any) -> None:
         if (source, target) in seen_pairs:
             return
         seen_pairs.add((source, target))
-        edges.append(edge(source, target, relation, path=path, line=line))
+        edges.append(edge(source, target, relation, path=path, line=line, **extra))
 
     for name, definition in data.items():
         name = str(name)
@@ -110,6 +110,7 @@ def extract_drupal_routing(path: Path) -> dict[str, Any]:
             for part in _PERMISSION_SPLIT.split(permission):
                 part = part.strip()
                 if part:
-                    add_edge(rid, permission_id(part), "requires_permission", line)
+                    add_edge(rid, permission_id(part), "requires_permission", line,
+                             target_name=part)
 
     return {"nodes": nodes, "edges": edges}

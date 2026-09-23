@@ -135,3 +135,13 @@ def test_symfony_reserved_keys_are_not_services(tmp_path):
     result = extract_drupal_services(_write(tmp_path, text))
     services = {n["id"] for n in result["nodes"] if n["type"] == "drupal_service"}
     assert services == {service_id("foo.real")}
+
+
+def test_reference_edges_carry_a_readable_target_name(tmp_path):
+    result = extract_drupal_services(_write(tmp_path))
+    names = {(e["relation"], e.get("target_name")) for e in result["edges"]}
+    assert ("injects_service", "database") in names
+    assert ("injects_service", "optional.thing") in names
+    assert ("injects_parameter", "foo.setting") in names
+    assert ("decorates", "foo.locator") in names
+    assert ("parent_service", "foo.base") in names

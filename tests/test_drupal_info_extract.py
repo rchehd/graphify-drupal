@@ -122,3 +122,67 @@ def test_node_ids_survive_builder_normalisation(tmp_path):
                   "name: Foo Bar\ntype: module\n")
     for node in extract_drupal_info(path)["nodes"]:
         assert normalize_id(node["id"]) == node["id"]
+
+
+def test_resolver_materialises_missing_targets_of_every_p1_relation():
+    from graphify.drupal.resolvers import resolve_missing_targets
+    from graphify.drupal.yaml_common import library_id, permission_id, route_id, service_id
+
+    nodes = [{"id": service_id("database")}]
+    edges = [
+        {"relation": "injects_service", "target": service_id("database"),
+         "source_file": "a/foo.services.yml"},
+        {"relation": "injects_service", "target": service_id("absent.service"),
+         "target_name": "absent.service", "source_file": "a/foo.services.yml"},
+        {"relation": "requires_permission", "target": permission_id("access content"),
+         "target_name": "access content", "source_file": "a/foo.routing.yml"},
+        {"relation": "library_depends_on", "target": library_id("core", "once"),
+         "target_name": "core/once", "source_file": "a/foo.libraries.yml"},
+        {"relation": "links_to_route", "target": route_id("user.login"),
+         "target_name": "user.login", "source_file": "a/foo.links.menu.yml"},
+        {"relation": "calls", "target": "another_language_node", "source_file": "a/x.py"},
+    ]
+    resolve_missing_targets([], nodes, edges)
+
+    created = {n["id"]: n for n in nodes if n.get("external")}
+    assert service_id("absent.service") in created
+    assert permission_id("access content") in created
+    assert library_id("core", "once") in created
+    assert route_id("user.login") in created
+    assert service_id("database") not in created      # already declared
+    assert "another_language_node" not in created     # not ours to invent
+    assert created[route_id("user.login")]["type"] == "drupal_route"
+    assert created[permission_id("access content")]["label"] == "access content"
+
+
+def test_a_missing_parent_takes_the_kind_of_its_child():
+    """`parent_link` joins a menu link to a menu link, a local task to a local task."""
+    from graphify.drupal.resolvers import resolve_missing_targets
+    from graphify.drupal.yaml_common import link_id
+
+    child = link_id("local_task", "foo.child")
+    nodes = [{"id": child, "type": "drupal_local_task"}]
+    edges = [{"relation": "parent_link", "source": child,
+              "target": link_id("local_task", "gone.parent"),
+              "target_name": "gone.parent", "source_file": "a/foo.links.task.yml"}]
+    resolve_missing_targets([], nodes, edges)
+    created = next(n for n in nodes if n.get("external"))
+    assert created["type"] == "drupal_local_task"
+    assert created["label"] == "gone.parent"
+
+
+def test_an_owner_without_info_yml_is_materialised_from_its_file(tmp_path):
+    """`core.services.yml` has no `core.info.yml`; `core` must still exist."""
+    from graphify.drupal.resolvers import resolve_missing_targets
+    from graphify.drupal.yaml_common import service_id
+
+    source = tmp_path / "web/core/core.services.yml"
+    nodes = [{"id": service_id("database"), "type": "drupal_service"}]
+    edges = [{"relation": "declares_service", "source": extension_id("core"),
+              "target": service_id("database"), "source_file": str(source)}]
+    resolve_missing_targets([], nodes, edges)
+    owner = next(n for n in nodes if n["id"] == extension_id("core"))
+    assert owner["label"] == "core"
+    assert owner["type"] == "drupal_extension"
+    assert owner["realm"] == "core"
+    assert owner["external"] is True

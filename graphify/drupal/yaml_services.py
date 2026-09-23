@@ -111,11 +111,13 @@ def extract_drupal_services(path: Path) -> dict[str, Any]:
             if reference is not None:
                 ref, optional = reference
                 add_edge(own, service_id(ref), "injects_service", line,
+                         target_name=ref,
                          confidence="INFERRED" if optional else "EXTRACTED")
                 continue
             parameter = _parameter_reference(argument)
             if parameter is not None:
-                add_edge(own, parameter_id(parameter), "injects_parameter", line)
+                add_edge(own, parameter_id(parameter), "injects_parameter", line,
+                         target_name=parameter)
 
         for tag in definition.get("tags") or []:
             name = tag.get("name") if isinstance(tag, dict) else tag
@@ -126,8 +128,10 @@ def extract_drupal_services(path: Path) -> dict[str, Any]:
             add_edge(own, tid, "tagged_as", line)
 
         if isinstance(definition.get("decorates"), str):
-            add_edge(own, service_id(definition["decorates"]), "decorates", line)
+            add_edge(own, service_id(definition["decorates"]), "decorates", line,
+                     target_name=definition["decorates"])
         if isinstance(definition.get("parent"), str):
-            add_edge(own, service_id(definition["parent"]), "parent_service", line)
+            add_edge(own, service_id(definition["parent"]), "parent_service", line,
+                     target_name=definition["parent"])
 
     return {"nodes": nodes, "edges": edges}

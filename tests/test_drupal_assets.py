@@ -100,3 +100,9 @@ def test_neither_family_emits_an_extension_node(tmp_path):
     ):
         result = fn(_write(tmp_path, name, text))
         assert not any(n["id"] == extension_id("foo") for n in result["nodes"])
+
+
+def test_dependency_edge_carries_a_readable_target_name(tmp_path):
+    result = extract_drupal_libraries(_write(tmp_path, "foo.libraries.yml", LIBRARIES))
+    dep = next(e for e in result["edges"] if e["relation"] == "library_depends_on")
+    assert dep["target_name"] in ("core/once", "foo/helper")

@@ -138,3 +138,14 @@ def test_a_menu_named_by_two_files_is_one_node(tmp_path):
     result = extract(paths, root=tmp_path)
     menus = [n for n in result["nodes"] if n.get("type") == "drupal_menu"]
     assert [n["id"] for n in menus] == [menu_id("admin")]
+
+
+def test_link_edges_carry_a_readable_target_name(tmp_path):
+    result = extract_drupal_menu_links(_write(tmp_path, "foo.links.menu.yml", MENU))
+    names = {(e["relation"], e.get("target_name")) for e in result["edges"]}
+    assert ("links_to_route", "foo.settings") in names
+    assert ("in_menu", "admin") in names
+    assert ("parent_link", "system.admin_config") in names
+    actions = extract_drupal_local_actions(_write(tmp_path, "foo.links.action.yml", ACTION))
+    assert ("appears_on_route", "foo.collection") in {
+        (e["relation"], e.get("target_name")) for e in actions["edges"]}
