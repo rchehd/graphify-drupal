@@ -108,6 +108,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
 def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.config_stores import clear_caches
+    from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor
     from graphify.drupal.merge import _relative, collapse_drupal_duplicates, collision_group
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
@@ -140,6 +141,17 @@ def _patch_extract(extract: ModuleType) -> None:
                     result["edges"] = list(result.get("edges", [])) + ours["edges"]
                     return result
                 return settings_handler
+            if path.suffix == ".php" and is_manager_class_file(path):
+                # Same composition as settings.php: keep core's PHP nodes, add
+                # the type's node and edges (spec §5.4). A manager file is
+                # never settings.php, so the two branches never both apply.
+                def manager_handler(p: Path, _base=base):
+                    result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
+                    ours = extract_plugin_types(p)
+                    result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
+                    result["edges"] = list(result.get("edges", [])) + ours["edges"]
+                    return result
+                return manager_handler
             return base
         return _get_extractor
 
@@ -221,7 +233,9 @@ def _register_resolvers() -> None:
     resolver_registry.register(
         resolver_registry.LanguageResolver(
             name="drupal",
-            suffixes=frozenset({".yml"}),
+            # ".php" so a manager-only incremental run (its `defines_plugin_type`
+            # / `plugin_manager_for` edges, no .yml in the batch) still resolves.
+            suffixes=frozenset({".yml", ".php"}),
             resolve=resolve_missing_targets,
         )
     )

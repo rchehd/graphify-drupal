@@ -97,6 +97,71 @@ def type_id(plugin_type: str) -> str:
     return make_id("drupal", "plugin_type", plugin_type)
 
 
+#: `registry.by_class_file()` built once per registry object and cached as an
+#: attribute of the registry itself -- the same pattern `yaml_plugins._by_yaml_name`
+#: uses, and for the same reason: `is_manager_class_file` is on the extractor
+#: dispatch's hot path (every `.php` file in a scan), and keying a module-level
+#: dict by `id(registry)` would risk handing back a freed registry's stale entry.
+_CLASS_FILE_CACHE_ATTR = "_drupal_class_file_cache"
+
+
+def _class_file_types(registry: Registry, path: Path) -> list[PluginType]:
+    cached = getattr(registry, _CLASS_FILE_CACHE_ATTR, None)
+    if cached is None:
+        cached = registry.by_class_file()
+        setattr(registry, _CLASS_FILE_CACHE_ATTR, cached)
+    return cached.get(Path(path).absolute().as_posix(), [])
+
+
+def is_manager_class_file(path: Path) -> bool:
+    """True when `path` is some plugin type's manager class file, per the
+    current process's registry (spec §5.4)."""
+    registry = current_registry()
+    if registry is None:
+        return False
+    return bool(_class_file_types(registry, path))
+
+
+def extract_plugin_types(path: Path) -> dict[str, Any]:
+    """One `drupal_plugin_type` node (plus its edges) per type whose manager
+    class file is `path`, using every non-empty §4.1 attribute. Empty for any
+    other file -- including when there is no registry for this process."""
+    from graphify.drupal.yaml_common import edge, node, service_id
+    from graphify.drupal.yaml_extract import extension_id
+
+    registry = current_registry()
+    if registry is None:
+        return {"nodes": [], "edges": []}
+    types = _class_file_types(registry, path)
+    if not types:
+        return {"nodes": [], "edges": []}
+
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    for t in types:
+        tid = type_id(t.plugin_type)
+        attrs: dict[str, Any] = {
+            "plugin_type": t.plugin_type,
+            "discovery": t.discovery,
+            "manager_class": t.manager_class,
+            "registered": t.registered,
+        }
+        for key in ("manager_service", "subdir", "interface", "annotation_class",
+                    "attribute_class", "yaml_name", "alter_hook", "deferred_to"):
+            value = getattr(t, key)
+            if value:
+                attrs[key] = value
+        nodes.append(node(tid, t.plugin_type, type="drupal_plugin_type", layer="plugin",
+                          path=path, line=t.line, **attrs))
+        edges.append(edge(extension_id(t.owner), tid, "defines_plugin_type", path=path,
+                          line=t.line, owner=t.owner, target_name=t.plugin_type))
+        if t.registered:
+            edges.append(edge(service_id(t.manager_service), tid, "plugin_manager_for",
+                              path=path, line=t.line, source_name=t.manager_service,
+                              target_name=t.plugin_type))
+    return {"nodes": nodes, "edges": edges}
+
+
 def _has_core(path: Path) -> bool:
     return (path / "core" / "lib" / "Drupal.php").is_file()
 

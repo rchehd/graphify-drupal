@@ -50,7 +50,7 @@ _OWNER_RELATIONS = frozenset({
     "declares_service", "declares_parameter", "declares_route", "declares_permission",
     "declares_library", "declares_breakpoint", "declares_menu_link",
     "declares_local_task", "declares_local_action", "declares_contextual_link",
-    "defines_config", "defines_schema", "provides_plugin",
+    "defines_config", "defines_schema", "provides_plugin", "defines_plugin_type",
 })
 
 
@@ -69,9 +69,13 @@ def _materialise_owner(edge: dict[str, Any]) -> dict[str, Any]:
     from graphify.drupal.paths import resolve_realm
 
     source_file = Path(str(edge.get("source_file", "")))
+    # `_owner_name` derives an owner from the source file's name/directory
+    # (a YAML family suffix, or a config store) -- it cannot do that for a PHP
+    # source file, so `defines_plugin_type` carries the owner on the edge itself.
+    owner = edge.get("owner") or _owner_name(source_file)
     return {
         "id": edge["source"],
-        "label": _owner_name(source_file) or edge["source"],
+        "label": owner or edge["source"],
         # Named by the file, declared by no *.info.yml: "concept" + external,
         # like a missing dependency, but its realm is known from where it sits.
         "file_type": "concept",
@@ -92,6 +96,16 @@ _BY_PREFIX_RELATIONS = frozenset({
     "splits_config", "imports_config", "config_action", "overrides_config", "applies_recipe",
     "plugin_of_type",
 })
+
+#: Relations whose *source* (not target) may be missing from the corpus, and
+#: what to materialise it as. `plugin_manager_for`'s source is the P1 service
+#: node for the manager; when P1's own service extraction never ran over the
+#: file that declares it (e.g. a manager-only incremental run), it is missing
+#: rather than merely undeclared, so the materialised node says so.
+_SOURCE_RESOLVABLE: dict[str, tuple[str, str]] = {
+    "plugin_manager_for": ("drupal_service", "di"),
+}
+
 
 #: Longest first: a schema id also starts with `drupal_config_`.
 _PREFIX_TYPES: tuple[tuple[str, str, str], ...] = (
@@ -204,9 +218,26 @@ def resolve_missing_targets(
     for edge in all_edges:
         source = edge.get("source")
         relation = edge.get("relation")
-        if (relation in _OWNER_RELATIONS and source
-                and source not in known and source not in created):
-            created[source] = _materialise_owner(edge)
+        if source and source not in known and source not in created:
+            if relation in _OWNER_RELATIONS:
+                created[source] = _materialise_owner(edge)
+            else:
+                source_spec = _SOURCE_RESOLVABLE.get(relation)
+                if source_spec is not None:
+                    node_type, layer = source_spec
+                    created[source] = {
+                        "id": source,
+                        "label": edge.get("source_name") or source,
+                        "file_type": "concept",
+                        "type": node_type,
+                        "layer": layer,
+                        "realm": "unknown",
+                        "external": True,
+                        "missing": True,
+                        "_origin": "static_yaml",
+                        "source_file": edge.get("source_file", ""),
+                        "source_location": edge.get("source_location", "L1"),
+                    }
 
         target = edge.get("target")
         if not target or target in known or target in created:
