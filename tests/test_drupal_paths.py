@@ -51,6 +51,8 @@ def test_machine_name_is_the_stem_before_info():
     ("/p/web/core/tests/fixtures/test_stable/test_stable.info.yml", "core"),
     ("/p/web/core/tests/Drupal/Tests/Core/Extension/modules/mh_test/mh_test.info.yml", "core"),
     ("/p/somewhere/odd/foo.info.yml", "unknown"),
+    ("/p/web/core/config/install/core.extension.yml", "core"),
+    ("/p/web/core/recipes/standard/recipe.yml", "core"),
 ])
 def test_realm_resolution(path, expected):
     assert resolve_realm(Path(path)) == expected

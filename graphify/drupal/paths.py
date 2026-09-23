@@ -28,6 +28,9 @@ DEFAULT_REALM_RULES: dict[str, tuple[str, ...]] = {
         # directly in core/, and core/assets holds the scaffold copies it ships.
         "*/core/core.*.yml",
         "*/core/assets/*",
+        # Core's own default configuration and the recipes it ships.
+        "*/core/config/*",
+        "*/core/recipes/*",
     ),
     "contrib": ("*/modules/contrib/*", "*/themes/contrib/*", "*/profiles/contrib/*"),
     "custom": (
