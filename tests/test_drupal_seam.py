@@ -97,3 +97,11 @@ def test_real_secret_stores_are_still_caught():
     for name in ("token.yml", "token.json", "credentials.yaml", "secrets.yml",
                  "api_token.txt"):
         assert detect._is_sensitive(Path("/p") / name) is True, name
+
+
+def test_drupal_duplicates_are_collapsed_before_core_splits_them():
+    install()
+    import graphify.extract as extract
+
+    wrapped = extract._disambiguate_colliding_node_ids
+    assert getattr(wrapped, "_drupal_patched", False)

@@ -86,6 +86,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
 def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.families import family_extractor
+    from graphify.drupal.merge import collapse_drupal_duplicates
 
     if not hasattr(extract, "_get_extractor"):
         raise DrupalSeamError(
@@ -109,6 +110,22 @@ def _patch_extract(extract: ModuleType) -> None:
         return _get_extractor
 
     _wrap(extract, "_get_extractor", _dispatch)
+
+    if not callable(getattr(extract, "_disambiguate_colliding_node_ids", None)):
+        raise DrupalSeamError(
+            "graphify.extract._disambiguate_colliding_node_ids is missing — graphify "
+            "core changed shape; graphify/drupal/register.py must be updated"
+        )
+
+    def _collapse(original):
+        def _disambiguate_colliding_node_ids(nodes, edges, raw_calls, root):
+            # Core salts apart an id declared by two files. Drupal ids are
+            # global, so collapse ours first; see graphify/drupal/merge.py.
+            collapse_drupal_duplicates(nodes, Path(root) if root is not None else None)
+            return original(nodes, edges, raw_calls, root)
+        return _disambiguate_colliding_node_ids
+
+    _wrap(extract, "_disambiguate_colliding_node_ids", _collapse)
     # Registered here rather than in install() because the registry is imported
     # from graphify.extract's own dependency graph; doing it at this point keeps
     # install() free of any import of core.

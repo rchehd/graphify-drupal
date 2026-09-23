@@ -118,3 +118,20 @@ def test_malformed_file_reports_instead_of_raising(tmp_path):
     result = extract_drupal_services(_write(tmp_path, "services:\n  foo:\n - a\n  b: [\n"))
     assert result["nodes"] == [] and result["edges"] == []
     assert "parse error" in result["error"]
+
+
+def test_symfony_reserved_keys_are_not_services(tmp_path):
+    """`_defaults` and `_instanceof` configure the file; neither is a service."""
+    text = (
+        "services:\n"
+        "  _defaults:\n"
+        "    autowire: true\n"
+        "  _instanceof:\n"
+        "    Drupal\\foo\\PluginInterface:\n"
+        "      tags: [foo.plugin]\n"
+        "  foo.real:\n"
+        "    class: Drupal\\foo\\Real\n"
+    )
+    result = extract_drupal_services(_write(tmp_path, text))
+    services = {n["id"] for n in result["nodes"] if n["type"] == "drupal_service"}
+    assert services == {service_id("foo.real")}

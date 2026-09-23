@@ -23,6 +23,10 @@ from graphify.drupal.yaml_common import (
 from graphify.drupal.yaml_extract import extension_id
 
 
+#: Keys under `services:` that configure the file rather than name a service.
+_RESERVED_SERVICE_KEYS = frozenset({"_defaults", "_instanceof"})
+
+
 def _service_reference(value: Any) -> tuple[str, bool] | None:
     """('database', required) for '@database', ('x', optional) for '@?x'."""
     if not isinstance(value, str) or not value.startswith("@"):
@@ -85,6 +89,9 @@ def extract_drupal_services(path: Path) -> dict[str, Any]:
 
     for sid, definition in services.items():
         sid = str(sid)
+        # Symfony's file-level settings, not services.
+        if sid in _RESERVED_SERVICE_KEYS:
+            continue
         line = lines.get(sid, 1)
         own = service_id(sid)
         extra: dict[str, Any] = {}
