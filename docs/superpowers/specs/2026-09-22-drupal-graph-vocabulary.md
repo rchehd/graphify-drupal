@@ -226,6 +226,8 @@ entity it may render — see §4.7.
 | `drupal_config_schema` | `drupal:config_schema:<type>` | `config/schema/*.schema.yml` |
 | `drupal_config_split` | `drupal:config_split:<id>` | `config_split.config_split.*.yml` |
 | `drupal_domain` | `drupal:domain:<id>` | `domain.record.*.yml` |
+| `drupal_config_patch` | `drupal:config_patch:<split>:<target>` | `config_split.patch.<target>.yml` in a split folder; one node per file, keyed by split + target so two splits patching the same config never collide |
+| `drupal_config_translation` | `drupal:config_translation:<language>:<store kind>:<split>:<name>` | `language/<langcode>/<config>.yml` in a sync or split config directory; one node per file |
 
 ### 3.10 Infrastructure — `layer: infra`
 
@@ -374,6 +376,7 @@ add thousands of leaves that connect to exactly one parent each.
 | `splits_module` / `splits_config` | config_split → module/config | |
 | `storage_folder` | config_split → path | tells the scanner where else configuration lives |
 | **`overrides_config`** | override source → config | `override_source: split \| domain \| language \| settings_php` |
+| `contains` | split/language entity → `drupal_config_patch`/`drupal_config_translation` | the patch or translation file's own node, so it is never an island; the same source `overrides_config` already uses for that file |
 
 `overrides_config` unifies four mechanisms that all answer the same question —
 *the value in the file is not the value in production*:

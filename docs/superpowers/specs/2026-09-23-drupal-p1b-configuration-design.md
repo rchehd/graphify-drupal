@@ -71,9 +71,12 @@ directory.
 | `recipe` | `recipe.yml`, and `<recipe>/config/*.yml` beside it |
 
 A `language/<langcode>/` directory inside any store belongs to that store; it
-carries no marker of its own. Split **patch** files (`config_split.patch.*`) are
-read for their edges (§5.3) and emit no node: a patch is not a configuration
-object.
+carries no marker of its own. Split **patch** files (`config_split.patch.*`) and
+language-override files each read for their `overrides_config` edge (§5.3) and
+additionally emit one node of their own — `drupal_config_patch` /
+`drupal_config_translation` — so core's incremental cache has something to stamp
+the file against (Task 11: a file whose extraction returns zero nodes is treated
+as un-extracted and re-queued on every run).
 
 For a sync directory without the marker, `.graphifyrc` accepts
 `drupal.config.sync = <path>`, parsed like the existing realm rules.
@@ -140,6 +143,8 @@ and a recipe's `name` (its label) and `type`. Keys are recorded by *path* (`host
 | `drupal_config_split` | `drupal:config:<name>` | `config_split.config_split.*` — a specialised `type` on the config node; attribute `folder` |
 | `drupal_domain` | `drupal:config:<name>` | `domain.record.*` — likewise |
 | `drupal_config_schema` | `drupal:config_schema:<type>` | each top-level key of a `*.schema.yml`; `pattern: true` for wildcards |
+| `drupal_config_patch` | `drupal:config_patch:<split>:<target>` | `config_split.patch.<target>.yml` in a split folder; keyed by split + target, never `config_id(name)`, so two splits patching the same target never collide; attributes `config_name`, `store: split`, `split`, `target_name`, `realm: custom`; no `_rank` |
+| `drupal_config_translation` | `drupal:config_translation:<language>:<store kind>:<split>:<name>` | `language/<langcode>/<config>.yml` in a sync or split store; attributes `config_name`, `language`, `store`, `realm: custom` for sync/split stores; no `_rank` |
 | `drupal_recipe` | `drupal:recipe:<dir>` | `recipe.yml`; `layer: extension`; the id is the directory name because `recipes:` refers to recipes by it |
 | `drupal_settings` | `drupal:settings:<site>/<file>` | a `settings*.php` with at least one `$config[…]` line |
 
@@ -177,6 +182,7 @@ edge for them: the target is unknowable before the recipe is applied.
 | `imports_config` | recipe → config / extension | `config.import`; `'*'` targets the extension; a `${…}` name is `templated_config`, not an edge | `wildcard` |
 | `config_action` | recipe → config | `config.actions`; a `${…}` name is `templated_config`, not an edge | `AMBIGUOUS` when an argument uses `${…}` |
 | `overrides_config` | override source → config | §5.3–5.4 | `override_source`, `keys` |
+| `contains` | override source → `drupal_config_patch` / `drupal_config_translation` | the patch/translation file's own node (Task 11) | |
 
 At most one relation per ordered pair, as in P1.
 
@@ -196,6 +202,13 @@ neither does, the edge is `INFERRED` and the target is materialised as external.
 
 The language row has no instance on the corpus and is covered by synthetic tests
 only.
+
+The `split` (patch) and `language` rows each also emit one `drupal_config_patch`
+/ `drupal_config_translation` node for the file itself, with a `contains` edge
+from the same source node used for `overrides_config` — so the file is never an
+island and, when that source is itself undeclared in the corpus, the `contains`
+edge dangles on the source side exactly as `overrides_config`'s does today (the
+resolver materialises neither; §6.3).
 
 ### 5.4 `settings.php`
 
@@ -288,7 +301,8 @@ invalidate it without a manual bump.
 | shipped, not active | ~340 |
 | recipe configuration not already counted | ≤80 |
 | recipes | 46 |
-| schema nodes (1,805 types; two literal pairs share an id, §9) | 1,803 |
+| schema nodes (1,805 types, all distinct ids) | 1,805 |
+| split-patch and language-override nodes (Task 11) | 8 |
 | settings, externals | ~50 |
 | **after P1b** | **≈10,600** |
 
@@ -314,10 +328,19 @@ After the final-review fixes (§6.1): 21,274 edges. The 1,008 removed were a
 shadowed copy's dependency edges repeating a pair the survivor already has; the
 set of ordered pairs is unchanged (21,172), and 56 edges carry `shadowed: true`.
 
+After Task 11 (collision-free schema ids, a node for every split patch): **10,488
+nodes, 21,282 edges; 10,483 Drupal nodes**, 926 of them `realm: custom`. The
+8-node, 8-edge growth is exactly the 8 `drupal_config_patch` nodes and their
+`contains` edges (§9); the two extra schema nodes are `views.field.user` /
+`views_field_user` and `views.field.bulk_form` / `views_field_bulk_form`, no
+longer collapsed into one id. `drupal_config_translation`: 0, as FormsRemote has
+no `language/<langcode>/` override files (the row is covered by synthetic tests
+only, §5.3).
+
 | Type | Nodes |
 |---|---:|
 | `drupal_service` | 2,220 |
-| `drupal_config_schema` | 1,803 |
+| `drupal_config_schema` | 1,805 |
 | `drupal_route` | 1,634 |
 | `drupal_library` | 1,114 |
 | `drupal_module` | 1,018 |
@@ -335,9 +358,11 @@ set of ordered pairs is unchanged (21,172), and 56 edges carry `shadowed: true`.
 | `drupal_contextual_link` | 34 |
 | `drupal_profile` | 20 |
 | `drupal_menu` | 9 |
+| `drupal_config_patch` | 8 |
 | `drupal_config_split` | 3 |
 | `drupal_domain` | 2 |
 | `drupal_settings` | 2 |
+| `drupal_config_translation` | 0 |
 
 Configuration nodes (`config_name` set): 969 = 613 active (sync) + 340 shipped
 and not active (305 install, 35 optional) + 9 recipe-only + 7 external. 215
@@ -346,11 +371,10 @@ and not active (305 install, 35 optional) + 9 recipe-only + 7 external. 215
 `templated_config: [node.type.${node_type}]`. `schema_for`: 104 `EXTRACTED`,
 835 `INFERRED`.
 
-Schema types: 1,805 distinct (150 wildcards) give 1,803 nodes, all 150
-wildcards with `pattern: true`. `schema_id` encodes `*`, so a wildcard never
-shares an id with a literal type. Two literal pairs still differ only by `.`
-against `_` and share one id: `views.field.user` / `views_field_user` and
-`views.field.bulk_form` / `views_field_bulk_form`.
+Schema types: 1,805 distinct (150 wildcards) give 1,805 nodes, all 150
+wildcards with `pattern: true`, and no two distinct types share an id (Task
+11): `schema_id` keeps the direct id for a type that already matches
+`^[a-z0-9]+(\.[a-z0-9]+)*$`, and hashes the rest (§9).
 
 ---
 
@@ -365,9 +389,10 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
    `active: true`, one per file in `config/sync`.
 3. **Secret screen.** Zero configuration files are dropped.
 4. **Splits.** Three split nodes with `folder` resolved to
-   `config/splits/{dev,test,prod}`; 8 patches produce `overrides_config` edges;
-   `settings.php` produces `AMBIGUOUS` edges to all three splits with `status` in
-   `keys`.
+   `config/splits/{dev,test,prod}`; 8 patches produce `overrides_config` edges
+   and one `drupal_config_patch` node each, with a `contains` edge from the
+   owning split (Task 11); `settings.php` produces `AMBIGUOUS` edges to all
+   three splits with `status` in `keys`.
 5. **Installed.** Exactly 215 `installs_extension` edges from `core.extension`
    (207 modules including the profile, 8 themes), every target a node; no node
    carries `installed`; listed-but-absent extensions carry `missing: true`.
@@ -403,9 +428,15 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
 | `settings.php` regex matches inside a heredoc or string | accepted: `AMBIGUOUS` already says the edge is unverified |
 | A test-fixture recipe shares a directory name with a core recipe (3 on the corpus) | collapsed like P1's name-collision fixtures, with both files in `declared_in`; recipes refer to each other by that name, so a separate id would dangle every `applies_recipe` |
 | Wildcard schema matching is slow on 1,805 types × ~1,500 configs | patterns are grouped by their literal prefix before `fnmatch`; measured in the plan |
-| Two literal schema pairs share an id because `make_id` treats `.` and `_` alike: `views.field.user` / `views_field_user`, `views.field.bulk_form` / `views_field_bulk_form` | accepted residual: neither is a config name, so `schema_for` is unaffected; pinned by name in the corpus test, so a new collision fails there |
 | The AST cache keys a configuration file by its own content, but its store (and so its node) also depends on neighbouring files — a `core.extension.yml` marker, a split entity's `folder:`, an `*.info.yml` above `config/` | accepted: such a change is rare and a `--force` rebuild (or a fresh cache) re-reads it; the per-run store caches are cleared, so only the persisted AST cache can hold a stale answer |
 | A P1 collision (an overridden service) whose shadowing file also declares other ids, when only the survivor's file changes: the persisted graph hands `extract()` no node naming the shadowing file, so the collision group cannot be found | accepted residual: the survivor keeps its own attributes (it wins either way); only `declared_in` loses the unchanged shadowing file until that file is re-extracted or a full build runs. Configuration is not affected: a shadowed config copy owns no node, so core re-extracts it on every run and it pulls the survivor in |
+
+**Resolved (Task 11), after the final whole-branch review:**
+
+| Former risk | Resolution |
+|---|---|
+| Two literal schema pairs shared an id because `make_id` treats `.` and `_` alike: `views.field.user` / `views_field_user`, `views.field.bulk_form` / `views_field_bulk_form` | `schema_id` now hashes any type that is not plain lowercase-dotted (§5.1); no two distinct types share an id on the corpus (§7.1) |
+| A split patch or a language override returned zero nodes, so core's zero-node heal left the file unstamped and re-extracted it on every run | each now emits one `drupal_config_patch` / `drupal_config_translation` node with a `contains` edge from its owning entity (§3.1, §5.1–5.3); the file is stamped like any other config file |
 
 ---
 
