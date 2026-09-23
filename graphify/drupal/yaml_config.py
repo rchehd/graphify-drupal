@@ -200,7 +200,9 @@ def extract_drupal_config(path: Path) -> dict[str, Any]:
     if store is None:
         return dict(_EMPTY)
     if store.kind == "schema":
-        return dict(_EMPTY)      # Task 4
+        from graphify.drupal.yaml_schema import extract_drupal_schema
+
+        return extract_drupal_schema(path, store)
     if path.name == "recipe.yml":
         return dict(_EMPTY)      # Task 5
     data, error = load_drupal_yaml(path)
