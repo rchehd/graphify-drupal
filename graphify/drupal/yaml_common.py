@@ -178,6 +178,10 @@ def breakpoint_id(owner: str, name: str) -> str:
     return make_id("drupal", "breakpoint", owner, name)
 
 
+def plugin_id(plugin_type: str, name: str) -> str:
+    return make_id("drupal", "plugin", plugin_type, name)
+
+
 def config_id(name: str) -> str:
     return make_id("drupal", "config", name)
 

@@ -24,7 +24,7 @@ from graphify.drupal.yaml_common import (
 from graphify.drupal.yaml_extract import extension_id
 
 
-def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict[str, Any]:
+def _extract_links(path: Path, kind: str, node_type: str, declares: str, family: str) -> dict[str, Any]:
     data, error = load_drupal_yaml(path)
     if error:
         return {"nodes": [], "edges": [], "error": error}
@@ -33,8 +33,11 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
 
     # Imported here: `families` imports this module to build its table.
     from graphify.drupal.families import extension_owner
+    # Imported here for the same reason: `yaml_plugins` reads `families`.
+    from graphify.drupal.yaml_plugins import plugin_type_for_family
 
     owner_id = extension_id(extension_owner(path))
+    plugin_type = plugin_type_for_family(family)
     lines = key_lines(path.read_text(encoding="utf-8", errors="replace"))[0]
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -68,6 +71,8 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
         nodes.append(node(lid, str(definition.get("title") or plugin_id),
                           type=node_type, layer="routing", path=path, line=line, **extra))
         add_edge(owner_id, lid, declares, line)
+        if plugin_type:
+            add_edge(lid, plugin_type, "plugin_of_type", line)
 
         if isinstance(route, str) and route:
             add_edge(lid, route_id(route), "links_to_route", line, target_name=route)
@@ -99,17 +104,21 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str) -> dict
 
 
 def extract_drupal_menu_links(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "menu_link", "drupal_menu_link", "declares_menu_link")
+    return _extract_links(path, "menu_link", "drupal_menu_link", "declares_menu_link",
+                          "links.menu")
 
 
 def extract_drupal_local_tasks(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "local_task", "drupal_local_task", "declares_local_task")
+    return _extract_links(path, "local_task", "drupal_local_task", "declares_local_task",
+                          "links.task")
 
 
 def extract_drupal_local_actions(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "local_action", "drupal_local_action", "declares_local_action")
+    return _extract_links(path, "local_action", "drupal_local_action", "declares_local_action",
+                          "links.action")
 
 
 def extract_drupal_contextual_links(path: Path) -> dict[str, Any]:
     return _extract_links(
-        path, "contextual_link", "drupal_contextual_link", "declares_contextual_link")
+        path, "contextual_link", "drupal_contextual_link", "declares_contextual_link",
+        "links.contextual")

@@ -50,7 +50,7 @@ _OWNER_RELATIONS = frozenset({
     "declares_service", "declares_parameter", "declares_route", "declares_permission",
     "declares_library", "declares_breakpoint", "declares_menu_link",
     "declares_local_task", "declares_local_action", "declares_contextual_link",
-    "defines_config", "defines_schema",
+    "defines_config", "defines_schema", "provides_plugin",
 })
 
 
@@ -90,10 +90,12 @@ def _materialise_owner(edge: dict[str, Any]) -> dict[str, Any]:
 _BY_PREFIX_RELATIONS = frozenset({
     "config_depends_on", "enforced_dependency", "installs_extension", "splits_extension",
     "splits_config", "imports_config", "config_action", "overrides_config", "applies_recipe",
+    "plugin_of_type",
 })
 
 #: Longest first: a schema id also starts with `drupal_config_`.
 _PREFIX_TYPES: tuple[tuple[str, str, str], ...] = (
+    ("drupal_plugin_type_", "drupal_plugin_type", "plugin"),
     ("drupal_config_schema_", "drupal_config_schema", "config"),
     ("drupal_config_", "drupal_config", "config"),
     ("drupal_extension_", "drupal_extension", "extension"),
@@ -237,6 +239,9 @@ def resolve_missing_targets(
             created[target]["config_name"] = edge.get("target_name") or target
         if relation == "installs_extension" and source == core_extension:
             # The site installs an extension the code base does not contain.
+            created[target]["missing"] = True
+        if node_type == "drupal_plugin_type":
+            # A plugin type no manager in this corpus registered.
             created[target]["missing"] = True
 
     all_nodes.extend(created.values())

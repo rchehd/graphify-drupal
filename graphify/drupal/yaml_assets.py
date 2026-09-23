@@ -107,9 +107,12 @@ def extract_drupal_breakpoints(path: Path) -> dict[str, Any]:
 
     # Imported here: `families` imports this module to build its table.
     from graphify.drupal.families import extension_owner
+    # Imported here for the same reason: `yaml_plugins` reads `families`.
+    from graphify.drupal.yaml_plugins import plugin_type_for_family
 
     owner = extension_owner(path)
     owner_id = extension_id(owner)
+    plugin_type = plugin_type_for_family("breakpoints")
     lines = key_lines(path.read_text(encoding="utf-8", errors="replace"))[0]
     nodes: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
@@ -129,5 +132,7 @@ def extract_drupal_breakpoints(path: Path) -> dict[str, Any]:
         nodes.append(node(bid, label, type="drupal_breakpoint",
                           layer="presentation", path=path, line=line, **extra))
         edges.append(edge(owner_id, bid, "declares_breakpoint", path=path, line=line))
+        if plugin_type:
+            edges.append(edge(bid, plugin_type, "plugin_of_type", path=path, line=line))
 
     return {"nodes": nodes, "edges": edges}

@@ -70,7 +70,8 @@ def extension_owner(path: Path) -> str:
 
 def drupal_extractor(path: Path) -> Callable[[Path], dict] | None:
     """Configuration first: a file inside a config store is configuration
-    whatever its name ends in (P1b spec §3.2)."""
+    whatever its name ends in (P1b spec §3.2). Then P1's fixed family table.
+    Then a plugin type learned from the site's own plugin managers (P2a)."""
     from graphify.drupal.config_stores import in_config_directory, is_config_yaml
 
     if is_config_yaml(path):
@@ -80,7 +81,15 @@ def drupal_extractor(path: Path) -> Callable[[Path], dict] | None:
     if in_config_directory(path):
         # Excluded configuration (a test module's) is still not a family file.
         return None
-    return family_extractor(path)
+    handler = family_extractor(path)
+    if handler is not None:
+        return handler
+
+    from graphify.drupal.yaml_plugins import extract_drupal_yaml_plugins, learned_family
+
+    if learned_family(path) is not None:
+        return extract_drupal_yaml_plugins
+    return None
 
 
 def is_drupal_file(path: Path) -> bool:
