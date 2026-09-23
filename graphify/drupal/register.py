@@ -40,7 +40,7 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
 
 
 def _patch_detect(detect: ModuleType) -> None:
-    from graphify.drupal.paths import is_drupal_info_yaml
+    from graphify.drupal.families import is_drupal_yaml
 
     for attr in ("classify_file", "FileType", "_is_graphable_source"):
         if not hasattr(detect, attr):
@@ -51,7 +51,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
     def _classify(original):
         def classify_file(path: Path):
-            if is_drupal_info_yaml(path):
+            if is_drupal_yaml(path):
                 return detect.FileType.CODE
             return original(path)
         return classify_file
@@ -62,16 +62,20 @@ def _patch_detect(detect: ModuleType) -> None:
             # secret screen exempts "genuine programming-language source" via
             # this predicate, and it excludes every data format — `.yml`
             # included — because credentials.yaml is exactly what that screen
-            # must catch. A Drupal *.info.yml is an extension declaration with
-            # a fixed schema and is never a credential store, so it belongs on
-            # the exempt side of core's own rule rather than around it.
+            # must catch. A file in the family table is an extension
+            # declaration with a fixed schema, named after its owner, and is
+            # never a credential store; it belongs on the exempt side of core's
+            # own rule rather than around it.
             #
             # Without this, `token.info.yml` is dropped silently: its stem
             # `token.info` is two words and hits the generic-keyword rule. On a
-            # real 1,140-extension tree that was the single casualty — but the
-            # `token` module is a dependency of a large share of Drupal sites,
-            # so every depends_on_module edge pointing at it would dangle.
-            if is_drupal_info_yaml(path):
+            # real 1,140-extension tree that was the single casualty while only
+            # `*.info.yml` was known — but the `token` module is a dependency of
+            # a large share of Drupal sites, so every depends_on_module edge
+            # pointing at it would dangle. The exemption tracks the table, so
+            # `token.services.yml` is covered the moment that family is
+            # registered and not a line sooner.
+            if is_drupal_yaml(path):
                 return True
             return original(path)
         return _is_graphable_source
@@ -81,8 +85,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
 
 def _patch_extract(extract: ModuleType) -> None:
-    from graphify.drupal.paths import is_drupal_info_yaml
-    from graphify.drupal.yaml_extract import extract_drupal_info
+    from graphify.drupal.families import family_extractor
 
     if not hasattr(extract, "_get_extractor"):
         raise DrupalSeamError(
@@ -99,8 +102,9 @@ def _patch_extract(extract: ModuleType) -> None:
         )
     def _dispatch(original):
         def _get_extractor(path: Path):
-            if is_drupal_info_yaml(path):
-                return extract_drupal_info
+            handler = family_extractor(path)
+            if handler is not None:
+                return handler
             return original(path)
         return _get_extractor
 
