@@ -17,6 +17,12 @@ from typing import Callable
 from graphify.drupal.yaml_access import extract_drupal_permissions, extract_drupal_routing
 from graphify.drupal.yaml_assets import extract_drupal_breakpoints, extract_drupal_libraries
 from graphify.drupal.yaml_extract import extract_drupal_info
+from graphify.drupal.yaml_links import (
+    extract_drupal_contextual_links,
+    extract_drupal_local_actions,
+    extract_drupal_local_tasks,
+    extract_drupal_menu_links,
+)
 from graphify.drupal.yaml_services import extract_drupal_services
 
 FAMILY_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
@@ -26,6 +32,10 @@ FAMILY_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".routing.yml": extract_drupal_routing,
     ".libraries.yml": extract_drupal_libraries,
     ".breakpoints.yml": extract_drupal_breakpoints,
+    ".links.menu.yml": extract_drupal_menu_links,
+    ".links.task.yml": extract_drupal_local_tasks,
+    ".links.action.yml": extract_drupal_local_actions,
+    ".links.contextual.yml": extract_drupal_contextual_links,
 }
 
 
