@@ -210,7 +210,7 @@ def _walk(base: Path, core_dir: Path | None,
         for ext in exts:
             found.extensions.setdefault(ext, directory.as_posix())
         is_core_dir = core_dir is not None and directory == core_dir
-        in_src = "src" in directory.relative_to(base).parts
+        in_src = "src" in Path(dirpath[len(str(base)):]).parts
         for name in names:
             path = directory / name
             if name.endswith(_SERVICES_SUFFIX):

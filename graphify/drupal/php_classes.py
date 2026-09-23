@@ -166,7 +166,7 @@ def read_php_class(path: Path) -> PhpClass | None:
             if discovery_body is not None:
                 discoveries = _collect_discoveries(discovery_body, namespace, uses)
 
-        alter_call = next(
+        alter_call = None if b"alterInfo" not in source else next(
             (
                 n
                 for n in _walk(body)
@@ -275,7 +275,9 @@ def _add_use_clause(uses: dict[str, str], clause: "tree_sitter.Node", prefix: st
 
 
 def _find_method(body: "tree_sitter.Node", name: str) -> "tree_sitter.Node | None":
-    for node in _walk(body):
+    """The class's own method `name`: a direct member of its body, never a
+    method of an anonymous class some other method builds."""
+    for node in body.named_children:
         if node.type != "method_declaration":
             continue
         name_node = node.child_by_field_name("name")

@@ -163,3 +163,28 @@ def test_the_declaration_named_after_the_file_wins(tmp_path):
 def test_a_file_named_after_no_declaration_reads_the_first(tmp_path):
     cls = read_php_class(_write(tmp_path, TWO_DECLARATIONS, "Other.php"))
     assert (cls.fqcn, cls.kind) == ("Drupal\\redis\\Cache\\ChecksumPreloadInterface", "interface")
+
+
+def test_an_anonymous_class_method_is_not_the_managers_own(tmp_path):
+    """Methods are read from the class body's own members: a `getDiscovery()`
+    or `__construct()` of an anonymous class built inside another method is
+    not the manager's (and the class body is no longer walked in full per
+    method, which kept the corpus registry build near its 5 s budget)."""
+    source = r"""<?php
+namespace Drupal\foo;
+class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
+  public function helper() {
+    return new class {
+      public function __construct() { parent::__construct('Plugin/Nope'); }
+      protected function getDiscovery() { return new YamlDiscovery('nope', []); }
+    };
+  }
+}
+"""
+    path = tmp_path / "FooManager.php"
+    path.write_text(source, encoding="utf-8")
+    cls = read_php_class(path)
+    assert cls is not None
+    assert cls.has_get_discovery is False
+    assert cls.discoveries == ()
+    assert cls.construct_args is None
