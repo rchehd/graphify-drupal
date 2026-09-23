@@ -133,7 +133,7 @@ def _patch_extract(extract: ModuleType) -> None:
         def _disambiguate_colliding_node_ids(nodes, edges, raw_calls, root):
             # Core salts apart an id declared by two files. Drupal ids are
             # global, so collapse ours first; see graphify/drupal/merge.py.
-            collapse_drupal_duplicates(nodes, Path(root) if root is not None else None)
+            collapse_drupal_duplicates(nodes, Path(root) if root is not None else None, edges)
             return original(nodes, edges, raw_calls, root)
         return _disambiguate_colliding_node_ids
 

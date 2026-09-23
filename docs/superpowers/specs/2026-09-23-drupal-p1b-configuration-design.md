@@ -229,6 +229,15 @@ config gains `install_mode` from its shipped default. `active` is `true` exactly
 when one copy is in a sync store. P1 node types keep the path rule; nothing they
 emit changes.
 
+A non-surviving copy's outgoing `config_depends_on` / `enforced_dependency`
+edges are kept on the one node and marked `shadowed: true`: they say what the
+shipped default needs, not what the active object needs. When the survivor's own
+edges already name the same target, the shadowed duplicate is dropped, so an
+ordered pair still carries at most one relation. `defines_config` edges and the
+unranked (P1) groups are untouched. An incremental run re-extracts every copy of
+a colliding id together (the seam's `extract()` wrapper widens the batch to the
+collision group), because a copy extracted alone would win its own collapse.
+
 ### 6.2 Ownership
 
 Shipped configuration and schemas are owned by the extension whose `*.info.yml`

@@ -33,11 +33,37 @@ def _relative(source_file: str, root: Path | None) -> str:
         return source_file
 
 
-def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = None) -> None:
+#: A configuration copy's outgoing edges that say what that copy needs.
+_DEPENDENCY_RELATIONS = frozenset({"config_depends_on", "enforced_dependency"})
+
+
+def _mark_shadowed(survivor_file: str, mine: list[dict[str, Any]], drop: set[int]) -> None:
+    """A non-surviving copy's dependencies stay, marked `shadowed`, never doubling a pair.
+
+    They are what the shipped default needs, which is worth knowing, but not what the
+    active object needs (spec §6.1). The survivor's own edges come first, so they keep a
+    pair both copies name.
+    """
+    pairs: set[str] = set()
+    for e in sorted(mine, key=lambda e: str(e.get("source_file")) != survivor_file):
+        if str(e.get("source_file")) != survivor_file:
+            if e.get("target") in pairs:
+                drop.add(id(e))
+                continue
+            e["shadowed"] = True
+        pairs.add(e.get("target"))
+
+
+def collapse_drupal_duplicates(
+    nodes: list[dict[str, Any]],
+    root: Path | None = None,
+    edges: list[dict[str, Any]] | None = None,
+) -> None:
     """Keep one node per Drupal id, in place.
 
     The survivor is the copy with the lowest `_rank`, then the lowest `source_file`. For ranked
-    (configuration) groups, attributes it lacks are taken from the other copies in that order.
+    (configuration) groups, attributes it lacks are taken from the other copies in that order,
+    and when `edges` is given the other copies' dependency edges are marked `shadowed`.
     When there was more than one, every declaring file is kept in `declared_in`, relative to `root`.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -45,7 +71,13 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
         if node.get("_origin") == _ORIGIN and isinstance(node.get("id"), str):
             groups.setdefault(node["id"], []).append(node)
 
+    dependencies: dict[str, list[dict[str, Any]]] = {}
+    for e in edges or ():
+        if e.get("relation") in _DEPENDENCY_RELATIONS and e.get("source") in groups:
+            dependencies.setdefault(e["source"], []).append(e)
+
     drop: set[int] = set()
+    drop_edges: set[int] = set()
     for group in groups.values():
         if len(group) < 2:
             continue
@@ -61,6 +93,9 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
                 for key, value in other.items():
                     if key not in survivor and key != "_rank":
                         survivor[key] = value
+            if survivor["id"] in dependencies:
+                _mark_shadowed(str(survivor.get("source_file", "")),
+                               dependencies[survivor["id"]], drop_edges)
         survivor["declared_in"] = sorted(
             {_relative(str(n.get("source_file", "")), root) for n in group}
         )
@@ -68,6 +103,9 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
 
     if drop:
         nodes[:] = [n for n in nodes if id(n) not in drop]
+    if edges is not None and drop_edges:
+        # Only shadowed duplicates are ever dropped.
+        edges[:] = [e for e in edges if id(e) not in drop_edges]
     for node in nodes:
         if node.get("_origin") == _ORIGIN:
             node.pop("_rank", None)

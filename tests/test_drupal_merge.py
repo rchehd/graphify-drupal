@@ -177,3 +177,40 @@ def test_without_context_the_group_is_the_given_paths(tmp_path):
 
     a = _write(tmp_path, "web/modules/a/a.services.yml", "services:\n  x: {class: A}\n")
     assert collision_group([a], [], tmp_path) == [a]
+
+
+def _dep(source: str, target: str, source_file: str, relation: str = "config_depends_on") -> dict:
+    return {"source": source, "target": target, "relation": relation,
+            "source_file": source_file, "_origin": "static_yaml"}
+
+
+def test_a_shadowed_copys_dependencies_are_kept_marked_and_never_doubled():
+    """P1b final review, Important 4 (spec §6.1)."""
+    from graphify.drupal.yaml_common import config_id
+
+    site, a, b, c = (config_id(n) for n in ("system.site", "a", "b", "c"))
+    sync, install = "config/sync/system.site.yml", "web/core/x/config/install/system.site.yml"
+    nodes = [_node(site, install, _rank=4), _node(site, sync, _rank=0)]
+    edges = [
+        _dep(site, a, sync), _dep(site, b, sync, "enforced_dependency"),
+        _dep(site, a, install), _dep(site, b, install), _dep(site, c, install),
+        {"source": "drupal_extension_x", "target": site, "relation": "defines_config",
+         "source_file": install, "_origin": "static_yaml"},
+    ]
+    collapse_drupal_duplicates(nodes, edges=edges)
+    got = sorted((e["relation"], e["target"], e["source_file"], e.get("shadowed", False))
+                 for e in edges)
+    assert got == sorted([
+        ("config_depends_on", a, sync, False),
+        ("enforced_dependency", b, sync, False),
+        ("config_depends_on", c, install, True),
+        ("defines_config", site, install, False),
+    ])
+
+
+def test_unranked_groups_leave_edges_alone():
+    x = service_id("x")
+    nodes = [_node(x, "a.services.yml"), _node(x, "b.services.yml")]
+    edges = [_dep(x, "t", "a.services.yml"), _dep(x, "t", "b.services.yml")]
+    collapse_drupal_duplicates(nodes, edges=edges)
+    assert len(edges) == 2 and not any("shadowed" in e for e in edges)
