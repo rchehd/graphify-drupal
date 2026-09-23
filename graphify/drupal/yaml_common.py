@@ -174,3 +174,19 @@ def link_id(kind: str, plugin_id: str) -> str:
 
 def breakpoint_id(owner: str, name: str) -> str:
     return make_id("drupal", "breakpoint", owner, name)
+
+
+def config_id(name: str) -> str:
+    return make_id("drupal", "config", name)
+
+
+def schema_id(type_: str) -> str:
+    return make_id("drupal", "config_schema", type_)
+
+
+def recipe_id(directory: str) -> str:
+    return make_id("drupal", "recipe", directory)
+
+
+def settings_id(site_file: str) -> str:
+    return make_id("drupal", "settings", site_file)
