@@ -200,8 +200,9 @@ Performance budget: under 5 seconds on the corpus; measured in the plan.
 `families.is_drupal_file` and `families.drupal_extractor` gain one more case,
 after P1b's configuration and P1's table: `<ext>.<yaml_name>.yml` in an
 extension root, where `<yaml_name>` is a learned, non-deferred family and not a
-P1 family → `yaml_plugins.extract_drupal_yaml_plugins`. The longest matching
-`yaml_name` wins (`modeler_api.contexts` over any `contexts`).
+P1 family → `yaml_plugins.extract_drupal_yaml_plugins`. The family is an exact
+lookup on the name after the owner's first dot segment: `eca.modeler_api.contexts.yml`
+is looked up as `modeler_api.contexts`, whole, and never as `contexts`.
 
 ### 5.3 Worker processes
 
@@ -224,9 +225,9 @@ manager (exactly as P1b composes `settings.php`). The type's edges
 
 ### 5.5 A changed registry re-extracts what it affects
 
-The `extract()` wrapper compares the new registry with the previous run's
-`drupal-discovery.json` (read before the `detect` wrapper overwrites it and kept
-in process state). Per `yaml_name` and per manager class it compares the
+`prepare_run`, inside the `detect` wrapper, compares the new registry with the
+previous run's `drupal-discovery.json` (read before it overwrites the file, and
+kept in process state). Per `yaml_name` and per manager class it compares the
 emitted facts; for every changed family, the files `*.<yaml_name>.yml` in
 extension roots, and for every changed manager its class file, are:
 - forced to miss the AST cache — a wrapper on `cache.load_cached` returns
@@ -234,15 +235,28 @@ extension roots, and for every changed manager its class file, are:
   `_EXTRACTOR_VERSION` and `_cleanup_stale_ast_entries` deletes other
   namespaces, so putting the registry hash into the version would re-parse the
   whole project on any manager change);
-- added to `paths` on incremental runs (the same widening as P1b's collision
-  group).
+- added to `paths` on incremental runs by the `extract()` wrapper (the same
+  widening as P1b's collision group).
 
 A newly learned family needs neither: its files had no nodes, and core
 re-queues zero-node files.
 
 The forced set is kept in `drupal-discovery.json` (`force_miss`) and carried
 into the next run's set until an `extract()` completes: an interrupted run, or a
-`detect` with nothing to extract, does not lose it.
+`detect` with nothing to extract, does not lose it. The widening lives in
+`extract()`, and core skips `extract()` when a batch is empty, so a registry
+change with no change to any graph file waits for the next extraction; the
+carried `force_miss` set is what keeps it from being lost.
+
+On `extract --out`, the incremental path calls `detect_incremental(root,
+<out>/graphify-out/manifest.json)`, which calls `detect` without a `cache_root`.
+The seam also wraps `detect_incremental`: an explicit `manifest_path` names the
+out dir (its parent), and the nested `detect` uses it for the previous
+registry, the new one and the inventory, so nothing is written into the
+scanned tree and the previous registry is found. The report wrapper finds the
+inventory beside the graph a caller names through
+`report.load_learning_for_report(<out>/graph.json)` (e.g. `cluster-only <site>
+--graph <out>/graphify-out/graph.json`), else under `<root>/graphify-out`.
 
 ### 5.6 Watch
 
@@ -278,10 +292,17 @@ out dir, so a stale one cannot resurrect the section.
 ### 5.8 Errors
 
 Nothing in the registry or the inventory raises: an unreadable or unparsable
-file becomes a `parse_error` entry and the run continues. The seam raises
-`DrupalSeamError` if `detect.detect`, `cache.load_cached`,
-`report.generate`, `watch._batch_triggers_rebuild` or `watch._has_non_code` is
-missing.
+file (a pathologically nested one included) becomes a `parse_error` entry and
+the run continues. An out dir that cannot be written (a read-only checkout)
+does not fail `detect`: the registry and the inventory stay in process, and
+`GRAPHIFY_DRUPAL_DISCOVERY` points at a private temp copy of the registry
+(`graphify-drupal-discovery-*.json`, replaced on the next run) so a
+spawn/forkserver worker still reads it; if that too fails the variable is
+removed and one warning is logged. The seam raises `DrupalSeamError` if
+`detect.detect`, `detect.detect_incremental`, `detect.ignored_predicate`,
+`paths.GRAPHIFY_OUT`, `cache.load_cached`, `report.generate`,
+`report.load_learning_for_report`, `watch._batch_triggers_rebuild` or
+`watch._has_non_code` is missing.
 
 ## 6. Acceptance criteria (corpus)
 
@@ -308,6 +329,9 @@ missing.
 - **Registry hash granularity.** Comparing per family and per manager keeps an
   unrelated manager's change from re-extracting everything; a bug here shows up
   as stale plugin nodes, which acceptance criterion 6 tests.
+- **A registry change with no graph-file change is applied late.** Widening
+  happens in `extract()`, which core skips for an empty batch; `force_miss`
+  carries the set to the next extraction (§5.5).
 - **tree-sitter PHP grammar drift** upstream: pinned by core's lockfile, and the
   seam's PHP reads are covered by unit tests on real manager shapes.
 
