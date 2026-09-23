@@ -143,12 +143,12 @@ so `x.links.menu.yml` is never read as family `menu`.
 |---|---:|---:|---|
 | `*.services.yml` | 375 | **2,305** | `drupal:service:<id>` |
 | `*.routing.yml` | 293 | **1,533** | `drupal:route:<name>` |
-| `*.libraries.yml` | 241 | 1,066 | `drupal:library:<owner>/<name>` |
+| `*.libraries.yml` | 241 | **1,066** | `drupal:library:<owner>/<name>` |
 | `*.permissions.yml` | 133 | **355** | `drupal:permission:<string>` |
 | `*.links.task.yml` | 117 | 437 | `drupal:local_task:<id>` |
 | `*.links.menu.yml` | 131 | 312 | `drupal:menu_link:<id>` |
 | `*.links.action.yml` | 65 | 112 | `drupal:local_action:<id>` |
-| `*.breakpoints.yml` | 9 | 36 | `drupal:breakpoint:<owner>:<name>` |
+| `*.breakpoints.yml` | 9 | **36** | `drupal:breakpoint:<owner>:<name>` |
 | `*.links.contextual.yml` | 19 | 34 | `drupal:contextual_link:<id>` |
 | **total** | **1,383** | **6,190** | |
 

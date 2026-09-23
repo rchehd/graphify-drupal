@@ -1278,6 +1278,22 @@ def test_assets_are_attributes_not_edges(tmp_path):
     assert not any(e["relation"] == "library_has_asset" for e in result["edges"])
 
 
+def test_js_attributes_are_not_mistaken_for_asset_paths(tmp_path):
+    """js is one level deep; a file's `attributes:` mapping is not a css-style group."""
+    text = (
+        "main:\n"
+        "  js:\n"
+        "    js/deferred.js: {attributes: {defer: true}}\n"
+        "  css:\n"
+        "    theme:\n"
+        "      css/print.css: {media: print}\n"
+    )
+    result = extract_drupal_libraries(_write(tmp_path, "foo.libraries.yml", text))
+    main = next(n for n in result["nodes"] if n["id"] == library_id("foo", "main"))
+    assert main["js"] == ["js/deferred.js"]
+    assert main["css"] == ["css/print.css"]
+
+
 def test_malformed_dependency_is_skipped_not_guessed(tmp_path):
     text = "main:\n  dependencies:\n    - no_slash_here\n"
     result = extract_drupal_libraries(_write(tmp_path, "foo.libraries.yml", text))
@@ -1301,6 +1317,11 @@ def test_neither_family_emits_an_extension_node(tmp_path):
         assert not any(n["id"] == extension_id("foo") for n in result["nodes"])
 ```
 
+> The first draft flattened assets with one shape-guessing helper, which read
+> `js/x.js: {attributes: {defer: true}}` as a css-style group and stored
+> `attributes` as a path. It occurs in core's `common_test`. js is one level
+> deep and css two, so each has its own helper.
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/test_drupal_assets.py -q`
@@ -1322,7 +1343,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from graphify.drupal.families import extension_owner
 from graphify.drupal.yaml_common import (
     breakpoint_id,
     edge,
@@ -1334,15 +1354,23 @@ from graphify.drupal.yaml_common import (
 from graphify.drupal.yaml_extract import extension_id
 
 
-def _asset_paths(section: Any) -> list[str]:
-    """Flatten `css: {theme: {path: {}}}` and `js: {path: {}}` to a path list."""
+def _js_paths(section: Any) -> list[str]:
+    """`js: {path: {options}}` -- one level. Options such as `attributes:` are
+    themselves mappings, so the shape alone cannot tell a file from a group."""
+    return [str(key) for key in section] if isinstance(section, dict) else []
+
+
+def _css_paths(section: Any) -> list[str]:
+    """`css: {category: {path: {options}}}` -- two levels.
+
+    A path written straight under `css:` with no category is malformed but
+    occurs; it is kept as a path rather than dropped.
+    """
     if not isinstance(section, dict):
         return []
     paths: list[str] = []
     for key, value in section.items():
-        if isinstance(value, dict) and value and all(
-            isinstance(inner, dict) for inner in value.values()
-        ):
+        if isinstance(value, dict) and value:
             paths.extend(str(inner_key) for inner_key in value)
         else:
             paths.append(str(key))
@@ -1355,6 +1383,9 @@ def extract_drupal_libraries(path: Path) -> dict[str, Any]:
         return {"nodes": [], "edges": [], "error": error}
     if not data:
         return {"nodes": [], "edges": []}
+
+    # Imported here: `families` imports this module to build its table.
+    from graphify.drupal.families import extension_owner
 
     owner = extension_owner(path)
     owner_id = extension_id(owner)
@@ -1369,8 +1400,8 @@ def extract_drupal_libraries(path: Path) -> dict[str, Any]:
         lid = library_id(owner, name)
         extra: dict[str, Any] = {}
         if isinstance(definition, dict):
-            css = _asset_paths(definition.get("css"))
-            js = _asset_paths(definition.get("js"))
+            css = _css_paths(definition.get("css"))
+            js = _js_paths(definition.get("js"))
             if css:
                 extra["css"] = css
             if js:
@@ -1405,6 +1436,9 @@ def extract_drupal_breakpoints(path: Path) -> dict[str, Any]:
         return {"nodes": [], "edges": [], "error": error}
     if not data:
         return {"nodes": [], "edges": []}
+
+    # Imported here: `families` imports this module to build its table.
+    from graphify.drupal.families import extension_owner
 
     owner = extension_owner(path)
     owner_id = extension_id(owner)

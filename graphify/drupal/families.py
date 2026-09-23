@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from graphify.drupal.yaml_access import extract_drupal_permissions, extract_drupal_routing
+from graphify.drupal.yaml_assets import extract_drupal_breakpoints, extract_drupal_libraries
 from graphify.drupal.yaml_extract import extract_drupal_info
 from graphify.drupal.yaml_services import extract_drupal_services
 
@@ -23,6 +24,8 @@ FAMILY_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     ".services.yml": extract_drupal_services,
     ".permissions.yml": extract_drupal_permissions,
     ".routing.yml": extract_drupal_routing,
+    ".libraries.yml": extract_drupal_libraries,
+    ".breakpoints.yml": extract_drupal_breakpoints,
 }
 
 
