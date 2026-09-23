@@ -288,7 +288,7 @@ invalidate it without a manual bump.
 | shipped, not active | ~340 |
 | recipe configuration not already counted | ≤80 |
 | recipes | 46 |
-| schema types | 1,805 |
+| schema nodes (1,805 types; two literal pairs share an id, §9) | 1,803 |
 | settings, externals | ~50 |
 | **after P1b** | **≈10,600** |
 
@@ -309,6 +309,10 @@ which the CLI would not collect; `settings.ddev.php` adds the second
 domain records). Parse errors: `invalid_file.libraries.yml` only.
 
 10,478 nodes, 22,282 edges; **10,473 Drupal nodes**, 918 of them `realm: custom`.
+
+After the final-review fixes (§6.1): 21,274 edges. The 1,008 removed were a
+shadowed copy's dependency edges repeating a pair the survivor already has; the
+set of ordered pairs is unchanged (21,172), and 56 edges carry `shadowed: true`.
 
 | Type | Nodes |
 |---|---:|
@@ -399,6 +403,9 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
 | `settings.php` regex matches inside a heredoc or string | accepted: `AMBIGUOUS` already says the edge is unverified |
 | A test-fixture recipe shares a directory name with a core recipe (3 on the corpus) | collapsed like P1's name-collision fixtures, with both files in `declared_in`; recipes refer to each other by that name, so a separate id would dangle every `applies_recipe` |
 | Wildcard schema matching is slow on 1,805 types × ~1,500 configs | patterns are grouped by their literal prefix before `fnmatch`; measured in the plan |
+| Two literal schema pairs share an id because `make_id` treats `.` and `_` alike: `views.field.user` / `views_field_user`, `views.field.bulk_form` / `views_field_bulk_form` | accepted residual: neither is a config name, so `schema_for` is unaffected; pinned by name in the corpus test, so a new collision fails there |
+| The AST cache keys a configuration file by its own content, but its store (and so its node) also depends on neighbouring files — a `core.extension.yml` marker, a split entity's `folder:`, an `*.info.yml` above `config/` | accepted: such a change is rare and a `--force` rebuild (or a fresh cache) re-reads it; the per-run store caches are cleared, so only the persisted AST cache can hold a stale answer |
+| A P1 collision (an overridden service) whose shadowing file also declares other ids, when only the survivor's file changes: the persisted graph hands `extract()` no node naming the shadowing file, so the collision group cannot be found | accepted residual: the survivor keeps its own attributes (it wins either way); only `declared_in` loses the unchanged shadowing file until that file is re-extracted or a full build runs. Configuration is not affected: a shadowed config copy owns no node, so core re-extracts it on every run and it pulls the survivor in |
 
 ---
 

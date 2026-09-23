@@ -100,7 +100,11 @@ Every node carries:
 | `layer` | see §1.1 |
 | `_origin` | `static_yaml` \| `static_php` \| `learned` \| `container` |
 | `external` | `true` when the entity has no file in the repository |
-| `installed` | `true`/`false` from `core.extension.yml`, on extensions only |
+
+Whether an extension is installed is not a node attribute: it is the
+`installs_extension` edge from the `core.extension` config node (P1b deviation 4
+— an attribute on an unchanged `*.info.yml`'s node would go stale on an
+incremental run, while the edge is re-emitted with `core.extension.yml`).
 
 Every edge carries `source`, `target`, `relation`, `confidence`
 (`EXTRACTED`/`INFERRED`/`AMBIGUOUS`), `source_file`, `source_location`, and
@@ -536,7 +540,8 @@ Two things commonly assumed to need runtime **do not**:
   static list of installed modules and themes with weights. The divergence
   recorded in `docs/drupal-graphify.md` §4 (23 container edges vs 29 file edges,
   the difference being six shipped-but-not-enabled sub-modules) is resolvable
-  statically by setting `installed` on the extension node;
+  statically from the `installs_extension` edges of `core.extension` (an
+  extension without one is shipped but not enabled);
 - **block placement and Layout Builder defaults** — `block.block.*.yml` is a
   config entity, and Layout Builder defaults live in
   `core.entity_view_display.*` under
