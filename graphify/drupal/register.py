@@ -126,6 +126,19 @@ def _patch_extract(extract: ModuleType) -> None:
             "graphify.extract._DISPATCH is missing or no longer a dict — dispatch "
             "was restructured upstream; graphify/drupal/register.py must be updated"
         )
+    def _compose(base, extra):
+        """A handler that runs core's `base` first, then appends `extra(p)`'s
+        nodes and edges -- core's PHP nodes are kept either way, and a file
+        that is both cases at once cannot occur (settings.php is never a
+        manager class file), so one helper serves both compositions."""
+        def handler(p: Path, _base=base, _extra=extra):
+            result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
+            ours = _extra(p)
+            result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
+            result["edges"] = list(result.get("edges", [])) + ours["edges"]
+            return result
+        return handler
+
     def _dispatch(original):
         def _get_extractor(path: Path):
             handler = drupal_extractor(path)
@@ -134,24 +147,10 @@ def _patch_extract(extract: ModuleType) -> None:
             base = original(path)
             if is_settings_php(path):
                 # Keep core's PHP nodes; add the `$config[…]` overrides.
-                def settings_handler(p: Path, _base=base):
-                    result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
-                    ours = extract_drupal_settings(p)
-                    result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
-                    result["edges"] = list(result.get("edges", [])) + ours["edges"]
-                    return result
-                return settings_handler
+                return _compose(base, extract_drupal_settings)
             if path.suffix == ".php" and is_manager_class_file(path):
-                # Same composition as settings.php: keep core's PHP nodes, add
-                # the type's node and edges (spec §5.4). A manager file is
-                # never settings.php, so the two branches never both apply.
-                def manager_handler(p: Path, _base=base):
-                    result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
-                    ours = extract_plugin_types(p)
-                    result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
-                    result["edges"] = list(result.get("edges", [])) + ours["edges"]
-                    return result
-                return manager_handler
+                # Keep core's PHP nodes; add the type's node and edges (spec §5.4).
+                return _compose(base, extract_plugin_types)
             return base
         return _get_extractor
 
