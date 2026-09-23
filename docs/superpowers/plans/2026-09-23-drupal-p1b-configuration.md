@@ -437,7 +437,7 @@ print(dict(c))
 "
 ```
 
-Expected: `sync` 613, `split` 8, `install` + `optional` 858, `schema` 311, `recipe` 58 + 103 (recipe.yml files plus recipe config, fixtures included). Record the measured numbers in the commit message; a gap is a store-detection bug, not a number to edit.
+Measured (Task 1): `sync` 613, `split` 8, `install` + `optional` 857, `schema` 303, `recipe` 152 (49 recognised `recipe.yml` + recipe config). Of 58 `recipe.yml` files, 4 Composer-unpack fixtures are test fixtures and 5 sit one level deeper (`recipes/<group>/<name>/`), outside the `recipes/<name>/recipe.yml` rule. Record the measured numbers in the commit message; a gap is a store-detection bug, not a number to edit.
 
 - [ ] **Step 6: Commit**
 
@@ -2343,7 +2343,7 @@ def test_p1b_criterion_7_no_configuration_value_reaches_the_graph(site_extractio
 def test_p1b_criterion_8_recipes(site_extraction):
     recipes = [n for n in site_extraction["nodes"] if n.get("type") == "drupal_recipe"
                and not n.get("external")]
-    assert len(recipes) == 55
+    assert len(recipes) == 46
     for e in site_extraction["edges"]:
         if e["relation"] == "config_action" and e.get("confidence") != "AMBIGUOUS":
             assert "${" not in repr(e), e

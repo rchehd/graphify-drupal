@@ -34,8 +34,8 @@ the same node ids.
 | `config/splits/{dev,test,prod}` | 8 | config_split 2.x **patches**, not copies (§5.3) |
 | `config/install`, `config/optional` of non-test extensions | 858 | 772 distinct names; **432 are also in sync**, 340 are shipped but not active |
 | `config/install`, `config/optional` of test modules | 959 | out of scope (§4) |
-| `config/schema/*.schema.yml`, non-test | 311 | 1,815 schema types, 151 of them wildcard patterns |
-| `recipe.yml` | 58 | 28 in `core/recipes`, 30 in `core/tests/fixtures/recipes`; 3 directory names occur in both, so **55 recipe ids** |
+| `config/schema/*.schema.yml`, non-test | 303 | 1,815 schema types, 151 of them wildcard patterns |
+| `recipe.yml` | 58 | 28 in `core/recipes`, 30 test fixtures; 49 sit at `recipes/<name>/recipe.yml` (4 Composer-unpack fixtures and 5 grouped fixtures do not); 3 directory names occur twice, so **46 recipe ids** |
 | recipe `config/*.yml` | 103 | 23 in test fixtures |
 | `settings*.php` visible to git | 1 | `settings.php`: 8 `$config[…]` lines, 6 of them set a split's `status` |
 | `domain.config.*.yml` in sync | 2 | per-domain `system.site` overrides |
@@ -262,7 +262,7 @@ invalidate it without a manual bump.
 | active configuration (sync) | 613 |
 | shipped, not active | ~340 |
 | recipe configuration not already counted | ≤80 |
-| recipes | 55 |
+| recipes | 46 |
 | schema types | 1,815 |
 | settings, externals | ~50 |
 | **after P1b** | **≈10,600** |
@@ -297,7 +297,7 @@ Measured through `graphify.extract.extract` with a fresh `cache_root`, in
 7. **No values.** `graph.json` contains none of a fixed list of values present in
    the corpus — split-patch hostnames, `password_reset_timeout` values, the
    `settings.php` SMTP sender — in any node or edge attribute.
-8. **Recipes.** 55 recipe nodes from 58 files — `article_content_type`,
+8. **Recipes.** 46 recipe nodes from 49 recognised files — `article_content_type`,
    `article_tags` and `page_content_type` exist as a core recipe and as a test
    fixture, and collapse with both in `declared_in`; every `config_action` whose arguments contain
    `${…}` is `AMBIGUOUS`.
