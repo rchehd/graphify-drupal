@@ -66,3 +66,22 @@ def extension_owner(path: Path) -> str:
     """Machine name of the extension that owns this file, or ''."""
     suffix = _match(path)
     return path.name[: -len(suffix)] if suffix else ""
+
+
+def drupal_extractor(path: Path) -> Callable[[Path], dict] | None:
+    """Configuration first: a file inside a config store is configuration
+    whatever its name ends in (P1b spec §3.2)."""
+    from graphify.drupal.config_stores import in_config_directory, is_config_yaml
+
+    if is_config_yaml(path):
+        from graphify.drupal.yaml_config import extract_drupal_config
+
+        return extract_drupal_config
+    if in_config_directory(path):
+        # Excluded configuration (a test module's) is still not a family file.
+        return None
+    return family_extractor(path)
+
+
+def is_drupal_file(path: Path) -> bool:
+    return drupal_extractor(path) is not None

@@ -105,3 +105,15 @@ def test_drupal_duplicates_are_collapsed_before_core_splits_them():
 
     wrapped = extract._disambiguate_colliding_node_ids
     assert getattr(wrapped, "_drupal_patched", False)
+
+
+def test_the_seam_dispatches_configuration(tmp_path):
+    install()
+    import graphify.extract as extract
+    from graphify.drupal.yaml_config import extract_drupal_config
+
+    (tmp_path / "config/sync").mkdir(parents=True)
+    (tmp_path / "config/sync/core.extension.yml").write_text("module: {}\n", encoding="utf-8")
+    path = tmp_path / "config/sync/system.site.yml"
+    path.write_text("name: x\n", encoding="utf-8")
+    assert extract._get_extractor(path) is extract_drupal_config

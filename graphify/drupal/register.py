@@ -40,7 +40,7 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
 
 
 def _patch_detect(detect: ModuleType) -> None:
-    from graphify.drupal.families import is_drupal_yaml
+    from graphify.drupal.families import is_drupal_file
 
     for attr in ("classify_file", "FileType", "_is_graphable_source"):
         if not hasattr(detect, attr):
@@ -51,7 +51,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
     def _classify(original):
         def classify_file(path: Path):
-            if is_drupal_yaml(path):
+            if is_drupal_file(path):
                 return detect.FileType.CODE
             return original(path)
         return classify_file
@@ -62,10 +62,10 @@ def _patch_detect(detect: ModuleType) -> None:
             # secret screen exempts "genuine programming-language source" via
             # this predicate, and it excludes every data format — `.yml`
             # included — because credentials.yaml is exactly what that screen
-            # must catch. A file in the family table is an extension
-            # declaration with a fixed schema, named after its owner, and is
-            # never a credential store; it belongs on the exempt side of core's
-            # own rule rather than around it.
+            # must catch. A family file or a configuration file (P1b) has
+            # a fixed schema and is never a credential store; its values never
+            # reach the graph, so it belongs on the exempt side of core's own
+            # rule rather than around it.
             #
             # Without this, `token.info.yml` is dropped silently: its stem
             # `token.info` is two words and hits the generic-keyword rule. On a
@@ -75,7 +75,7 @@ def _patch_detect(detect: ModuleType) -> None:
             # pointing at it would dangle. The exemption tracks the table, so
             # `token.services.yml` is covered the moment that family is
             # registered and not a line sooner.
-            if is_drupal_yaml(path):
+            if is_drupal_file(path):
                 return True
             return original(path)
         return _is_graphable_source
@@ -85,8 +85,9 @@ def _patch_detect(detect: ModuleType) -> None:
 
 
 def _patch_extract(extract: ModuleType) -> None:
-    from graphify.drupal.families import family_extractor
+    from graphify.drupal.families import drupal_extractor
     from graphify.drupal.merge import collapse_drupal_duplicates
+    from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
         raise DrupalSeamError(
@@ -103,10 +104,20 @@ def _patch_extract(extract: ModuleType) -> None:
         )
     def _dispatch(original):
         def _get_extractor(path: Path):
-            handler = family_extractor(path)
+            handler = drupal_extractor(path)
             if handler is not None:
                 return handler
-            return original(path)
+            base = original(path)
+            if is_settings_php(path):
+                # Keep core's PHP nodes; add the `$config[…]` overrides.
+                def settings_handler(p: Path, _base=base):
+                    result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
+                    ours = extract_drupal_settings(p)
+                    result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
+                    result["edges"] = list(result.get("edges", [])) + ours["edges"]
+                    return result
+                return settings_handler
+            return base
         return _get_extractor
 
     _wrap(extract, "_get_extractor", _dispatch)
