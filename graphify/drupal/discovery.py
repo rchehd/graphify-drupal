@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
-from graphify.drupal.php_classes import Arg, PhpClass, read_php_class
+from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
 from graphify.drupal.yaml_common import load_drupal_yaml
 from graphify.ids import make_id
 
@@ -491,14 +492,35 @@ def _read_services(builder: _Builder, path: Path) -> set[str]:
     return reached
 
 
-def _read_provider(builder: _Builder, path: Path) -> None:
+_SET_CLASS = re.compile(
+    r"->setClass\(\s*(?:'([^']+)'|\"([^\"]+)\"|(\\?[A-Za-z_][\w\\]*)::class)")
+_USE = re.compile(r"^\s*use\s+\\?([A-Za-z_][\w\\]*)(?:\s+as\s+(\w+))?\s*;", re.MULTILINE)
+
+
+def _set_classes(text: str, namespace: str) -> list[str]:
+    """The classes `->setClass(...)` names: a string literal, or `X::class`
+    resolved through the file's namespace and `use` statements."""
+    uses = {(alias or name.rsplit("\\", 1)[-1]): name for name, alias in _USE.findall(text)}
+    found = []
+    for single, double, const in _SET_CLASS.findall(text):
+        # A double-quoted PHP string may escape its backslashes.
+        literal = single or double.replace("\\\\", "\\")
+        found.append(literal.lstrip("\\") if literal else resolve_name(const, namespace, uses))
+    return found
+
+
+def _read_provider(builder: _Builder, path: Path) -> list[str]:
+    """Record a provider whose `alter()` sets a class; return the classes it sets."""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return
-    if "function alter(" in text and "->setClass(" in text:
-        cls = read_php_class(path)
-        builder.note(cls.fqcn if cls else "", path.as_posix(), "service_provider_alter")
+        return []
+    if "function alter(" not in text or "->setClass(" not in text:
+        return []
+    cls = read_php_class(path)
+    builder.note(cls.fqcn if cls else "", path.as_posix(), "service_provider_alter")
+    namespace = cls.fqcn.rpartition("\\")[0] if cls else ""
+    return _set_classes(text, namespace)
 
 
 def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = None) -> Registry:
@@ -518,8 +540,9 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
     reached: set[str] = set()
     for path in walk.services:
         reached |= _read_services(builder, path)
+    swapped: list[tuple[Path, str]] = []
     for path in walk.providers:
-        _read_provider(builder, path)
+        swapped.extend((path, fqcn) for fqcn in _read_provider(builder, path))
     for path in walk.managers:
         cls = read_php_class(path)
         if cls is None:
@@ -531,6 +554,14 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
         reached.add(cls.fqcn)
         builder.note(cls.fqcn, path.as_posix(), "not_a_service")
         builder.add_type(f"class:{cls.fqcn}", path, cls, builder.owner_of(path), "")
+
+    # A manager only a provider's `alter()` installs (symfony_mailer's
+    # `MailManagerReplacement`) is neither a service nor `*Manager.php`: name it
+    # as the provider's entry so no manager class goes unreported (P3 follows it).
+    for path, fqcn in swapped:
+        found = builder.lookup(fqcn) if fqcn not in reached else None
+        if found is not None and builder.is_manager(found[1]):
+            builder.note(fqcn, path.as_posix(), "service_provider_alter")
 
     return Registry(
         web_root=web_root.as_posix() if web_root is not None else None,

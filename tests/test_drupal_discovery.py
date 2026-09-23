@@ -467,3 +467,48 @@ class FooManager extends \Drupal\Core\Plugin\DefaultPluginManager {
     r = build_registry(tmp_path)
     assert sorted(r.types) == ["one", "two"]
     assert _reasons(r) == [("dynamic_discovery", "Drupal\\foo\\FooManager")]
+
+
+REPLACEMENT_MANAGER = r"""<?php
+namespace Drupal\foo;
+class FooReplacement extends \Drupal\Core\Plugin\DefaultPluginManager {}
+"""
+
+
+def test_a_manager_a_service_provider_swaps_in_is_named(tmp_path):
+    """symfony_mailer's `MailManagerReplacement` on the reference corpus: not a
+    service, not `*Manager.php`, reached only through `alter()`'s `setClass()`.
+    The class it sets is recorded, not just the provider (spec §6 criterion 1)."""
+    provider = r"""<?php
+namespace Drupal\foo;
+use Drupal\Core\DependencyInjection\ServiceProviderBase;
+use Drupal\foo\Other\Swapped as Alias;
+class FooServiceProvider extends ServiceProviderBase {
+  public function alter($c) {
+    $c->getDefinition('plugin.manager.mail')->setClass('Drupal\foo\FooReplacement');
+    $c->getDefinition('plugin.manager.bar')->setClass(Alias::class);
+    $c->getDefinition('plugin.manager.foo')->setClass(FooManager::class);
+    $c->getDefinition('x')->setClass(NotAManager::class);
+  }
+}
+"""
+    swapped = r"""<?php
+namespace Drupal\foo\Other;
+class Swapped extends \Drupal\Core\Plugin\DefaultPluginManager {}
+"""
+    _site(tmp_path, _module("foo", FOO_SERVICES, {
+        "src/FooServiceProvider.php": provider,
+        "src/FooReplacement.php": REPLACEMENT_MANAGER,
+        "src/Other/Swapped.php": swapped,
+        "src/FooManager.php": D11_MANAGER,
+    }))
+    r = build_registry(tmp_path)
+    provider_file = (tmp_path / "web/modules/custom/foo/src/FooServiceProvider.php").as_posix()
+    assert sorted(u["class"] for u in r.unresolved
+                  if u["reason"] == "service_provider_alter" and u["file"] == provider_file) == [
+        "Drupal\\foo\\FooReplacement",
+        "Drupal\\foo\\FooServiceProvider",
+        "Drupal\\foo\\Other\\Swapped",
+    ]
+    # FooManager is already a type; the swap does not make it unresolved too.
+    assert list(r.types) == ["foo"]
