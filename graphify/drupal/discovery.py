@@ -10,6 +10,7 @@ never an exception.
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -462,3 +463,124 @@ def build_registry(scan_root: Path) -> Registry:
         extensions=walk.extensions,
         root_yaml=walk.root_yaml,
     )
+
+
+# -- the registry in the pipeline --------------------------------------------
+#
+# `prepare_run` builds the registry once at the start of every `detect()` (see
+# graphify/drupal/register.py's `_patch_detect`), keeps it in this process via
+# `set_current`, and persists it to `<out>/drupal-discovery.json` so a spawned
+# `ProcessPoolExecutor` extraction worker — a separate process that never runs
+# `detect()` itself — can still read it through `current_registry()`.
+
+ENV_VAR = "GRAPHIFY_DRUPAL_DISCOVERY"
+
+_REGISTRY_FILENAME = "drupal-discovery.json"
+
+_current: Registry | None = None
+_previous: Registry | None = None
+
+# current_registry() caches the file it loads from ENV_VAR by (path, mtime), so
+# a worker process that calls it many times over one run reads the file once.
+_env_cache_path: str | None = None
+_env_cache_mtime: float | None = None
+_env_cache_registry: Registry | None = None
+
+
+def out_dir(root: Path, cache_root: Path | None = None) -> Path:
+    """The graphify-out directory for this run, matching core's own resolution.
+
+    Mirrors `graphify.cache.cache_dir`'s `_out if _out.is_absolute() else
+    Path(location).resolve() / _out`, where `location` is `cache_root` when
+    given, else `root` — so a `GRAPHIFY_OUT` override (relative or absolute)
+    and an `extract --out`-style `cache_root` land the registry file exactly
+    where the rest of graphify's output already goes.
+    """
+    from graphify.paths import GRAPHIFY_OUT
+
+    location = cache_root if cache_root is not None else root
+    out = Path(GRAPHIFY_OUT)
+    return out if out.is_absolute() else Path(location).resolve() / out
+
+
+def set_current(registry: Registry | None, previous: Registry | None = None) -> None:
+    """Set this process's in-memory registry (and the prior run's, if any)."""
+    global _current, _previous
+    _current = registry
+    _previous = previous
+
+
+def current_registry() -> Registry | None:
+    """This process's registry: in-memory if set, else loaded from ENV_VAR's file.
+
+    The file load is cached by (path, mtime) so repeated calls in one process
+    (e.g. many files handled by one extraction worker) cost one stat plus at
+    most one read. Returns None when neither is available, or the file cannot
+    be read/parsed.
+    """
+    global _env_cache_path, _env_cache_mtime, _env_cache_registry
+    if _current is not None:
+        return _current
+    path = os.environ.get(ENV_VAR)
+    if not path:
+        return None
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return None
+    if (
+        _env_cache_registry is not None
+        and _env_cache_path == path
+        and _env_cache_mtime == mtime
+    ):
+        return _env_cache_registry
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    registry = Registry.from_json(data)
+    _env_cache_path, _env_cache_mtime, _env_cache_registry = path, mtime, registry
+    return registry
+
+
+def previous_registry() -> Registry | None:
+    """The prior run's registry, as read by `prepare_run` before it overwrote
+    the file. In-process only — a worker process never sees it, only the
+    process that called `prepare_run` (i.e. that ran `detect()`)."""
+    return _previous
+
+
+def prepare_run(root: Path, cache_root: Path | None = None) -> Registry:
+    """Build the registry for this run and make it visible to the pipeline.
+
+    Reads `<out>/drupal-discovery.json` as the previous run's registry (ignored
+    if missing or unreadable), builds the new registry with `build_registry`
+    (which never raises), and tries to write it back to that same path with
+    sorted keys and one-space indent. A write failure (read-only tree,
+    permissions, ...) degrades to keeping the registry in-process only: no
+    file is written, `ENV_VAR` is left untouched, and the run proceeds exactly
+    as `build_registry` intends — never raising on bad input.
+    """
+    root = Path(root)
+    target = out_dir(root, cache_root) / _REGISTRY_FILENAME
+
+    previous: Registry | None = None
+    try:
+        previous = Registry.from_json(json.loads(target.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError, KeyError):
+        previous = None
+
+    registry = build_registry(root)
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(registry.to_json(), sort_keys=True, indent=1),
+            encoding="utf-8",
+        )
+        os.environ[ENV_VAR] = str(target.absolute())
+    except OSError:
+        pass
+
+    set_current(registry, previous)
+    return registry

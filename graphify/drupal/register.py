@@ -42,7 +42,7 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
 def _patch_detect(detect: ModuleType) -> None:
     from graphify.drupal.families import is_drupal_file
 
-    for attr in ("classify_file", "FileType", "_is_graphable_source"):
+    for attr in ("classify_file", "FileType", "_is_graphable_source", "detect"):
         if not hasattr(detect, attr):
             raise DrupalSeamError(
                 f"graphify.detect.{attr} is missing — graphify core changed shape; "
@@ -80,8 +80,30 @@ def _patch_detect(detect: ModuleType) -> None:
             return original(path)
         return _is_graphable_source
 
+    def _detect(original):
+        # The registry must exist before core scans a single file — extraction
+        # workers spawned later in the same run read it through
+        # `current_registry()`, and `prepare_run` is what makes that possible.
+        def detect_(root, *, follow_symlinks=None, google_workspace=None,
+                    extra_excludes=None, cache_root=None, gitignore=True):
+            from graphify.drupal.discovery import prepare_run
+
+            prepare_run(Path(root), cache_root)
+            return original(
+                root,
+                follow_symlinks=follow_symlinks,
+                google_workspace=google_workspace,
+                extra_excludes=extra_excludes,
+                cache_root=cache_root,
+                gitignore=gitignore,
+            )
+        detect_.__name__ = detect_.__qualname__ = "detect"
+        detect_.__doc__ = original.__doc__
+        return detect_
+
     _wrap(detect, "classify_file", _classify)
     _wrap(detect, "_is_graphable_source", _graphable)
+    _wrap(detect, "detect", _detect)
 
 
 def _patch_extract(extract: ModuleType) -> None:
