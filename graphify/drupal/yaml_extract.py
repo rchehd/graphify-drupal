@@ -106,6 +106,13 @@ def extract_drupal_info(path: Path) -> dict[str, Any]:
         for raw in raw_deps:
             add(_normalise_dependency(raw), "depends_on_module")
 
+    # A profile's `install:` names extensions it enables, without saying which
+    # kind (P1b spec §5.1, deviation 2).
+    raw_install = data.get("install") or []
+    if isinstance(raw_install, list):
+        for raw in raw_install:
+            add(_normalise_dependency(raw), "installs_extension")
+
     base = data.get("base theme")
     if isinstance(base, str) and base.strip():
         add(base.strip(), "base_theme")

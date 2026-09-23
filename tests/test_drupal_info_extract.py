@@ -186,3 +186,13 @@ def test_an_owner_without_info_yml_is_materialised_from_its_file(tmp_path):
     assert owner["type"] == "drupal_extension"
     assert owner["realm"] == "core"
     assert owner["external"] is True
+
+
+def test_a_profile_installs_what_it_lists(tmp_path):
+    path = tmp_path / "web/core/profiles/standard/standard.info.yml"
+    path.parent.mkdir(parents=True)
+    path.write_text("name: Standard\ntype: profile\ninstall:\n  - node\n  - drupal:history\n",
+                    encoding="utf-8")
+    result = extract_drupal_info(path)
+    installs = {e["target"] for e in result["edges"] if e["relation"] == "installs_extension"}
+    assert installs == {extension_id("node"), extension_id("history")}
