@@ -36,8 +36,9 @@ def _relative(source_file: str, root: Path | None) -> str:
 def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = None) -> None:
     """Keep one node per Drupal id, in place.
 
-    The survivor is the copy with the lowest `_rank`, then the lowest `source_file`; attributes it lacks are taken from the other copies in that order. When there was more than one, every
-    declaring file is kept in `declared_in`, relative to `root`.
+    The survivor is the copy with the lowest `_rank`, then the lowest `source_file`. For ranked
+    (configuration) groups, attributes it lacks are taken from the other copies in that order.
+    When there was more than one, every declaring file is kept in `declared_in`, relative to `root`.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for node in nodes:
@@ -53,10 +54,13 @@ def collapse_drupal_duplicates(nodes: list[dict[str, Any]], root: Path | None = 
         # path order.
         group.sort(key=lambda n: (n.get("_rank", _NO_RANK), str(n.get("source_file", ""))))
         survivor = group[0]
-        for other in group[1:]:
-            for key, value in other.items():
-                if key not in survivor and key != "_rank":
-                    survivor[key] = value
+        # Gap-fill applies only to ranked (configuration) groups.
+        is_ranked = any("_rank" in n for n in group)
+        if is_ranked:
+            for other in group[1:]:
+                for key, value in other.items():
+                    if key not in survivor and key != "_rank":
+                        survivor[key] = value
         survivor["declared_in"] = sorted(
             {_relative(str(n.get("source_file", "")), root) for n in group}
         )

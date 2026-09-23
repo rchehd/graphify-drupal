@@ -125,3 +125,15 @@ def test_rank_is_removed_from_single_nodes_too():
     nodes = [_node("drupal_config_a", "config/sync/a.yml", _rank=0)]
     collapse_drupal_duplicates(nodes)
     assert "_rank" not in nodes[0]
+
+
+def test_unranked_duplicates_dont_get_gap_filled():
+    nodes = [
+        _node("drupal_service_x", "web/core/core.services.yml", class_name="Core"),
+        _node("drupal_service_x", "web/modules/b/b.services.yml", class_name="B", deprecated=True),
+    ]
+    collapse_drupal_duplicates(nodes)
+    [kept] = nodes
+    assert kept["source_file"] == "web/core/core.services.yml"
+    assert kept["class_name"] == "Core"
+    assert "deprecated" not in kept
