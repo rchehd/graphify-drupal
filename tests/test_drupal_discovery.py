@@ -512,3 +512,51 @@ class Swapped extends \Drupal\Core\Plugin\DefaultPluginManager {}
     ]
     # FooManager is already a type; the swap does not make it unresolved too.
     assert list(r.types) == ["foo"]
+
+
+def test_the_ignore_predicate_sees_only_directories_and_collected_files(tmp_path):
+    """The registry asks `is_ignored` about directories before descending and
+    about the files it would collect -- never about every walked file, which
+    cost ~3 s per run on the reference corpus."""
+    _site(tmp_path, _module("foo", FOO_SERVICES, {
+        "src/FooManager.php": D11_MANAGER,
+        "src/FooServiceProvider.php": "<?php\nnamespace Drupal\\foo;\nclass FooServiceProvider {}\n",
+        "src/Plugin/Foo/Bar.php": "<?php\n",
+        "foo.module": "<?php\n",
+        "foo.links.menu.yml": "{}\n",
+        "README.md": "x\n",
+        "templates/foo.html.twig": "x\n",
+    }))
+    asked: list[str] = []
+
+    def is_ignored(path: Path) -> bool:
+        asked.append(path.relative_to(tmp_path).as_posix())
+        return False
+
+    r = build_registry(tmp_path, is_ignored)
+    assert "foo" in r.types
+    d = "web/modules/custom/foo"
+    files = {a for a in asked if (tmp_path / a).is_file()}
+    assert {f"{d}/foo.info.yml", f"{d}/foo.services.yml", f"{d}/foo.links.menu.yml",
+            f"{d}/src/FooManager.php", f"{d}/src/FooServiceProvider.php"} <= files
+    assert not files & {f"{d}/src/Plugin/Foo/Bar.php", f"{d}/foo.module", f"{d}/README.md",
+                        f"{d}/templates/foo.html.twig", "web/core/lib/Drupal.php"}
+    assert f"{d}/templates" in asked
+
+
+def test_the_services_fast_path_parses_exactly_what_the_p1_loader_does(tmp_path):
+    from graphify.drupal.discovery import _load_services_yaml
+    from graphify.drupal.yaml_common import load_drupal_yaml
+
+    cases = {
+        "tagged.services.yml": "services:\n  a:\n    arguments: [!tagged_iterator foo]\n"
+                               "  b: { class: Drupal\\foo\\B }\n",
+        "broken.services.yml": "services:\n  a: [unclosed\n",
+        "list.services.yml": "- a\n- b\n",
+        "empty.services.yml": "",
+    }
+    for name, text in cases.items():
+        path = tmp_path / name
+        path.write_text(text, encoding="utf-8")
+        assert _load_services_yaml(path) == load_drupal_yaml(path), name
+    assert _load_services_yaml(tmp_path / "missing.services.yml")[1]

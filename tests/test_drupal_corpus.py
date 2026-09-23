@@ -390,7 +390,7 @@ def test_p1b_every_config_store_file_yields_at_least_one_node(site_extraction):
 
 # -- P2a: plugin discovery (spec 2026-09-23-drupal-p2a-plugin-discovery §6) ----
 #
-# The registry is built the way `detect()` builds it (`prepare_run`), into a
+# The registry is built the way a default `detect()` builds it (`prepare_run`), into a
 # temporary out dir so the corpus gains no graphify-out/. Everything
 # `prepare_run` sets for the process (the in-memory registry, the env var a
 # worker reads, the env-file cache) is restored before the fixture returns, so
@@ -459,10 +459,10 @@ def p2a(family_files, tmp_path_factory):
 
     out = tmp_path_factory.mktemp("p2a-out")
     with _restored_discovery_state():
-        # The corpus's own .gitignore excludes /web/core and /web/modules/contrib
-        # (composer-managed), so a default run learns almost nothing; the spec's
-        # measurements are of the whole tree, i.e. `--no-gitignore`.
-        registry = prepare_run(CORPUS, cache_root=out, gitignore=False)
+        # The default run. The corpus's .gitignore excludes /web/core and
+        # /web/modules/contrib (composer-managed); the registry does not honour
+        # .gitignore, so it still learns every type they define.
+        registry = prepare_run(CORPUS, cache_root=out)
         assert registry is not None
         learned = sorted(Path(p) for p in registry.root_yaml if learned_family(Path(p)))
         managers = sorted(Path(p) for p in registry.by_class_file())
@@ -603,30 +603,17 @@ def test_p2a_criterion_5_no_plugin_carries_a_value(p2a):
     assert {n["id"]: sorted(set(n) - allowed) for n in plugins if set(n) - allowed} == {}
 
 
-def test_p2a_the_default_scope_follows_the_corpus_gitignore(tmp_path):
-    """Controller ruling 4: the registry walks what `detect()` scans. The
-    corpus's .gitignore lists /web/core and /web/modules/contrib, so a run
-    that honours it learns only the two custom managers' types, and no P1
-    family has a type to point `plugin_of_type` at. `--no-gitignore` is how
-    such a site is measured (the fixture above)."""
+def test_p2a_criterion_8_registry_build_is_under_five_seconds(tmp_path):
+    """What `detect()` pays: `prepare_run`, the build plus core's ignore
+    predicate on directories and collected files."""
+    import time
+
     import graphify  # noqa: F401
     from graphify.drupal.discovery import prepare_run
 
     with _restored_discovery_state():
+        started = time.perf_counter()
         registry = prepare_run(CORPUS, cache_root=tmp_path)
-    assert registry is not None
-    assert sorted(registry.types) == ["system_type", "webform_integration_type"]
-    assert {t.owner for t in registry.types.values()} == {
-        "webform_integrations", "webform_integrations_database"}
-    assert registry.by_yaml_name() == {}
-
-
-def test_p2a_criterion_8_registry_build_is_under_five_seconds():
-    import time
-
-    import graphify  # noqa: F401
-    from graphify.drupal.discovery import build_registry
-
-    started = time.perf_counter()
-    build_registry(CORPUS)
-    assert time.perf_counter() - started < 5.0
+        elapsed = time.perf_counter() - started
+    assert registry is not None and len(registry.types) == 143
+    assert elapsed < 5.0

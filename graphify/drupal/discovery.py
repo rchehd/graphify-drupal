@@ -193,19 +193,26 @@ class _Walk:
 def _walk(base: Path, core_dir: Path | None,
           is_ignored: Callable[[Path], bool] | None = None) -> _Walk:
     """One pass over `base`. A directory `is_ignored` rejects is never descended,
-    and a file it rejects is never read -- the same scope `detect()` has."""
+    and a file it rejects is never read.
+
+    `is_ignored` is asked only about directories and the files the registry
+    collects, never about every walked file: on the reference corpus a
+    per-file check cost about 3 s a run."""
     found = _Walk()
     if core_dir is not None:
         found.extensions["core"] = core_dir.as_posix()
+
+    def kept(path: Path) -> bool:
+        return is_ignored is None or not is_ignored(path)
+
     for dirpath, dirnames, filenames in os.walk(base):
         directory = Path(dirpath)
         dirnames[:] = sorted(
             d for d in dirnames
-            if d not in _PRUNED_DIRS and not d.startswith(".")
-            and not (is_ignored is not None and is_ignored(directory / d))
+            if d not in _PRUNED_DIRS and not d.startswith(".") and kept(directory / d)
         )
-        names = sorted(n for n in filenames if is_ignored is None or not is_ignored(directory / n))
-        info = [n for n in names if is_drupal_info_yaml(Path(n))]
+        names = sorted(filenames)
+        info = [n for n in names if is_drupal_info_yaml(Path(n)) and kept(directory / n)]
         exts = [extension_machine_name(Path(n)) for n in info]
         for ext in exts:
             found.extensions.setdefault(ext, directory.as_posix())
@@ -214,14 +221,18 @@ def _walk(base: Path, core_dir: Path | None,
         for name in names:
             path = directory / name
             if name.endswith(_SERVICES_SUFFIX):
-                found.services.append(path)
-            if name.endswith("Manager.php") and in_src:
-                found.managers.append(path)
-            if name.endswith("ServiceProvider.php"):
-                found.providers.append(path)
+                if kept(path):
+                    found.services.append(path)
+            elif name.endswith("ServiceProvider.php"):
+                if kept(path):
+                    found.providers.append(path)
+            elif name.endswith("Manager.php") and in_src:
+                if kept(path):
+                    found.managers.append(path)
             if name.startswith(".") or not name.endswith(".yml") or name in info:
                 continue
-            if any(name.startswith(f"{ext}.") for ext in exts) or (is_core_dir and name.startswith("core.")):
+            if (any(name.startswith(f"{ext}.") for ext in exts)
+                    or (is_core_dir and name.startswith("core."))) and kept(path):
                 found.root_yaml.append(path.as_posix())
     return found
 
@@ -456,10 +467,47 @@ def _service_class(sid: str, services: dict, depth: int = 0) -> str:
     return ""
 
 
+def _fast_loader() -> type | None:
+    """`DrupalYamlLoader`'s tag tolerance on libyaml's C loader, when present."""
+    import yaml
+
+    from graphify.drupal.yaml_common import _any_tag
+
+    base = getattr(yaml, "CSafeLoader", None)
+    if base is None:
+        return None
+    loader = type("_FastDrupalYamlLoader", (base,), {})
+    yaml.add_multi_constructor("!", _any_tag, Loader=loader)
+    return loader
+
+
+_FAST_LOADER = _fast_loader()
+_MAX_SERVICES_BYTES = 2 * 1024 * 1024
+
+
+def _load_services_yaml(path: Path) -> tuple[dict | None, str | None]:
+    """`load_drupal_yaml`, ten times faster on the ~250 services files a site
+    has (about 0.6 s of the registry build on the reference corpus). Anything
+    the C loader does not parse cleanly goes through `load_drupal_yaml`, so
+    errors and edge cases are exactly P1's."""
+    import yaml
+
+    if _FAST_LOADER is None:
+        return load_drupal_yaml(path)
+    try:
+        if path.stat().st_size > _MAX_SERVICES_BYTES:
+            return load_drupal_yaml(path)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        data = yaml.load(text, Loader=_FAST_LOADER)
+    except (OSError, yaml.YAMLError):
+        return load_drupal_yaml(path)
+    return (data, None) if isinstance(data, dict) else (None, None)
+
+
 def _read_services(builder: _Builder, path: Path) -> set[str]:
     """Register the manager services one file declares; return every class it reached."""
     reached: set[str] = set()
-    data, error = load_drupal_yaml(path)
+    data, error = _load_services_yaml(path)
     if error:
         builder.parse_error(path)
         return reached
@@ -526,8 +574,9 @@ def _read_provider(builder: _Builder, path: Path) -> list[str]:
 def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = None) -> Registry:
     """Learn every plugin type the site's managers define. Never raises on bad input.
 
-    `is_ignored` (core's `detect.ignored_predicate` in the pipeline) keeps the
-    walk to what `detect()` scans; without it every file under the web root counts.
+    `is_ignored` (core's `detect.ignored_predicate` without `.gitignore` in the
+    pipeline) keeps the walk out of what the user excluded; without it every
+    file under the web root counts.
     """
     scan_root = Path(scan_root).absolute()
     web_root = find_web_root(scan_root)
@@ -818,9 +867,10 @@ def prepare_run(
     file is written, `ENV_VAR` is left untouched, and the run proceeds exactly
     as `build_registry` intends — never raising on bad input.
 
-    `extra_excludes` and `gitignore` are `detect()`'s own: the walk honours
-    the same `.graphifyignore`/`.gitignore`/`--exclude` rules and noise-dir
-    pruning, so an ignored module defines no type and is never descended.
+    `extra_excludes` is `detect()`'s own: the walk honours the same
+    `.graphifyignore`/`--exclude` rules and noise-dir pruning, so an ignored
+    module defines no type and is never descended. `.gitignore` is not
+    honoured, whatever `gitignore` says (see the comment below).
 
     The files the change from the previous registry affects (`affected_files`),
     plus any set a previous run left unconsumed, become this run's
@@ -845,7 +895,15 @@ def prepare_run(
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         previous = None
 
-    registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore))
+    # `gitignore` is accepted for `detect()`'s signature but deliberately not
+    # passed on: the registry is knowledge about the site, not graph content.
+    # A composer-managed site gitignores web/core and web/modules/contrib,
+    # which define almost every plugin type, so honouring .gitignore here would
+    # learn next to nothing. Explicit intent (.graphifyignore, --exclude) and
+    # core's noise-dir pruning still apply; the graph itself still honours
+    # .gitignore, and edges to a type defined in an ignored tree point at a
+    # materialised (missing) type node.
+    registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore=False))
     forced = frozenset(affected_files(previous, registry) | carried)
 
     try:

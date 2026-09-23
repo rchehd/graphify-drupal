@@ -149,6 +149,38 @@ def test_a_graphifyignored_module_is_never_walked_and_defines_no_type(
     assert not any("ignored_foo" in Path(v).parts for v in visited)
 
 
+CORE_BLOCK_MANAGER = r"""<?php
+namespace Drupal\Core\Block;
+use Drupal\Core\Plugin\DefaultPluginManager;
+class BlockManager extends DefaultPluginManager {}
+"""
+
+
+def test_a_gitignored_core_still_defines_its_types(tmp_path, _isolated_discovery_state):
+    """A composer-managed site gitignores web/core and contrib, which define
+    almost every plugin type. The registry is knowledge about the site, not
+    graph content: it does not honour .gitignore (the graph still does)."""
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.discovery import current_registry
+
+    root = _drupal_site(tmp_path)
+    (root / "web/core/core.services.yml").write_text(
+        "services:\n  plugin.manager.block:\n    class: Drupal\\Core\\Block\\BlockManager\n",
+        encoding="utf-8")
+    block = root / "web/core/lib/Drupal/Core/Block/BlockManager.php"
+    block.parent.mkdir(parents=True)
+    block.write_text(CORE_BLOCK_MANAGER, encoding="utf-8")
+    (root / ".gitignore").write_text("/web/core\n/web/modules/custom\n", encoding="utf-8")
+
+    result = detect.detect(root)
+
+    assert {"block", "foo"} <= set(current_registry().types)
+    # The graph's own scope is unchanged: detect still leaves the ignored trees out.
+    scanned = [f for files in result["files"].values() for f in files]
+    assert not any("/web/core/" in f or "/modules/custom/" in f for f in scanned)
+
+
 def test_an_excluded_module_is_left_out_of_the_registry(tmp_path, _isolated_discovery_state):
     install()
     import graphify.detect as detect
