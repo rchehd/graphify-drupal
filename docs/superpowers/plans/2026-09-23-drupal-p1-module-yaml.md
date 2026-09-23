@@ -36,7 +36,7 @@ Reference corpus for every measured criterion: `/home/user/Projects/FormsRemote`
 - Consumes: `resolve_realm` from `graphify/drupal/paths.py`.
 - Produces:
   - `load_drupal_yaml(path: Path) -> tuple[dict | None, str | None]` — `(data, error)`; exactly one is not `None`
-  - `key_lines(text: str) -> dict[str, int]` — top-level and one-level-indented keys to 1-based line numbers
+  - `key_lines(text: str) -> dict[int, dict[str, int]]` — keys grouped by indent (0 and 2) to 1-based line numbers
   - `node(nid, label, *, type, layer, path, line=1, **extra) -> dict`
   - `edge(source, target, relation, *, path, line=1, confidence="EXTRACTED", **extra) -> dict`
   - `service_id`, `route_id`, `permission_id`, `library_id`, `tag_id`, `parameter_id`, `menu_id`, `link_id`, `breakpoint_id`
