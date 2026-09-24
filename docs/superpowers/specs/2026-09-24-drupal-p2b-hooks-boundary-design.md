@@ -126,7 +126,7 @@ scanned file declares. It now also sets `boundary: true`, `realm` from
 
 | stub | facts |
 |---|---|
-| `drupal_extension` | `extension_type` (module/theme/profile), `path` (relative to the scan root when inside it, else absolute), `realm` |
+| `drupal_extension` | `extension_type` (module/theme/profile), `extension_path` (relative to the scan root when inside it, else absolute; not `path`, which core folds into `source_file` as a legacy alias), `realm` |
 | `drupal_service` | `class_name`, `provider` (from every `*.services.yml` the registry reads) |
 | `drupal_plugin_type` | every §4.1 attribute of P2a |
 | `drupal_hook` | `provider`, `declared_file`, `line`, `pattern` |
@@ -254,3 +254,7 @@ Corpus tests (FormsRemote):
   pins it.
 - **`_is_noise_dir` wrapping** changes `watch`'s ignore view too: boundary
   events are ignored there, which is the intended behaviour.
+- **Boundary facts go stale on a registry-only change**: a stub is carried by
+  graph.json and re-materialised only when a file referencing it is
+  re-extracted, so a boundary change alone (a composer update) leaves its old
+  facts in place until then.

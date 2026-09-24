@@ -88,7 +88,7 @@ def _expected(root: Path) -> dict[str, dict]:
     return {
         extension_id("token"): {
             "type": "drupal_extension", "boundary": True, "extension_type": "module",
-            "path": "web/modules/contrib/token", "realm": "contrib"},
+            "extension_path": "web/modules/contrib/token", "realm": "contrib"},
         service_id("entity_type.manager"): {
             "type": "drupal_service", "boundary": True,
             "class_name": "Drupal\\Core\\Entity\\EntityTypeManager", "provider": "core",
@@ -134,6 +134,36 @@ def test_boundary_stubs_carry_the_registry_facts(tmp_path, _isolated_discovery_s
     assert typed["target_name"] == "menu.link"
 
 
+@pytest.mark.parametrize("kind, node_type, family", [
+    ("local_task", "drupal_local_task", "links.task"),
+    ("local_action", "drupal_local_action", "links.action"),
+    ("contextual_link", "drupal_contextual_link", "links.contextual"),
+])
+def test_every_link_family_stub_gets_its_learned_type(
+        kind, node_type, family, _isolated_discovery_state):
+    from graphify.drupal.discovery import PluginType, Registry, set_current
+    from graphify.drupal.resolvers import resolve_missing_targets
+
+    name = f"{kind}.type"
+    set_current(Registry(web_root=None, types={name: PluginType(
+        plugin_type=name, manager_class="Drupal\\X", class_file="/x/X.php", line=1,
+        owner="core", registered=False, discovery="yaml", yaml_name=family)}))
+    child, parent = link_id(kind, "foo.child"), link_id(kind, "core.parent")
+    nodes = [{"id": child, "label": "Child", "type": node_type}]
+    parent_edge = {"source": child, "target": parent, "relation": "parent_link",
+                   "target_name": "core.parent", "source_file": "x/foo.yml"}
+    # Two children of one parent: still one typing edge.
+    edges = [parent_edge, {**parent_edge, "source": "other"}]
+    resolve_missing_targets([], nodes, edges)
+
+    stubs = _by_id(nodes)
+    assert stubs[parent]["type"] == node_type and stubs[parent]["boundary"] is True
+    typed = [e for e in edges if e["relation"] == "plugin_of_type"]
+    assert [(e["source"], e["target"], e["target_name"]) for e in typed] == [
+        (parent, type_id(name), name)]
+    assert stubs[type_id(name)]["boundary"] is True
+
+
 def test_without_a_registry_a_stub_is_still_the_boundary(tmp_path, _isolated_discovery_state):
     from graphify.drupal.resolvers import resolve_missing_targets
 
@@ -144,11 +174,11 @@ def test_without_a_registry_a_stub_is_still_the_boundary(tmp_path, _isolated_dis
     resolve_missing_targets([], nodes, edges)
     [stub] = nodes
     assert (stub["boundary"], stub["realm"], stub["label"]) == (True, "unknown", "token")
-    assert "extension_type" not in stub and "path" not in stub
+    assert "extension_type" not in stub and "extension_path" not in stub
 
 
 def test_a_path_outside_the_scan_root_stays_absolute(tmp_path, _isolated_discovery_state):
-    """`path` is relative to the scan root only when inside it (spec §4.3)."""
+    """`extension_path` is relative to the scan root only when inside it (spec §4.3)."""
     install()
     from graphify.extract import extract
 
@@ -157,7 +187,7 @@ def test_a_path_outside_the_scan_root_stays_absolute(tmp_path, _isolated_discove
     # Scanning the custom module alone: contrib and core sit outside the root.
     result = extract(_custom_files(root), root=root / FOO)
     nodes = _by_id(result["nodes"])
-    assert nodes[extension_id("token")]["path"] == (root / "web/modules/contrib/token").as_posix()
+    assert nodes[extension_id("token")]["extension_path"] == (root / "web/modules/contrib/token").as_posix()
     assert nodes[hook_id("cron")]["declared_file"] == (root / "web/core/core.api.php").as_posix()
 
 
@@ -216,11 +246,13 @@ def test_boundary_facts_survive_incremental_reruns(tmp_path):
 
 def _shadowed_site(root: Path) -> Path:
     """`foo.settings` in the sync store and shipped by foo's `config/install`:
-    P1b's collapse gives the node to the sync copy, so the shipped file owns none."""
+    P1b's collapse gives the node to the sync copy, so the shipped file owns none.
+    (The dependency keeps an edge in the graph whichever copy is left: core's
+    clustering fails on an edgeless graph.)"""
     return _site(root, {
         "config/sync/core.extension.yml": "module:\n  foo: 0\ntheme: {}\n",
         "config/sync/foo.settings.yml": "enabled: true\n",
-        f"{FOO}/foo.info.yml": "name: Foo\ntype: module\n",
+        f"{FOO}/foo.info.yml": "name: Foo\ntype: module\ndependencies:\n  - token\n",
         f"{FOO}/config/install/foo.settings.yml": "enabled: false\n",
     })
 
@@ -235,6 +267,18 @@ def test_an_unchanged_rerun_does_not_re_extract_a_shadowed_copy(tmp_path):
     second, rerun = _cli(root, out)
     assert rerun == 0
     assert {n["id"] for n in second["nodes"]} == {n["id"] for n in first["nodes"]}
+
+
+def test_deleting_the_winning_copy_re_extracts_the_shadowed_one(tmp_path):
+    """The old graph's `declared_in` names the install copy, but its only
+    other declaring file is gone: core's heal must re-queue the copy."""
+    root = _shadowed_site(tmp_path / "site")
+    out = tmp_path / "out"
+    _cli(root, out)
+    (root / "config/sync/foo.settings.yml").unlink()
+    second, _ = _cli(root, out)
+    [settings] = [n for n in second["nodes"] if n.get("config_name") == "foo.settings"]
+    assert settings["source_file"] == f"{FOO}/config/install/foo.settings.yml"
 
 
 # -- the cli wrapper ---------------------------------------------------------------
@@ -262,6 +306,11 @@ def test_the_wrapper_drops_only_declared_in_paths(tmp_path):
     graph = _graph(tmp_path / "out/graph.json", [
         {"id": "n", "declared_in": ["a/config/install/x.yml", "config/sync/x.yml"]}])
     heal = _fake_cli([shadowed, other])
+    # The winning copy is gone: the shadowed one is left to core's heal.
+    assert heal(graph, root, [shadowed, other]) == [shadowed, other]
+    winner = root / "config/sync/x.yml"
+    winner.parent.mkdir(parents=True)
+    winner.write_text("a: 1\n", encoding="utf-8")
     assert heal(graph, root, [shadowed, other]) == [other]
 
 

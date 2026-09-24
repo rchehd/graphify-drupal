@@ -645,21 +645,22 @@ def _patch_watch(watch: ModuleType) -> None:
     _wrap(watch, "_has_non_code", _non_code)
 
 
-def _declared_in_paths(graph_path: Path, root: Path) -> set[str]:
-    """Every `declared_in` entry in `graph_path`, as a root-relative POSIX path
-    (P1b stores them so; an absolute one, from a root-less extract, is made
-    relative when inside `root`). Raises on an unreadable or malformed file."""
+def _co_declarers(graph_path: Path, root: Path) -> dict[str, set[str]]:
+    """Each path in some node's `declared_in` in `graph_path` -> the other paths
+    in those same lists, all as root-relative POSIX paths (P1b stores them so;
+    an absolute one, from a root-less extract, is made relative when inside
+    `root`). Raises on an unreadable or malformed file."""
     import json
 
     data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
-    found: set[str] = set()
+    found: dict[str, set[str]] = {}
     for node in data.get("nodes", []):
         declared = node.get("declared_in") if isinstance(node, dict) else None
         if not isinstance(declared, list):
             continue
-        for entry in declared:
-            if isinstance(entry, str) and entry:
-                found.add(_root_relative(entry, root))
+        paths = {_root_relative(e, root) for e in declared if isinstance(e, str) and e}
+        for path in paths:
+            found.setdefault(path, set()).update(paths - {path})
     return found
 
 
@@ -684,7 +685,8 @@ def _patch_cli(cli: ModuleType) -> None:
     owns no node in graph.json. A configuration copy P1b's collapse gave to
     another copy (a module's `config/install` default shadowed by `config/sync`)
     owns none by design, yet its path is in the survivor's `declared_in`: it
-    was extracted, so the stamp is honest. `watch` never calls the heal.
+    was extracted, so the stamp is honest -- as long as another copy in that
+    list still exists. `watch` never calls the heal.
     """
     if not callable(getattr(cli, "_zero_node_stamped_code_sources", None)):
         raise DrupalSeamError(
@@ -700,10 +702,18 @@ def _patch_cli(cli: ModuleType) -> None:
                 return healed
             try:
                 root = Path(scan_root).resolve()
-                declared = _declared_in_paths(graph_path, root)
+                co_declarers = _co_declarers(graph_path, root)
             except Exception:
                 return healed
-            return [f for f in healed if _root_relative(str(f), root) not in declared]
+
+            def shadowed(f) -> bool:
+                # Only while another declaring copy is still on disk: when the
+                # winner was deleted, core prunes its node and this copy must
+                # be re-extracted to take it over -- core's heal does that.
+                others = co_declarers.get(_root_relative(str(f), root), ())
+                return any((root / other).exists() for other in others)
+
+            return [f for f in healed if not shadowed(f)]
         return _zero_node_stamped_code_sources
 
     _wrap(cli, "_zero_node_stamped_code_sources", _heal)

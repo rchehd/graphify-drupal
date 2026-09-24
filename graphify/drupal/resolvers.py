@@ -294,7 +294,7 @@ class _BoundaryIndex:
             if info is not None:
                 facts["extension_type"] = info[0]
             directory = r.extensions[found]
-            facts["path"] = _portable(directory)
+            facts["extension_path"] = _portable(directory)
             facts["realm"] = realm_of(Path(directory))
         elif kind == "drupal_service":
             class_name, provider = r.services[found]
@@ -439,6 +439,9 @@ def resolve_missing_targets(
             # that is mostly a type the registry knows but whose manager lives
             # in gitignored core/contrib, which the graph leaves out.
             created[target]["missing"] = True
+        # Load-bearing placement: past the `target in created` guard above, so
+        # this runs once, when the stub is made -- one edge per stub, however
+        # many links name it as their parent.
         if relation == "parent_link":
             typed = _link_type_edge(created[target], edge)
             if typed is not None:
