@@ -19,7 +19,7 @@ from typing import Any
 
 import yaml
 
-from graphify.drupal.paths import resolve_realm
+from graphify.drupal.boundary import realm_of
 from graphify.ids import make_id
 
 #: A Drupal YAML file is configuration, not data. Anything past this is not one,
@@ -110,7 +110,7 @@ def node(
         "file_type": "code",
         "type": type,
         "layer": layer,
-        "realm": resolve_realm(path),
+        "realm": realm_of(path),
         "_origin": "static_yaml",
         "source_file": str(path),
         "source_location": f"L{line}",

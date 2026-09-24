@@ -174,6 +174,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
 
 def _patch_extract(extract: ModuleType) -> None:
+    from graphify.drupal.boundary import clear_caches as clear_boundary_caches
     from graphify.drupal.config_stores import clear_caches
     from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
@@ -252,6 +253,7 @@ def _patch_extract(extract: ModuleType) -> None:
         # so they read the module attribute at call time and get this wrapper.
         def extract_(paths, cache_root=None, **kwargs):
             clear_caches()
+            clear_boundary_caches()
             context = kwargs.get("resolution_context_nodes")
             if context:
                 # An incremental run. Pull in the unchanged files a changed
