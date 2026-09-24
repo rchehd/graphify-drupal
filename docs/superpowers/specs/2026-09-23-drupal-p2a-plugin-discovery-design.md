@@ -391,3 +391,32 @@ Differences from §2, and why:
   `declared_in` of 2) and so carry two identical `plugin_of_type` edges; the
   reader folds parallel edges of one relation, so the graph has one.
 
+
+## 9. Real CLI run after closing, and what moves to P2b
+
+`graphify extract /home/user/Projects/FormsRemote --code-only --out <scratch>`,
+run twice on 2026-09-24. Nothing was written into the project.
+
+- Full run: 6.7 s, 4,563 nodes, 9,968 edges. An unchanged rerun gives an
+  identical graph.
+- The CLI honours the site's `.gitignore`, which excludes `web/core` and
+  `web/modules/contrib`, so only custom code is in the graph. The registry
+  still knows all 143 types and the inventory lists 0 unrecognised families.
+- The graph has 6 `drupal_plugin_type` nodes: 2 real custom managers and 4
+  materialised stubs for core types. It has 0 YAML plugins, because custom
+  modules ship no learned-family file.
+- 82 of 85 P1 link nodes have `plugin_of_type`. The other 3 are stubs of core
+  menu links, materialised only as a custom link's `parent`.
+
+Carried into the P2b plan as a bug-fix block:
+
+1. **Unchanged reruns re-extract about 50 files.** These are the custom
+   modules' `config/install` and `config/optional` copies. P1b's collapse
+   gives their nodes to the `config/sync` copy, so each such file owns no node
+   and core re-queues it on every run (the same class as the config_split
+   patch files fixed in P1b Task 11). The data is correct; only time is lost.
+2. **Menu-link stubs.** Stubs materialised from `parent` references carry no
+   `plugin_of_type`. Decide whether to type them.
+
+From P2b on, every phase closes with this real CLI run: a full run and an
+unchanged incremental run on the reference project.
