@@ -17,6 +17,19 @@ functions in an extension's procedural files (`is_procedural_file`), which
 the seam makes PHP for detection and extraction (spec §5.2). Only a literal,
 declared hook name becomes an implementation; everything else that looks
 like one is a `hook_candidates` inventory entry (vocabulary §5.6).
+
+Three readings of spec §5.2-§5.4, settled for P2b:
+- a procedural `<ext>_<rest>()` naming no declared hook is an `undeclared`
+  candidate only when it claims to be a hook -- its docblock reads
+  `Implements hook_…`, or it sits in a group file `<ext>.<group>.inc` and
+  `<rest>` starts with `<group>_`; any other `<ext>_*` is a helper and
+  yields nothing (`_claims_a_hook`);
+- `.inc` was already core's (a Pascal include): only `<ext>.<group>.inc`
+  beside `<ext>.info.yml` becomes PHP; any other `.inc` keeps core's own
+  classification and handler (`register.py`'s `classify_file`);
+- the id `drupal:hook_impl:<module>:<hook>` is one node however many
+  functions or methods implement that hook for that module: the first names
+  it, and each implementation gets its own `hook_implemented_by` edge.
 """
 from __future__ import annotations
 

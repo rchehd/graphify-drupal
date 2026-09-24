@@ -136,6 +136,10 @@ def _patch_detect(detect: ModuleType) -> None:
         # `current_registry()`, and `prepare_run` is what makes that possible.
         def detect_(root, *, follow_symlinks=None, google_workspace=None,
                     extra_excludes=None, cache_root=None, gitignore=True):
+            if cache_root is None:
+                # Called by core's `detect_incremental`, which passes none: the
+                # location its manifest implies, as a full `--out` run gets it.
+                cache_root = incremental_cache_root[-1] if incremental_cache_root else None
             from graphify.drupal.boundary import clear_caches as clear_boundary_caches
             from graphify.drupal.discovery import out_dir, prepare_run
             from graphify.drupal.inventory import (
@@ -191,6 +195,24 @@ def _patch_detect(detect: ModuleType) -> None:
         detect_.__doc__ = original.__doc__
         return detect_
 
+    # The `cache_root` core's nested `detect()` should have had, for the
+    # duration of a wrapped `detect_incremental` (a stack: re-entrant).
+    incremental_cache_root: list[Path | None] = []
+
+    def _cache_root_for(out: Path) -> Path | None:
+        """The `cache_root` whose `<cache_root>/<GRAPHIFY_OUT>` is `out` --
+        what a full `extract --out` run passes to `detect()`, so its word-count
+        cache (`cache/stat-index.json`) and office sidecars land in the out dir
+        rather than in the scanned tree. None when `GRAPHIFY_OUT` is absolute
+        (core already ignores `cache_root` for it) or `out` does not end in it."""
+        graphify_out = Path(core_paths.GRAPHIFY_OUT)
+        if graphify_out.is_absolute():
+            return None
+        parts = graphify_out.parts
+        if not parts or out.parts[-len(parts):] != parts:
+            return None
+        return Path(*out.parts[:-len(parts)])
+
     def _incremental(original):
         # Core's detect_incremental calls detect() without a cache_root, so on
         # `extract --out` the nested prepare_run would look for the previous
@@ -205,8 +227,13 @@ def _patch_detect(detect: ModuleType) -> None:
             default = getattr(detect, "_MANIFEST_PATH", None)
             if manifest is None or str(manifest) == str(default):
                 return original(root, *args, **kwargs)
-            with using_out_dir(Path(manifest).resolve().parent):
-                return original(root, *args, **kwargs)
+            out = Path(manifest).resolve().parent
+            incremental_cache_root.append(_cache_root_for(out))
+            try:
+                with using_out_dir(out):
+                    return original(root, *args, **kwargs)
+            finally:
+                incremental_cache_root.pop()
         detect_incremental_.__name__ = detect_incremental_.__qualname__ = "detect_incremental"
         detect_incremental_.__doc__ = original.__doc__
         return detect_incremental_
@@ -453,6 +480,7 @@ def _register_resolvers() -> None:
     nothing: `resolver_registry.register` exists for exactly this.
     """
     from graphify import resolver_registry
+    from graphify.drupal.hooks import PROCEDURAL_SUFFIXES
     from graphify.drupal.resolvers import resolve_missing_targets
 
     if any(r.name == "drupal" for r in resolver_registry.registered_resolvers()):
@@ -461,8 +489,10 @@ def _register_resolvers() -> None:
         resolver_registry.LanguageResolver(
             name="drupal",
             # ".php" so a manager-only incremental run (its `defines_plugin_type`
-            # / `plugin_manager_for` edges, no .yml in the batch) still resolves.
-            suffixes=frozenset({".yml", ".php"}),
+            # / `plugin_manager_for` edges, no .yml in the batch) still resolves;
+            # the procedural suffixes for a batch of only `.module` files (its
+            # `implements_hook` edges, P2b §5.3).
+            suffixes=frozenset({".yml", ".php", *PROCEDURAL_SUFFIXES}),
             resolve=resolve_missing_targets,
         )
     )

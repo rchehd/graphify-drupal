@@ -2,6 +2,7 @@
 functions (P2b Task 4, spec §5.2-§5.5)."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -500,3 +501,55 @@ def test_corpus_custom_implementations_are_edges_or_candidates(tmp_path, _isolat
     # 12 attribute candidates (3 undeclared, 9 variable) + 64 procedural
     # variable ones (49 of them `update_N`), none under tests/.
     assert candidates == {"undeclared": 3, "variable": 73}
+
+
+# -- fix round 1 ---------------------------------------------------------------------
+
+
+def test_a_boundary_hook_target_becomes_a_missing_hook_stub(tmp_path, _isolated_discovery_state):
+    """`cron` is declared only in (boundary) core: the `implements_hook` edge
+    survives into the graph, pointing at a materialised `drupal_hook` stub."""
+    install()
+    from graphify.build import build_from_json
+    from graphify.extract import extract
+
+    root = _hooks_site(tmp_path)
+    prepare_run(root)
+    result = extract([root / FOO / "foo.module", root / FOO / "foo.info.yml"], root=root)
+
+    stub = _node(result, hook_id("cron"))
+    assert (stub["type"], stub["layer"], stub["label"], stub["missing"]) == (
+        "drupal_hook", "hook", "cron", True)
+    assert (extension_id("foo"), "implements_hook", hook_id("cron")) in _rel(result)
+    graph = build_from_json(result)
+    assert graph.has_edge(extension_id("foo"), hook_id("cron")) or graph.has_edge(
+        hook_id("cron"), extension_id("foo"))
+
+
+def _cli(root: Path, out: Path) -> None:
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "GRAPHIFY_DRUPAL_DISCOVERY"}
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "extract", str(root), "--code-only", "--out", str(out)],
+        capture_output=True, text=True, cwd=root, env=env,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_an_incremental_run_with_out_writes_nothing_into_the_site(tmp_path):
+    """Core's `detect_incremental` calls `detect()` without a `cache_root`, so
+    its word-count cache would land in `<site>/graphify-out/`; the seam hands
+    the `--out` location down, as a full run gets it."""
+    root = _hooks_site(tmp_path / "site")
+    out = tmp_path / "out"
+    _cli(root, out)
+    # A new procedural file: a word-count entry the index does not hold yet.
+    (root / FOO / "foo.install").write_text("<?php\nfunction foo_install() {}\n", encoding="utf-8")
+    _cli(root, out)
+
+    assert not (root / "graphify-out").exists()
+    graph = json.loads(next(out.rglob("graph.json")).read_text(encoding="utf-8"))
+    edges = graph.get("links") or graph.get("edges")
+    assert any(e.get("relation") == "implements_hook" for e in edges)

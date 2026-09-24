@@ -40,6 +40,10 @@ _RESOLVABLE: dict[str, tuple[str, str]] = {
     # The type is the child's: a menu link's parent is a menu link, a local
     # task's parent a local task. This entry is only the fallback.
     "parent_link": ("drupal_menu_link", "routing"),
+    # A hook only a boundary `*.api.php` declares (P2b §5.3): a missing stub,
+    # named by the edge's `target_name`; Task 6 adds the registry's facts.
+    "implements_hook": ("drupal_hook", "hook"),
+    "invokes_hook": ("drupal_hook", "hook"),
 }
 
 
@@ -270,6 +274,9 @@ def resolve_missing_targets(
             created[target]["config_name"] = edge.get("target_name") or target
         if relation == "installs_extension" and source == core_extension:
             # The site installs an extension the code base does not contain.
+            created[target]["missing"] = True
+        if node_type == "drupal_hook":
+            created[target]["hook_name"] = edge.get("target_name") or target
             created[target]["missing"] = True
         if node_type == "drupal_plugin_type":
             # A type no manager file in the graph defines. On a composer site
