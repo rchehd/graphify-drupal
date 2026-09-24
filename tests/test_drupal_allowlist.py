@@ -23,8 +23,17 @@ def _patterns() -> list[str]:
 
 
 def _changed_against_upstream() -> list[str]:
+    # From the merge base, not upstream's tip: commits upstream made after the
+    # fork are not this fork's changes. Against the working tree, so an
+    # uncommitted edit to core is still caught before it is committed.
+    base = subprocess.run(
+        ["git", "merge-base", "upstream/v8", "HEAD"],
+        capture_output=True, text=True,
+    )
+    if base.returncode != 0:
+        pytest.skip("upstream/v8 not available in this checkout")
     proc = subprocess.run(
-        ["git", "diff", "upstream/v8", "--name-only"],
+        ["git", "diff", base.stdout.strip(), "--name-only"],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
