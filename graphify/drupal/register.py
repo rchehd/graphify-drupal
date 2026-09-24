@@ -43,6 +43,7 @@ def _patch_detect(detect: ModuleType) -> None:
     from graphify.drupal.boundary import boundary_dir
     from graphify.drupal.discovery import current_registry, walking_registry
     from graphify.drupal.families import is_drupal_file
+    from graphify.drupal.hooks import PROCEDURAL_SUFFIXES
 
     # `ignored_predicate` is not wrapped but called by the registry walk
     # (discovery._scan_predicate); `GRAPHIFY_OUT` is what `out_dir` resolves.
@@ -61,10 +62,28 @@ def _patch_detect(detect: ModuleType) -> None:
             "changed shape; graphify/drupal/register.py must be updated"
         )
 
+    # Procedural PHP (P2b spec §5.2): the suffixes join core's own set, in
+    # place, so everything reading it -- `watch._CODE_EXTENSIONS` is this very
+    # object -- sees them. Classification stays gated below.
+    code_extensions = getattr(detect, "CODE_EXTENSIONS", None)
+    if not isinstance(code_extensions, set):
+        raise DrupalSeamError(
+            "graphify.detect.CODE_EXTENSIONS is missing or no longer a set — graphify core "
+            "changed shape; graphify/drupal/register.py must be updated"
+        )
+    new_to_core = frozenset(s for s in PROCEDURAL_SUFFIXES if s not in code_extensions)
+    code_extensions.update(PROCEDURAL_SUFFIXES)
+
     def _classify(original):
         def classify_file(path: Path):
             if is_drupal_file(path):
                 return detect.FileType.CODE
+            # A `.module` that is no extension's procedural file (a library's)
+            # stays what it was before the suffix joined CODE_EXTENSIONS:
+            # unclassified. `.inc` was core's already (a Pascal include), so a
+            # non-procedural one keeps core's own answer.
+            if path.suffix.lower() in new_to_core:
+                return None
             return original(path)
         return classify_file
 
@@ -202,10 +221,10 @@ def _patch_detect(detect: ModuleType) -> None:
 def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.boundary import clear_caches as clear_boundary_caches
     from graphify.drupal.config_stores import clear_caches
-    from graphify.drupal.discovery import clear_force_miss
+    from graphify.drupal.discovery import clear_force_miss, current_registry
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor, is_api_php
-    from graphify.drupal.hooks import extract_hook_declarations
+    from graphify.drupal.hooks import extract_hook_declarations, extract_hook_implementations
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
@@ -222,18 +241,35 @@ def _patch_extract(extract: ModuleType) -> None:
             "graphify.extract._DISPATCH is missing or no longer a dict — dispatch "
             "was restructured upstream; graphify/drupal/register.py must be updated"
         )
-    def _compose(base, extra):
-        """A handler that runs core's `base` first, then appends `extra(p)`'s
-        nodes and edges -- core's PHP nodes are kept either way, and a file
-        is never more than one of settings.php, a manager class file or an
-        `*.api.php` at once, so one helper serves every composition."""
-        def handler(p: Path, _base=base, _extra=extra):
+    # Procedural files (P2b spec §5.2) dispatch to core's PHP handler, through
+    # `families.drupal_extractor` -> `hooks.extract_php_with_hooks`.
+    if not callable(extract._DISPATCH.get(".php")):
+        raise DrupalSeamError(
+            "graphify.extract._DISPATCH has no '.php' handler — graphify core changed "
+            "shape; graphify/drupal/register.py must be updated"
+        )
+
+    def _compose(base, extras):
+        """A handler that runs core's `base` first, then appends each extra's
+        nodes and edges. An extra is called as `extra(p, core_result)` with
+        core's own result for `p`, so it can point at core's nodes; core's
+        PHP nodes are kept either way."""
+        def handler(p: Path, _base=base, _extras=tuple(extras)):
             result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
-            ours = _extra(p)
-            result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
-            result["edges"] = list(result.get("edges", [])) + ours["edges"]
+            core_result = dict(result)
+            for extra in _extras:
+                ours = extra(p, core_result)
+                result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
+                result["edges"] = list(result.get("edges", [])) + ours["edges"]
             return result
         return handler
+
+    def _path_only(extra):
+        return lambda p, _core_result: extra(p)
+
+    settings_extra = _path_only(extract_drupal_settings)
+    plugin_types_extra = _path_only(extract_plugin_types)
+    hook_declarations_extra = _path_only(extract_hook_declarations)
 
     def _dispatch(original):
         def _get_extractor(path: Path):
@@ -241,18 +277,23 @@ def _patch_extract(extract: ModuleType) -> None:
             if handler is not None:
                 return handler
             base = original(path)
+            extras = []
             if is_settings_php(path):
                 # Keep core's PHP nodes; add the `$config[…]` overrides.
-                return _compose(base, extract_drupal_settings)
+                extras.append(settings_extra)
             if path.suffix == ".php" and is_manager_class_file(path):
                 # Keep core's PHP nodes; add the type's node and edges (spec §5.4).
-                return _compose(base, extract_plugin_types)
+                extras.append(plugin_types_extra)
             if is_api_php(path):
                 # Keep core's PHP nodes; add the hook nodes and edges (spec §5.3).
                 # Only an in-graph file reaches this dispatch at all -- a
                 # boundary api.php never gets scanned (Task 2 prunes it).
-                return _compose(base, extract_hook_declarations)
-            return base
+                extras.append(hook_declarations_extra)
+            if path.suffix == ".php" and base is not None and current_registry() is not None:
+                # A `#[Hook]` outside `src/Hook` (spec §5.4); the extractor's
+                # own text check keeps this to one read of a hook-free file.
+                extras.append(extract_hook_implementations)
+            return _compose(base, extras) if extras else base
         return _get_extractor
 
     _wrap(extract, "_get_extractor", _dispatch)
@@ -536,6 +577,25 @@ def _patch_watch(watch: ModuleType) -> None:
                 f"graphify.watch.{attr} is missing — graphify core changed shape; "
                 "graphify/drupal/register.py must be updated"
             )
+    # Procedural PHP (P2b spec §5.2) reaches watch through `CODE_EXTENSIONS`,
+    # which `_patch_detect` extended in place: watch's alias must be that
+    # object, not a copy. Its watched set is a union built at import, so it
+    # gains the suffixes explicitly (a no-op when detect was patched first).
+    import graphify.detect as detect
+    from graphify.drupal.hooks import PROCEDURAL_SUFFIXES
+
+    if getattr(watch, "_CODE_EXTENSIONS", None) is not detect.CODE_EXTENSIONS:
+        raise DrupalSeamError(
+            "graphify.watch._CODE_EXTENSIONS is no longer graphify.detect.CODE_EXTENSIONS "
+            "— graphify core changed shape; graphify/drupal/register.py must be updated"
+        )
+    watched = getattr(watch, "_WATCHED_EXTENSIONS", None)
+    if not isinstance(watched, set):
+        raise DrupalSeamError(
+            "graphify.watch._WATCHED_EXTENSIONS is missing or no longer a set — graphify "
+            "core changed shape; graphify/drupal/register.py must be updated"
+        )
+    watched.update(PROCEDURAL_SUFFIXES)
 
     def _triggers(original):
         def _batch_triggers_rebuild(batch):

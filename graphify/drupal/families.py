@@ -68,10 +68,26 @@ def extension_owner(path: Path) -> str:
     return path.name[: -len(suffix)] if suffix else ""
 
 
+#: Suffixes of a procedural file (P2b §5.2) or a `src/Hook` class: no YAML
+#: family or configuration file ends in one, so the check below short-circuits.
+_HOOK_FILE_SUFFIXES = frozenset({".module", ".install", ".theme", ".profile", ".inc", ".php"})
+
+
 def drupal_extractor(path: Path) -> Callable[[Path], dict] | None:
     """Configuration first: a file inside a config store is configuration
     whatever its name ends in (P1b spec §3.2). Then P1's fixed family table.
-    Then a plugin type learned from the site's own plugin managers (P2a)."""
+    Then a plugin type learned from the site's own plugin managers (P2a).
+
+    An extension's procedural files (`<ext>.module`, `<ext>.views.inc`, ...)
+    and its `src/Hook/**/*.php` are PHP with hook implementations (P2b §5.2):
+    core's PHP handler composed with the hook extractor."""
+    if path.suffix in _HOOK_FILE_SUFFIXES:
+        from graphify.drupal.hooks import extract_php_with_hooks, is_hook_class_file, is_procedural_file
+
+        if is_procedural_file(path) or is_hook_class_file(path):
+            return extract_php_with_hooks
+        return None
+
     from graphify.drupal.config_stores import in_config_directory, is_config_yaml
 
     if is_config_yaml(path):

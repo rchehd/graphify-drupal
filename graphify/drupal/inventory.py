@@ -9,6 +9,9 @@ writes this once per run, from the same file list `detect()` itself
 returned; `report.generate`'s wrapper turns it into the "Drupal coverage"
 section appended to `GRAPH_REPORT.md`.
 
+It also lists every hook candidate (P2b spec §5.4): what looks like a hook
+implementation but names no declared hook literally.
+
 Nothing here raises on bad input (spec §5.8): an unreadable or unparsable
 YAML file is simply not counted toward `yaml_plugins`.
 """
@@ -22,6 +25,7 @@ from graphify.drupal.boundary import boundary_dir, install_map
 from graphify.drupal.config_stores import in_config_directory
 from graphify.drupal.discovery import Registry
 from graphify.drupal.families import is_drupal_file
+from graphify.drupal.hooks import find_hook_candidates, is_procedural_file
 from graphify.drupal.yaml_common import load_drupal_yaml
 from graphify.drupal.yaml_plugins import learned_family
 
@@ -217,6 +221,27 @@ def _boundary_counts(registry: Registry, root: Path) -> tuple[dict[str, int], di
     return boundary, dict(sorted(reasons.items())), imap.error if imap is not None else ""
 
 
+def _hook_candidates(registry: Registry, detected: set[str], root: Path) -> list[dict[str, Any]]:
+    """Every `hook_candidates` entry (P2b spec §5.4) of the detected PHP and
+    procedural files, `file` relative to `root`.
+
+    Read here, from the full file list every `detect()` returns, rather than
+    collected from extraction results: an incremental run extracts only the
+    changed files, and a candidate in an unchanged one must not drop out of
+    the inventory. The same `hooks.find_hook_candidates` the extractor uses
+    decides, so the two cannot disagree.
+    """
+    found: list[dict[str, Any]] = []
+    for p in sorted(detected):
+        path = Path(p)
+        if path.suffix != ".php" and not is_procedural_file(path):
+            continue
+        for entry in find_hook_candidates(path, registry):
+            found.append({**entry, "file": _relative(entry["file"], root)})
+    found.sort(key=lambda e: (e["kind"], e["module"], e["name"], e["file"], e["line"]))
+    return found
+
+
 def build_inventory(registry: Registry, detected_files: set[str], root: Path) -> dict:
     """The coverage inventory (spec §5.7): what plugin discovery, the P1/P1b
     families and P5/P6's deferred families claim of `detected_files`, and
@@ -278,6 +303,8 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
             continue
         filtered += 1
 
+    candidates = _hook_candidates(registry, detected, root)
+
     unrecognised_files = sum(e["files"] for e in unrecognised)
     boundary, boundary_reasons, composer_error = _boundary_counts(registry, root)
     summary = {
@@ -290,12 +317,14 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         "filtered": filtered,
         "boundary": boundary,
         "boundary_reasons": boundary_reasons,
+        "hook_candidates": len(candidates),
     }
 
     inventory = {
         "unrecognised_yaml": unrecognised,
         "deferred": deferred_entries,
         "managers_unresolved": [dict(u) for u in registry.unresolved],
+        "hook_candidates": candidates,
         "summary": summary,
     }
     if composer_error:
@@ -311,6 +340,7 @@ _SUMMARY_LABELS = (
     ("unrecognised_families", "unrecognised families"),
     ("unrecognised_files", "unrecognised files"),
     ("filtered", "filtered"),
+    ("hook_candidates", "hook candidates"),
 )
 
 _MAX_RENDERED_FAMILIES = 15
@@ -347,6 +377,17 @@ def render_section(inventory: dict) -> str:
         for entry in deferred:
             lines.append(f"- `{entry.get('family')}` -> {entry.get('phase')} "
                          f"({entry.get('files', 0)} file(s))")
+    else:
+        lines.append("- none")
+
+    lines += ["", "### Hook candidates"]
+    candidates = inventory.get("hook_candidates") or []
+    if candidates:
+        by_kind: dict[str, int] = {}
+        for c in candidates:
+            by_kind[c.get("kind", "")] = by_kind.get(c.get("kind", ""), 0) + 1
+        for kind in sorted(by_kind):
+            lines.append(f"- {kind}: {by_kind[kind]}")
     else:
         lines.append("- none")
 

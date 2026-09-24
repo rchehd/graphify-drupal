@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from graphify.drupal.hooks import HookDecl, hook_pattern, read_hook_stubs
+from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_pattern, read_hook_stubs
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
 from graphify.drupal.yaml_common import load_drupal_yaml
@@ -868,9 +868,7 @@ def affected_files(previous: Registry | None, current: Registry | None) -> set[s
 
     # A hook added, removed or changed (name, provider, pattern, or which
     # file declares it): the `*.api.php` file(s) that declared the old and/or
-    # new version. Task 4 widens this further to every in-graph procedural
-    # file and `src/Hook/**/*.php` (spec §5.5) -- this only re-extracts the
-    # `*.api.php` files themselves, so their own `drupal_hook` nodes stay current.
+    # new version, so their own `drupal_hook` nodes stay current.
     old_hooks, new_hooks = previous.hooks, current.hooks
     for name in old_hooks.keys() | new_hooks.keys():
         old_decl, new_decl = old_hooks.get(name), new_hooks.get(name)
@@ -879,7 +877,17 @@ def affected_files(previous: Registry | None, current: Registry | None) -> set[s
         for decl in (old_decl, new_decl):
             if decl is not None:
                 result.add(decl.file)
+
+    # What an implementation is depends only on which names are declared and
+    # their patterns: when that changes, every in-graph procedural file and
+    # `src/Hook/**/*.php` (spec §5.5).
+    if _hook_names(old_hooks) != _hook_names(new_hooks):
+        result |= hook_dependent_files(previous) | hook_dependent_files(current)
     return result
+
+
+def _hook_names(hooks: dict[str, HookDecl]) -> dict[str, str]:
+    return {name: decl.pattern for name, decl in hooks.items()}
 
 
 def force_miss() -> frozenset[str]:

@@ -1,9 +1,14 @@
-"""Read a single PHP class declaration with tree-sitter.
+"""Read PHP declarations with tree-sitter.
 
-Used by later P2a tasks to find Drupal plugin managers and read the facts
-their constructor and ``getDiscovery()`` method carry: what they extend and
-implement, what they pass to ``parent::__construct()``, what discovery
-objects they build, and what ``alterInfo()`` they register.
+``read_php_class`` is what P2a uses to find Drupal plugin managers and read
+the facts their constructor and ``getDiscovery()`` method carry: what they
+extend and implement, what they pass to ``parent::__construct()``, what
+discovery objects they build, and what ``alterInfo()`` they register.
+
+``read_php_attributes`` and ``read_php_functions`` are P2b's: the attributes
+on classes and methods (``#[Hook(...)]``, names resolved, argument source
+text kept verbatim) and a file's top-level functions (hook stubs, procedural
+hook implementations).
 """
 
 from __future__ import annotations
@@ -85,21 +90,10 @@ def read_php_class(path: Path) -> PhpClass | None:
 
 
 def _read_php_class(path: Path) -> PhpClass | None:
-    try:
-        if not path.is_file() or path.stat().st_size > _MAX_SIZE:
-            return None
-        source = path.read_bytes()
-    except OSError:
+    parsed = _parse(path)
+    if parsed is None:
         return None
-
-    try:
-        tree = _parser().parse(source)
-    except Exception:
-        return None
-
-    root = tree.root_node
-    if root is None:
-        return None
+    source, root = parsed
 
     state: dict = {"namespace": "", "uses": {}, "found": []}
     _find_class(root, state)
@@ -204,6 +198,166 @@ def _read_php_class(path: Path) -> PhpClass | None:
         alter_info=alter_info,
         construct_discoveries=construct_discoveries,
     )
+
+
+@dataclass(frozen=True)
+class AttrArg:
+    name: str            # the named argument's name (`method:` -> "method"), "" when positional
+    text: str            # the value's source text, verbatim (`Order::First`)
+    string: str | None   # the value of a plain string literal, else None
+
+
+@dataclass(frozen=True)
+class PhpAttribute:
+    name: str            # resolved FQCN, no leading backslash
+    line: int
+    args: tuple[AttrArg, ...]
+
+
+@dataclass(frozen=True)
+class PhpMethod:
+    name: str
+    line: int
+    attributes: tuple[PhpAttribute, ...]
+
+
+@dataclass(frozen=True)
+class AttributedClass:
+    name: str            # the short class name, as declared
+    fqcn: str
+    line: int
+    attributes: tuple[PhpAttribute, ...]
+    methods: tuple[PhpMethod, ...]
+
+
+@dataclass(frozen=True)
+class PhpFunction:
+    name: str
+    line: int
+    doc: str             # the comment directly above the declaration, "" when none
+
+
+def _parse(path: Path) -> "tuple[bytes, tree_sitter.Node] | None":
+    """`(source, root node)` of a PHP file, or None when it is missing,
+    unreadable, oversized or unparsable."""
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_SIZE:
+            return None
+        source = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        tree = _parser().parse(source)
+    except Exception:
+        return None
+    if tree.root_node is None:
+        return None
+    return source, tree.root_node
+
+
+def read_php_attributes(path: Path) -> list[AttributedClass]:
+    """Every top-level class in `path` with the attributes on it and on each
+    of its own methods, attribute names resolved through the file's `use`
+    statements. Classes are listed whether or not they carry any attribute.
+    Never raises: bad input yields an empty list."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return []
+        state: dict = {"namespace": "", "uses": {}, "found": []}
+        _find_class(parsed[1], state)
+        out: list[AttributedClass] = []
+        for class_node, namespace, uses in state["found"]:
+            if class_node.type != "class_declaration":
+                continue
+            name = _text(class_node.child_by_field_name("name"))
+            if not name:
+                continue
+            methods: list[PhpMethod] = []
+            body = class_node.child_by_field_name("body")
+            for member in body.named_children if body is not None else ():
+                if member.type != "method_declaration":
+                    continue
+                method_name = _text(member.child_by_field_name("name"))
+                if method_name:
+                    methods.append(PhpMethod(method_name, member.start_point[0] + 1,
+                                             _attributes(member, namespace, uses)))
+            out.append(AttributedClass(
+                name=name,
+                fqcn=resolve_name(name, namespace, uses),
+                line=class_node.start_point[0] + 1,
+                attributes=_attributes(class_node, namespace, uses),
+                methods=tuple(methods),
+            ))
+        return out
+    except Exception:
+        return []
+
+
+def _attributes(decl: "tree_sitter.Node", namespace: str, uses: dict[str, str]) -> tuple[PhpAttribute, ...]:
+    attr_list = decl.child_by_field_name("attributes")
+    if attr_list is None:
+        return ()
+    found: list[PhpAttribute] = []
+    for group in attr_list.named_children:
+        if group.type != "attribute_group":
+            continue
+        for attr in group.named_children:
+            if attr.type != "attribute":
+                continue
+            name_node = next((c for c in attr.named_children if c.type in ("name", "qualified_name")), None)
+            if name_node is None:
+                continue
+            args: list[AttrArg] = []
+            params = attr.child_by_field_name("parameters")
+            for arg in params.named_children if params is not None else ():
+                if arg.type != "argument":
+                    continue
+                arg_name = arg.child_by_field_name("name")
+                values = [c for c in arg.named_children if arg_name is None or c.id != arg_name.id]
+                if not values:
+                    continue
+                value = values[-1]
+                string = _string_value(value) if value.type in ("string", "encapsed_string") else None
+                args.append(AttrArg(_text(arg_name), _text(value), string))
+            found.append(PhpAttribute(resolve_name(_text(name_node), namespace, uses),
+                                      attr.start_point[0] + 1, tuple(args)))
+    return tuple(found)
+
+
+def read_php_functions(path: Path) -> list[PhpFunction]:
+    """Every top-level `function name(` in `path` (directly in the file or in
+    a brace-style namespace body), in source order -- never a method, a
+    closure, or a function declared inside another block. Never raises."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return []
+        found: list[PhpFunction] = []
+        _collect_functions(parsed[1], found)
+        return found
+    except Exception:
+        return []
+
+
+def _collect_functions(node: "tree_sitter.Node", found: list[PhpFunction]) -> None:
+    for child in node.named_children:
+        if child.type == "namespace_definition":
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _collect_functions(body, found)
+            continue
+        if child.type != "function_definition":
+            continue
+        name = _text(child.child_by_field_name("name"))
+        if not name:
+            continue
+        doc = ""
+        previous = child.prev_named_sibling
+        if previous is not None and previous.type == "comment" \
+                and previous.end_point[0] >= child.start_point[0] - 1:
+            doc = _text(previous)
+        found.append(PhpFunction(name, child.start_point[0] + 1, doc))
 
 
 def _collect_discoveries(
