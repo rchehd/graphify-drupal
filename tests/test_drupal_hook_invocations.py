@@ -458,3 +458,23 @@ def test_declaring_an_invoked_hook_later_matches_a_fresh_run(tmp_path):
         "<?php\n\nfunction hook_a_thing() {\n}\n\nfunction hook_new_hook() {\n}\n", encoding="utf-8")
     assert graph(out) == graph(tmp_path / "fresh")
     assert graph(tmp_path / "fresh2")[1]["provider"] == "a"
+
+
+def test_dispatch_does_not_read_php_files_for_the_marker(tmp_path, monkeypatch, _isolated_discovery_state):
+    """Final review minor 6: `_get_extractor` composes the invocation extractor
+    for every in-graph `.php` without reading the file; the extractor pre-checks."""
+    install()
+    import graphify.extract as core
+
+    root = _invocations_site(tmp_path)
+    prepare_run(root)
+    path = root / FOO / "src/Invoker.php"
+    reads: list[Path] = []
+    original = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: reads.append(self) or original(self))
+
+    handler = core._get_extractor(path)
+    assert path not in reads
+    monkeypatch.undo()
+    result = handler(path)
+    assert any(e["relation"] == "invokes_hook" for e in result["edges"])

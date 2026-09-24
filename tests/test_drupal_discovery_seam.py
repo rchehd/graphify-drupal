@@ -288,7 +288,7 @@ def test_an_unwritable_out_dir_hands_workers_a_temp_registry(
         path.unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("attr", ["ignored_predicate", "detect_incremental"])
+@pytest.mark.parametrize("attr", ["ignored_predicate", "detect_incremental", "_MANIFEST_PATH"])
 def test_patch_detect_fails_loudly_when_a_seam_symbol_disappears(monkeypatch, attr):
     install()
     import graphify.detect as detect

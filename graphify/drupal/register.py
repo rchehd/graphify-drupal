@@ -48,8 +48,10 @@ def _patch_detect(detect: ModuleType) -> None:
 
     # `ignored_predicate` is not wrapped but called by the registry walk
     # (discovery._scan_predicate); `GRAPHIFY_OUT` is what `out_dir` resolves.
+    # `_MANIFEST_PATH` is how `detect_incremental_` tells core's default
+    # manifest (no out dir to infer) from an `--out` one.
     for attr in ("classify_file", "FileType", "_is_graphable_source", "detect",
-                 "detect_incremental", "ignored_predicate", "_is_noise_dir"):
+                 "detect_incremental", "ignored_predicate", "_is_noise_dir", "_MANIFEST_PATH"):
         if not hasattr(detect, attr):
             raise DrupalSeamError(
                 f"graphify.detect.{attr} is missing — graphify core changed shape; "
@@ -225,7 +227,7 @@ def _patch_detect(detect: ModuleType) -> None:
             from graphify.drupal.discovery import using_out_dir
 
             manifest = args[0] if args else kwargs.get("manifest_path")
-            default = getattr(detect, "_MANIFEST_PATH", None)
+            default = detect._MANIFEST_PATH
             if manifest is None or str(manifest) == str(default):
                 return _promote_forced(original(root, *args, **kwargs), root)
             out = Path(manifest).resolve().parent
@@ -279,11 +281,7 @@ def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor, is_api_php
-    from graphify.drupal.hooks import (
-        extract_hook_declarations,
-        extract_hook_invocations,
-        has_hook_invocation_marker,
-    )
+    from graphify.drupal.hooks import extract_hook_declarations, extract_hook_invocations
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group, compose_handlers
     from graphify.drupal.resolvers import scanning
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
@@ -308,6 +306,19 @@ def _patch_extract(extract: ModuleType) -> None:
             "graphify.extract._DISPATCH has no '.php' handler — graphify core changed "
             "shape; graphify/drupal/register.py must be updated"
         )
+
+    # `hooks.py` computes `hook_implemented_by` targets and `invokes_hook`
+    # sources with core's own PHP id helpers and emits an edge only when the
+    # id is one core emitted: a renamed helper would drop every such edge
+    # silently (inside the extractors' never-raise guard), so assert them here.
+    import graphify.extractors.base as extractor_base
+
+    for attr in ("_file_stem", "_make_id"):
+        if not callable(getattr(extractor_base, attr, None)):
+            raise DrupalSeamError(
+                f"graphify.extractors.base.{attr} is missing — graphify core changed "
+                "shape; graphify/drupal/register.py must be updated"
+            )
 
     def _path_only(extra):
         return lambda p, _core_result: extra(p)
@@ -334,12 +345,12 @@ def _patch_extract(extract: ModuleType) -> None:
                 # Only an in-graph file reaches this dispatch at all -- a
                 # boundary api.php never gets scanned (Task 2 prunes it).
                 extras.append(hook_declarations_extra)
-            if path.suffix == ".php" and has_hook_invocation_marker(path):
+            if path.suffix == ".php":
                 # Any other in-graph PHP file (a service, a controller, a
-                # manager, `settings.php`, `*.api.php`) that calls
-                # `invoke`/`alter`/`hasImplementations` on some receiver gets
-                # its invocation sites too (spec §5.3). Procedural files and
-                # `src/Hook/**/*.php` already carry this through
+                # manager, `settings.php`, `*.api.php`) gets its invocation
+                # sites too (spec §5.3); the extractor's own text pre-check
+                # skips a file with none, so dispatch reads nothing. Procedural
+                # files and `src/Hook/**/*.php` already carry this through
                 # `hooks.extract_php_with_hooks` (`drupal_extractor`, above).
                 extras.append(extract_hook_invocations)
             # A `#[Hook]` outside `<extension>/src/Hook/` is no implementation

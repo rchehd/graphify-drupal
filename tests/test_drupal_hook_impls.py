@@ -595,8 +595,12 @@ def test_a_hook_attribute_outside_src_hook_is_misplaced(tmp_path, _isolated_disc
     assert result["nodes"] == [] and result["edges"] == []
     assert result["hook_candidates"] == [{
         "kind": "misplaced", "module": "foo", "name": "cron", "file": str(path), "line": 5}]
-    # Not composed at all: core's own handler.
-    assert core._get_extractor(path) is core._DISPATCH[".php"]
+    # No implementation extractor is composed: the handler (core's own plus
+    # the invocation extractor, final review minor 6) yields core's nodes only.
+    composed = core._get_extractor(path)(path)
+    assert [n["id"] for n in composed["nodes"]] == [n["id"] for n in _core_php(path)["nodes"]]
+    assert not any(e["relation"] in ("implements_hook", "hook_implemented_by")
+                   for e in composed["edges"])
 
 
 def test_non_literal_module_or_method_is_a_candidate(tmp_path, _isolated_discovery_state):
@@ -675,3 +679,17 @@ def test_several_hooks_on_one_method_and_a_duplicate_target(tmp_path, _isolated_
         (insert, "hook_implemented_by", run),
     ])
     assert [c["name"] for c in result["hook_candidates"]] == ["form_alter"]
+
+
+@pytest.mark.parametrize("attr", ["_file_stem", "_make_id"])
+def test_the_seam_fails_loudly_when_core_id_helpers_move(monkeypatch, attr):
+    """Final review I4: hooks.py computes `hook_implemented_by` targets and
+    `invokes_hook` sources with core's id helpers; a rename upstream must fail
+    here, not silently drop every such edge."""
+    install()
+    import graphify.extract as core
+    import graphify.extractors.base as base
+
+    monkeypatch.delattr(base, attr, raising=True)
+    with pytest.raises(DrupalSeamError, match=rf"graphify\.extractors\.base\.{attr}"):
+        _patch_extract(core)
