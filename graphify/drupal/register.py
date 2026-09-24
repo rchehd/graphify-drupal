@@ -351,14 +351,16 @@ def _patch_extract(extract: ModuleType) -> None:
         def extract_(paths, cache_root=None, **kwargs):
             clear_caches()
             clear_boundary_caches()
+            # What core anchors relative `source_file`s to: `root`, else
+            # `cache_root` -- `graphify watch` passes only the latter.
+            root = kwargs.get("root")
+            anchor = root if root is not None else cache_root
             context = kwargs.get("resolution_context_nodes")
             if context:
                 # An incremental run. Pull in the unchanged files a changed
                 # plugin registry affects (spec §5.5), then each collision group
                 # (see merge.collision_group), and keep every pulled file out of
                 # the read-only context, as core does for every file it extracts.
-                root = kwargs.get("root")
-                anchor = root if root is not None else cache_root
                 given = list(paths)
                 widened = collision_group(
                     given + _registry_widening(given, context, anchor), context, anchor)
@@ -367,7 +369,7 @@ def _patch_extract(extract: ModuleType) -> None:
                     paths = widened
             # Boundary stubs name their paths relative to the scan root; the
             # resolver runs inside this call but is not handed the root.
-            with scanning(kwargs.get("root")):
+            with scanning(anchor):
                 result = original(paths, cache_root, **kwargs)
             # Only now are the forced files re-extracted; an exception above
             # leaves the set in place for the next run to carry over.

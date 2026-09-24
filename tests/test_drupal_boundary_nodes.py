@@ -191,6 +191,23 @@ def test_a_path_outside_the_scan_root_stays_absolute(tmp_path, _isolated_discove
     assert nodes[hook_id("cron")]["declared_file"] == (root / "web/core/core.api.php").as_posix()
 
 
+def test_a_watch_style_extract_keeps_boundary_paths_relative(tmp_path, _isolated_discovery_state):
+    """`graphify watch` calls `extract(..., cache_root=<watch root>)` with no
+    `root`: boundary paths must still be relative to that anchor (final review I1)."""
+    install()
+    from graphify.extract import extract
+
+    root = _boundary_site(tmp_path)
+    prepare_run(root)
+    by_root = _by_id(extract(_custom_files(root), root=root)["nodes"])
+    by_cache_root = _by_id(extract(_custom_files(root), cache_root=root)["nodes"])
+
+    for nid, key in ((extension_id("token"), "extension_path"), (hook_id("cron"), "declared_file")):
+        assert by_cache_root[nid][key] == by_root[nid][key], nid
+    assert by_cache_root[extension_id("token")]["extension_path"] == "web/modules/contrib/token"
+    assert by_cache_root[hook_id("cron")]["declared_file"] == "web/core/core.api.php"
+
+
 # -- the real CLI ------------------------------------------------------------------
 
 
