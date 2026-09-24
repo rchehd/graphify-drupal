@@ -639,10 +639,11 @@ def _extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            attrs: dict[str, Any] = {"target_name": name}
-            if name not in registry.hooks:
-                attrs["undeclared"] = True
-            edges.append(edge(source, hook_id(name), "invokes_hook", path=path, line=call.line, **attrs))
+            # Whether `name` is declared is the target's fact, not the edge's:
+            # an edge flag would go stale on an incremental run that re-reads
+            # the declaring `*.api.php` but not this file (final review I2).
+            edges.append(edge(source, hook_id(name), "invokes_hook", path=path, line=call.line,
+                              target_name=name))
     return {"nodes": [], "edges": edges, "hook_candidates": candidates}
 
 

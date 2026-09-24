@@ -456,8 +456,10 @@ P2b emits the first four:
   `\Drupal::theme()`, or a variable/property named `moduleHandler` or
   `themeManager`); on any other receiver the call is an `unknown_receiver`
   candidate. The other names count on any receiver. A hook no `*.api.php`
-  declares is still the target (a boundary stub) and the edge carries
-  `undeclared: true`. From a `drupal_plugin_type` with `alter_hook` to
+  declares is still the target: a boundary stub with `missing: true` and no
+  `provider`/`declared_file`, which is what says it is undeclared (the edge
+  carries no such flag: it would go stale on an incremental run that re-reads
+  the declaring file but not the invoking one). From a `drupal_plugin_type` with `alter_hook` to
   `<alter_hook>_alter`. A non-literal name is not `AMBIGUOUS`: it is no edge,
   and a `non_literal` inventory candidate.
 

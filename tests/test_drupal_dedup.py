@@ -94,3 +94,62 @@ def test_seam_fails_loudly_when_dedup_moves(monkeypatch):
     monkeypatch.delattr(dedup, "_is_code", raising=True)
     with pytest.raises(DrupalSeamError, match="_is_code"):
         _patch_dedup(dedup)
+
+
+def _merge(tmp_path, existing: list[dict], new_nodes: list[dict], new_edges: list[dict]):
+    """`build_merge` of one new chunk onto a graph.json holding `existing`:
+    the incremental path, where graph.json's copy of an id meets a fresh one."""
+    import json
+
+    install()
+    from graphify.build import build_merge
+
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps({"directed": True, "multigraph": False, "graph": {},
+                                      "nodes": existing, "links": []}), encoding="utf-8")
+    return build_merge([{"nodes": new_nodes, "edges": new_edges}], graph_path,
+                       directed=True, root=tmp_path)
+
+
+def test_build_merge_keeps_same_label_stubs_apart(tmp_path):
+    """The dedup-by-id fix holds on the incremental path too (final review minor 13)."""
+    existing = [
+        _stub("drupal_extension_toolbar", "toolbar", "drupal_extension",
+              "config/sync/core.extension.yml"),
+        _stub("drupal_route_a_b", "entity.log.canonical", "drupal_route", "m/m.routing.yml"),
+    ]
+    new = [
+        _stub("drupal_hook_toolbar", "toolbar", "drupal_hook",
+              "web/modules/custom/ds/src/Hook/ToolbarHooks.php"),
+        _stub("drupal_route_a_c", "entity.log.collection", "drupal_route", "m/m.links.task.yml"),
+    ]
+    graph = _merge(tmp_path, existing, new, [])
+    assert {n["id"] for n in existing + new} <= set(graph.nodes)
+    assert "hook_name" not in graph.nodes["drupal_extension_toolbar"]
+
+
+def test_a_declared_node_beats_the_stub_graph_json_carries(tmp_path):
+    """A hook first only invoked (a stub, source_file the invoking file), then
+    declared by a re-extracted in-graph `*.api.php`: the declared node survives
+    the merge with its own attributes, not the stale stub's."""
+    stub = {**_stub("drupal_hook_new_hook", "new_hook", "drupal_hook",
+                    "web/modules/custom/a/src/Thing.php"),
+            "hook_name": "new_hook", "missing": True, "realm": "unknown"}
+    declared = {"id": "drupal_hook_new_hook", "label": "new_hook", "type": "drupal_hook",
+                "file_type": "code", "hook_name": "new_hook", "provider": "a",
+                "realm": "custom", "source_file": "web/modules/custom/a/a.api.php",
+                "source_location": "L6"}
+    graph = _merge(tmp_path, [stub], [declared], [])
+    node = graph.nodes["drupal_hook_new_hook"]
+    assert (node["source_file"], node.get("provider"), node.get("realm")) == (
+        "web/modules/custom/a/a.api.php", "a", "custom")
+    assert "missing" not in node and "boundary" not in node
+
+
+def test_seam_fails_loudly_when_defines_id_moves(monkeypatch):
+    import graphify.dedup as dedup
+    from graphify.drupal.register import _patch_dedup
+
+    monkeypatch.delattr(dedup, "_defines_id", raising=True)
+    with pytest.raises(DrupalSeamError, match="_defines_id"):
+        _patch_dedup(dedup)

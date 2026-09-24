@@ -731,19 +731,39 @@ def _patch_dedup(dedup: ModuleType) -> None:
     never evidence of sameness: boundary stubs are `concept` (vocabulary §1.3),
     and without this the core module `toolbar` merged into the hook `toolbar`,
     and route, menu-link and local-task stubs sharing a label into each other.
-    """
-    if not callable(getattr(dedup, "_is_code", None)):
-        raise DrupalSeamError(
-            "graphify.dedup._is_code is missing — graphify core changed shape; "
-            "graphify/drupal/register.py must be updated"
-        )
 
-    def _identity(original):
+    `_defines_id` picks the survivor when one id reaches the build twice
+    (graph.json's copy and a re-extracted one). A Drupal id encodes no file,
+    so core's answer is False for every Drupal node and the tie falls to label
+    and path: a boundary stub carried over from graph.json could beat the node
+    a now-declaring file emits (`hook_new_hook` added to an in-graph
+    `*.api.php` kept the stale `missing` stub). The declared node defines the
+    id; a stub (`boundary: true`) only references it.
+    """
+    for attr in ("_is_code", "_defines_id"):
+        if not callable(getattr(dedup, attr, None)):
+            raise DrupalSeamError(
+                f"graphify.dedup.{attr} is missing — graphify core changed shape; "
+                "graphify/drupal/register.py must be updated"
+            )
+
+    def _is_drupal(node) -> bool:
+        return str(node.get("type", "")).startswith("drupal_")
+
+    def _key_by_id(original):
         def _is_code(node):
-            return original(node) or str(node.get("type", "")).startswith("drupal_")
+            return original(node) or _is_drupal(node)
         return _is_code
 
-    _wrap(dedup, "_is_code", _identity)
+    def _declared_defines(original):
+        def _defines_id(node):
+            if _is_drupal(node):
+                return bool(node.get("source_file")) and not node.get("boundary")
+            return original(node)
+        return _defines_id
+
+    _wrap(dedup, "_is_code", _key_by_id)
+    _wrap(dedup, "_defines_id", _declared_defines)
 
 
 _PATCHERS = {

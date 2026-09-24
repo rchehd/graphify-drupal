@@ -126,19 +126,18 @@ def test_invocation_edges_and_non_literal_candidate(tmp_path, _isolated_discover
     result = extract_hook_invocations(path, core_result)
 
     assert result["nodes"] == []
-    assert sorted((e["target"], e.get("target_name"), e.get("undeclared")) for e in result["edges"]) == sorted([
-        (hook_id("foo_info"), "foo_info", True),
-        (hook_id("foo_info_alter"), "foo_info_alter", True),
-        (hook_id("a_alter"), "a_alter", True),
-        (hook_id("b_alter"), "b_alter", True),
-        (hook_id("cron"), "cron", None),
+    assert sorted((e["target"], e.get("target_name")) for e in result["edges"]) == sorted([
+        (hook_id("foo_info"), "foo_info"),
+        (hook_id("foo_info_alter"), "foo_info_alter"),
+        (hook_id("a_alter"), "a_alter"),
+        (hook_id("b_alter"), "b_alter"),
+        (hook_id("cron"), "cron"),
     ])
     assert {e["source"] for e in result["edges"]} == {run}
     assert all(e["relation"] == "invokes_hook" for e in result["edges"])
-    cron_edge = _edge(result, hook_id("cron"))
-    assert "undeclared" not in cron_edge
-    foo_info_edge = _edge(result, hook_id("foo_info"))
-    assert foo_info_edge["undeclared"] is True
+    # No `undeclared` edge attribute (final review I2): it went stale on an
+    # incremental run; the hook stub's missing provider says it instead.
+    assert not any("undeclared" in e for e in result["edges"])
 
     assert result["hook_candidates"] == [
         {"kind": "non_literal", "module": "", "name": "$name", "file": str(path), "line": 14},
@@ -423,3 +422,39 @@ def test_an_interpolated_hook_name_is_a_non_literal_candidate(tmp_path, _isolate
         ("non_literal", '"${type}_insert"', 9),
         ("non_literal", '"$type"', 10),
     ]
+
+
+def test_declaring_an_invoked_hook_later_matches_a_fresh_run(tmp_path):
+    """The reviewer's scenario (final review I2): `invokeAll('new_hook')` in an
+    unchanged file, then `hook_new_hook` added to the `*.api.php`. The
+    incremental graph's `invokes_hook` edge and its target equal a fresh run's."""
+    import json
+
+    root = _site(tmp_path / "site", {"web/core/core.api.php": CORE_API_PHP})
+    a = root / "web/modules/custom/a"
+    files = {
+        "a.info.yml": "name: A\ntype: module\n",
+        "a.api.php": "<?php\n\nfunction hook_a_thing() {\n}\n",
+        "src/Thing.php": "<?php\nnamespace Drupal\\a;\nclass Thing {\n  public function run() {\n"
+                         "    $this->moduleHandler->invokeAll('new_hook');\n  }\n}\n",
+    }
+    for name, text in files.items():
+        (a / name).parent.mkdir(parents=True, exist_ok=True)
+        (a / name).write_text(text, encoding="utf-8")
+
+    def graph(out: Path) -> tuple[list[dict], dict]:
+        _cli(root, out)
+        data = json.loads(next(out.rglob("graph.json")).read_text(encoding="utf-8"))
+        links = data.get("links") or data.get("edges") or []
+        invokes = sorted((e["source"], e["target"], e.get("undeclared")) for e in links
+                         if e["relation"] == "invokes_hook")
+        target = next((n for n in data["nodes"] if n["id"] == hook_id("new_hook")), {})
+        return invokes, {k: target.get(k) for k in ("provider", "missing", "boundary")}
+
+    out = tmp_path / "out"
+    first, first_target = graph(out)
+    assert first and first[0][2] is None and first_target["missing"] is True
+    (a / "a.api.php").write_text(
+        "<?php\n\nfunction hook_a_thing() {\n}\n\nfunction hook_new_hook() {\n}\n", encoding="utf-8")
+    assert graph(out) == graph(tmp_path / "fresh")
+    assert graph(tmp_path / "fresh2")[1]["provider"] == "a"
