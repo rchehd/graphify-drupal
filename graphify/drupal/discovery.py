@@ -577,17 +577,43 @@ def _read_provider(builder: _Builder, path: Path) -> list[str]:
     return _set_classes(text, namespace)
 
 
+#: How many registry walks are in progress in this process (`registry_walk`).
+_registry_walks = 0
+
+
+@contextmanager
+def registry_walk() -> Iterator[None]:
+    """Mark the block as the registry's walk (re-entrant, cleared on exit).
+
+    While it runs, the seam's `_is_noise_dir` wrapper answers with core's
+    original only, so the registry reads core, contrib and vendor even though
+    `detect()` never descends them (spec S4.2)."""
+    global _registry_walks
+    _registry_walks += 1
+    try:
+        yield
+    finally:
+        _registry_walks -= 1
+
+
+def walking_registry() -> bool:
+    """True while the registry walks the site (inside `registry_walk()`)."""
+    return _registry_walks > 0
+
+
 def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = None) -> Registry:
     """Learn every plugin type the site's managers define. Never raises on bad input.
 
     `is_ignored` (core's `detect.ignored_predicate` without `.gitignore` in the
     pipeline) keeps the walk out of what the user excluded; without it every
-    file under the web root counts.
+    file under the web root counts. The walk runs inside `registry_walk()`, so
+    the boundary trees `detect()` prunes are read here.
     """
     scan_root = Path(scan_root).absolute()
     web_root = find_web_root(scan_root)
     base = web_root if web_root is not None else scan_root
-    walk = _walk(base, web_root / "core" if web_root is not None else None, is_ignored)
+    with registry_walk():
+        walk = _walk(base, web_root / "core" if web_root is not None else None, is_ignored)
     builder = _Builder(web_root, walk)
     if web_root is None:
         builder.note("", "", "no_drupal_core")
@@ -942,7 +968,11 @@ def prepare_run(
     # core's noise-dir pruning still apply; the graph itself still honours
     # .gitignore, and edges to a type defined in an ignored tree point at a
     # materialised (missing) type node.
-    registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore=False))
+    # The boundary (core, contrib, vendor) is not graph content either: the
+    # predicate is built and asked inside `registry_walk()`, so its noise-dir
+    # check does not prune what `detect()` itself never descends (spec S4.2).
+    with registry_walk():
+        registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore=False))
     forced = frozenset(affected_files(previous, registry) | carried)
 
     payload = json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced)},

@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from graphify.drupal.boundary import boundary_dir, install_map
 from graphify.drupal.config_stores import in_config_directory
 from graphify.drupal.discovery import Registry
 from graphify.drupal.families import is_drupal_file
@@ -153,6 +154,53 @@ def _deferred_entries(
     return entries, component_files | migrate_drupal_files | migrations_files
 
 
+_BOUNDARY_REALMS = ("core", "contrib", "vendor")
+
+
+def _boundary_counts(registry: Registry, root: Path) -> tuple[dict[str, int], dict[str, int], str]:
+    """`(boundary, boundary_reasons, composer error)` for the scan `root` (spec §4.2).
+
+    Counts the directories `detect()` prunes as boundary trees, read from the
+    composer install map rather than from a walk: every install dir that
+    exists under `root`, is still a boundary after `drupal.include`, and is
+    not inside another counted one (a package under `vendor/` is pruned with
+    it). Without a usable install map the pruning follows P0's path rules, so
+    the candidates are the registry's extension directories plus the vendor
+    directory beside the web root.
+    """
+    imap = install_map(root)
+    if imap is not None and not imap.error:
+        candidates = [Path(d) for d, _realm, _reason in imap.paths]
+    else:
+        candidates = [Path(d) for d in registry.extensions.values()]
+        if registry.web_root:
+            candidates.append(Path(registry.web_root).parent / "vendor")
+
+    pruned: dict[str, tuple[str, str]] = {}
+    for candidate in candidates:
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if not candidate.is_dir():
+            continue
+        found = boundary_dir(candidate)
+        if found is not None:
+            pruned[candidate.as_posix()] = found
+    outermost = [
+        d for d in pruned
+        if not any(d != other and d.startswith(other + "/") for other in pruned)
+    ]
+
+    boundary = dict.fromkeys(_BOUNDARY_REALMS, 0)
+    reasons: dict[str, int] = {}
+    for d in outermost:
+        realm, reason = pruned[d]
+        boundary[realm] += 1
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return boundary, dict(sorted(reasons.items())), imap.error if imap is not None else ""
+
+
 def build_inventory(registry: Registry, detected_files: set[str], root: Path) -> dict:
     """The coverage inventory (spec §5.7): what plugin discovery, the P1/P1b
     families and P5/P6's deferred families claim of `detected_files`, and
@@ -215,6 +263,7 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         filtered += 1
 
     unrecognised_files = sum(e["files"] for e in unrecognised)
+    boundary, boundary_reasons, composer_error = _boundary_counts(registry, root)
     summary = {
         "types": len(registry.types),
         "registered_types": sum(1 for t in registry.types.values() if t.registered),
@@ -223,14 +272,19 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         "unrecognised_families": len(unrecognised),
         "unrecognised_files": unrecognised_files,
         "filtered": filtered,
+        "boundary": boundary,
+        "boundary_reasons": boundary_reasons,
     }
 
-    return {
+    inventory = {
         "unrecognised_yaml": unrecognised,
         "deferred": deferred_entries,
         "managers_unresolved": [dict(u) for u in registry.unresolved],
         "summary": summary,
     }
+    if composer_error:
+        inventory["composer_unreadable"] = composer_error
+    return inventory
 
 
 _SUMMARY_LABELS = (

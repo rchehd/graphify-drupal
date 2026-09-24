@@ -219,6 +219,9 @@ def test_editing_one_services_file_changes_only_its_own_edge(tmp_path):
 
 def _site_corpus(root: Path) -> None:
     files = {
+        # Core's node/views extensions are declared in the graph (not
+        # materialised boundary stubs), as before P2b's boundary pruning.
+        ".graphifyrc": "drupal.include = core, contrib\n",
         "web/core/lib/Drupal.php": "<?php\n",
         "web/core/modules/node/node.info.yml": "name: Node\ntype: module\n",
         "web/core/modules/views/views.info.yml": "name: Views\ntype: module\n",
@@ -272,6 +275,9 @@ def _collision_site(root: Path) -> None:
     core re-extracts each of them on every later run (its zero-node heal).
     """
     files = {
+        # The shipped copy lives in core: without this P2b's boundary pruning
+        # would drop it, and with it the collision this site exists to create.
+        ".graphifyrc": "drupal.include = core, contrib\n",
         "web/core/lib/Drupal.php": "<?php\n",
         "web/core/modules/system/system.info.yml": "name: System\ntype: module\n",
         "web/core/modules/system/config/install/system.site.yml":

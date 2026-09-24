@@ -40,12 +40,14 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
 
 
 def _patch_detect(detect: ModuleType) -> None:
+    from graphify.drupal.boundary import boundary_dir
+    from graphify.drupal.discovery import current_registry, walking_registry
     from graphify.drupal.families import is_drupal_file
 
     # `ignored_predicate` is not wrapped but called by the registry walk
     # (discovery._scan_predicate); `GRAPHIFY_OUT` is what `out_dir` resolves.
     for attr in ("classify_file", "FileType", "_is_graphable_source", "detect",
-                 "detect_incremental", "ignored_predicate"):
+                 "detect_incremental", "ignored_predicate", "_is_noise_dir"):
         if not hasattr(detect, attr):
             raise DrupalSeamError(
                 f"graphify.detect.{attr} is missing — graphify core changed shape; "
@@ -90,17 +92,38 @@ def _patch_detect(detect: ModuleType) -> None:
             return original(path)
         return _is_graphable_source
 
+    def _noise(original):
+        # Core calls `_is_noise_dir` by bare name from detect()'s prune loop and
+        # from `ignored_predicate`, both resolved through this module global at
+        # call time, so wrapping it prunes a boundary tree (core, contrib,
+        # vendor install dir) whether it is committed or gitignored (spec §4.2).
+        #
+        # Only in a Drupal run (a registry is current): P0's path rules would
+        # otherwise prune `*/core/lib/*` or `*/modules/contrib/*` in any
+        # repository. Never while the registry walks: it must read the boundary.
+        def _is_noise_dir(part, parent=None):
+            if original(part, parent):
+                return True
+            if parent is None or walking_registry() or current_registry() is None:
+                return False
+            return boundary_dir(Path(parent) / part) is not None
+        return _is_noise_dir
+
     def _detect(original):
         # The registry must exist before core scans a single file — extraction
         # workers spawned later in the same run read it through
         # `current_registry()`, and `prepare_run` is what makes that possible.
         def detect_(root, *, follow_symlinks=None, google_workspace=None,
                     extra_excludes=None, cache_root=None, gitignore=True):
-            from graphify.drupal.discovery import current_registry, out_dir, prepare_run
+            from graphify.drupal.boundary import clear_caches as clear_boundary_caches
+            from graphify.drupal.discovery import out_dir, prepare_run
             from graphify.drupal.inventory import (
                 build_inventory, remove_inventory, set_current_inventory, write_inventory,
             )
 
+            # composer.json/lock and `.graphifyrc` may have changed since the
+            # last run in this process (`graphify watch`).
+            clear_boundary_caches()
             root_path = Path(root)
             prepare_run(root_path, cache_root,
                         extra_excludes=extra_excludes, gitignore=gitignore)
@@ -169,6 +192,7 @@ def _patch_detect(detect: ModuleType) -> None:
 
     _wrap(detect, "classify_file", _classify)
     _wrap(detect, "_is_graphable_source", _graphable)
+    _wrap(detect, "_is_noise_dir", _noise)
     _wrap(detect, "detect", _detect)
     _wrap(detect, "detect_incremental", _incremental)
 
