@@ -13,6 +13,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -617,3 +618,240 @@ def test_p2a_criterion_8_registry_build_is_under_five_seconds(tmp_path):
         elapsed = time.perf_counter() - started
     assert registry is not None and len(registry.types) == 143
     assert elapsed < 5.0
+
+
+# -- P2b: hooks and the boundary (spec 2026-09-24-drupal-p2b-hooks-boundary §8) --
+#
+# Through the seam's `detect()` -- `prepare_run` plus core's walk with the
+# boundary pruned -- and then `extract()` of the code files it returns, which is
+# what `graphify extract --code-only` does. Everything goes to a temporary out
+# dir, and the process state `prepare_run` and the inventory set is restored.
+
+#: Composer package types whose install paths criterion 1 checks (spec §4.1).
+_CONTRIB_TYPES = ("drupal-module", "drupal-theme", "drupal-profile", "drupal-recipe")
+_HOOK_ATTRIBUTE = re.compile(r"#\[\s*(?:\\?Drupal\\Core\\Hook\\Attribute\\)?Hook\s*\(")
+_TOP_LEVEL_FUNCTION = re.compile(r"^function\s+(\w+)\s*\(", re.MULTILINE)
+_CUSTOM_ROOTS = ("web/modules/custom", "web/themes/custom", "web/profiles/custom")
+
+
+@pytest.fixture(scope="module")
+def p2b(tmp_path_factory):
+    import graphify  # noqa: F401
+    from graphify.detect import detect
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.inventory import current_inventory
+    from graphify.extract import extract
+
+    out = tmp_path_factory.mktemp("p2b-out")
+    with _restored_discovery_state():
+        detected = detect(CORPUS, cache_root=out)
+        registry = current_registry()
+        inventory = current_inventory()
+        assert registry is not None and inventory is not None
+        code = sorted(Path(p) for p in detected["files"]["code"])
+        extraction = extract(code, cache_root=out, root=CORPUS)
+    return {"detected": detected, "registry": registry, "inventory": inventory,
+            "extraction": extraction}
+
+
+def _composer_install_dirs() -> dict[str, list[Path]]:
+    """Spec §4.1 re-derived from the corpus's own composer files: every
+    installed package of a contrib type -> its install dir, by type."""
+    import json
+
+    manifest = json.loads((CORPUS / "composer.json").read_text(encoding="utf-8"))
+    lock = json.loads((CORPUS / "composer.lock").read_text(encoding="utf-8"))
+    patterns = manifest["extra"]["installer-paths"]
+    found: dict[str, list[Path]] = collections.defaultdict(list)
+    for package in [*lock["packages"], *lock.get("packages-dev", [])]:
+        kind = package.get("type")
+        if kind not in _CONTRIB_TYPES:
+            continue
+        name = (package.get("extra") or {}).get("installer-name") or package["name"].split("/")[1]
+        for pattern, selectors in patterns.items():
+            if f"type:{kind}" in selectors or package["name"] in selectors:
+                found[kind].append(CORPUS / pattern.replace("{$name}", name))
+                break
+    return found
+
+
+def test_p2b_criterion_1_realm_comes_from_composer():
+    import graphify  # noqa: F401
+    from graphify.drupal.boundary import clear_caches, realm_of
+
+    clear_caches()
+    installed = _composer_install_dirs()
+    # 93 modules and 2 themes in composer.lock; the corpus has no contrib
+    # profile or recipe, so those two types simply contribute nothing.
+    assert {k: len(v) for k, v in installed.items()} == {"drupal-module": 93, "drupal-theme": 2}
+    wrong = {d.relative_to(CORPUS).as_posix(): realm_of(d / "x.info.yml")
+             for dirs in installed.values() for d in dirs
+             if realm_of(d / "x.info.yml") != "contrib"}
+    assert wrong == {}
+
+    def realms_under(relative: str) -> collections.Counter:
+        counts: collections.Counter = collections.Counter()
+        for dirpath, dirnames, _files in os.walk(CORPUS / relative):
+            # `tests/` excluded, as throughout the spec: package_manager's
+            # fixtures hold composer projects of their own (fake_site/ with a
+            # composer.json and lock), whose nearest-project answer is not core.
+            dirnames[:] = [d for d in dirnames if d not in _SCAN_PRUNED]
+            counts[realm_of(Path(dirpath) / "f.php")] += 1
+        return counts
+
+    assert set(realms_under("web/core")) == {"core"}
+    assert set(realms_under("vendor/symfony")) == {"vendor"}
+    for custom in ("web/modules/custom", "web/themes/custom", "config", "web/sites"):
+        assert set(realms_under(custom)) == {"custom"}, custom
+
+
+def test_p2b_criterion_1b_detect_prunes_the_boundary(p2b):
+    from graphify.drupal.boundary import realm_of
+
+    detected = [p for paths in p2b["detected"]["files"].values() for p in paths]
+    assert detected
+    assert collections.Counter(realm_of(Path(p)) for p in detected
+                               if realm_of(Path(p)) != "custom") == {}
+    summary = p2b["inventory"]["summary"]
+    # web/core, the 101 install dirs under web/modules/contrib, web/themes/contrib
+    # and web/libraries that exist, vendor/, and web/sites/default/files.
+    assert summary["boundary"] == {"core": 1, "contrib": 101, "vendor": 1, "files": 1}
+    assert summary["boundary_reasons"] == {"composer": 102, "site_files": 1, "vendor_dir": 1}
+
+
+def test_p2b_criterion_2_the_hook_registry(p2b):
+    hooks = p2b["registry"].hooks
+    # Spec §2: 298 core + 137 contrib stubs, 435 distinct names, 51 variable.
+    assert len(hooks) == 435
+    assert sum(1 for d in hooks.values() if d.pattern) == 51
+
+
+def _custom_hook_sites(declared: set[str]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Spec §2's custom counts, by a text scan independent of the extractor:
+    every `#[Hook(` in a custom `.php` file, and every procedural
+    `<ext>_<declared hook>()` in a custom extension's procedural file
+    (`tests/` excluded, as in the spec)."""
+    attributes, procedural = [], []
+    for root in _CUSTOM_ROOTS:
+        for dirpath, dirnames, filenames in os.walk(CORPUS / root):
+            dirnames[:] = [d for d in dirnames if d not in _SCAN_PRUNED and not d.startswith(".")]
+            for name in filenames:
+                path = Path(dirpath) / name
+                relative = path.relative_to(CORPUS).as_posix()
+                parts = name.split(".")
+                if name.endswith(".php"):
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    attributes += [(relative, text.count("\n", 0, m.start()) + 1)
+                                   for m in _HOOK_ATTRIBUTE.finditer(text)]
+                elif (parts[-1] in ("module", "install", "theme", "profile", "inc")
+                      and (Path(dirpath) / f"{parts[0]}.info.yml").is_file()):
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                    prefix = parts[0] + "_"
+                    procedural += [(relative, text.count("\n", 0, m.start()) + 1)
+                                   for m in _TOP_LEVEL_FUNCTION.finditer(text)
+                                   if m.group(1).startswith(prefix)
+                                   and m.group(1)[len(prefix):] in declared]
+    return attributes, procedural
+
+
+def _line(located: dict) -> int:
+    return int(str(located["source_location"]).lstrip("L"))
+
+
+def test_p2b_criterion_3_no_custom_hook_is_silent(p2b):
+    extraction, inventory = p2b["extraction"], p2b["inventory"]
+    attributes, procedural = _custom_hook_sites(set(p2b["registry"].hooks))
+    assert (len(attributes), len(procedural)) == (31, 23)
+
+    # Every implementation has its own `hook_implemented_by` edge at its line;
+    # everything else is a candidate at its line.
+    implemented = {(e["source_file"], _line(e)) for e in extraction["edges"]
+                   if e["relation"] == "hook_implemented_by"}
+    candidates = {(c["file"], c["line"]) for c in inventory["hook_candidates"]}
+    assert [s for s in attributes + procedural if s not in implemented | candidates] == []
+    assert len({s for s in attributes if s in implemented}) == 19
+    assert {s for s in procedural if s not in implemented} == set()
+
+    by_kind = collections.Counter(c["kind"] for c in inventory["hook_candidates"])
+    # 24 variable-segment names (form_*_alter, preprocess_*, *_access, ...) and
+    # 3 plugin-info alters no `*.api.php` declares. The `non_literal` entries
+    # are invocation sites; see test_p2b_invocations.
+    assert (by_kind["variable"], by_kind["undeclared"]) == (24, 3)
+    assert inventory["summary"]["hook_candidates"] == len(inventory["hook_candidates"])
+
+
+def test_p2b_criterion_4_every_hook_implemented_by_target_exists(p2b):
+    extraction = p2b["extraction"]
+    ids = {n["id"] for n in extraction["nodes"]}
+    by = [e for e in extraction["edges"] if e["relation"] == "hook_implemented_by"]
+    assert len(by) == 42
+    assert [e["target"] for e in by if e["target"] not in ids] == []
+    assert [e["source"] for e in by if e["source"] not in ids] == []
+    impls = [n for n in extraction["nodes"] if n.get("type") == "drupal_hook_impl"]
+    # One node per (module, hook): 42 implementations share 39 nodes.
+    assert len(impls) == 39
+    assert collections.Counter(n["via"] for n in impls) == {"attribute": 17, "procedural": 22}
+
+
+def test_p2b_criterion_5_registry_and_boundary_under_five_seconds(tmp_path):
+    import time
+
+    import graphify  # noqa: F401
+    from graphify.drupal.boundary import clear_caches
+    from graphify.drupal.discovery import prepare_run
+
+    with _restored_discovery_state():
+        clear_caches()
+        started = time.perf_counter()
+        registry = prepare_run(CORPUS, cache_root=tmp_path)
+        elapsed = time.perf_counter() - started
+    assert registry is not None and len(registry.hooks) == 435
+    assert elapsed < 5.0
+
+
+def test_p2b_the_graph_is_own_code_plus_a_named_boundary(p2b):
+    from graphify.drupal.boundary import realm_of
+
+    nodes = p2b["extraction"]["nodes"]
+    located = {n["source_file"] for n in nodes if n.get("source_file") and not n.get("boundary")}
+    assert collections.Counter(realm_of(CORPUS / s) for s in located) == {"custom": len(located)}
+    drupal = [n for n in nodes if _is_drupal(n)]
+    # `unknown` only on boundary stubs whose realm nothing derivable gives.
+    assert [n["id"] for n in drupal if n.get("realm") == "unknown" and not n.get("boundary")] == []
+    # Every boundary extension the registry knows carries its facts; the other
+    # two are the owners `web/sites/*.services.yml` imply (`default`,
+    # `development`), which no info file declares.
+    known = p2b["registry"].extension_info
+    extensions = [n for n in drupal if n.get("boundary") and n["type"] == "drupal_extension"]
+    assert len(extensions) == 194
+    assert sorted(n["label"] for n in extensions if n["label"] not in known) \
+        == ["default", "development"]
+    assert [n["id"] for n in extensions if n["label"] in known
+            and not (n.get("extension_type") and n.get("extension_path")
+                     and n["realm"] in ("core", "contrib"))] == []
+
+
+def test_p2b_invocations(p2b):
+    edges = [e for e in p2b["extraction"]["edges"] if e["relation"] == "invokes_hook"]
+    # Two custom plugin managers' alter hooks, one kernel test's invokeAll,
+    # and three from a unit test's own `$this->alter([...])` helper, which the
+    # any-receiver rule (plan Task 5) reads as a module-handler alter.
+    assert len(edges) == 6
+    non_literal = [c for c in p2b["inventory"]["hook_candidates"] if c["kind"] == "non_literal"]
+    # All in custom tests/ trees (ReflectionMethod::invoke, the same helper).
+    assert len(non_literal) == 14
+    assert all("/tests/" in c["file"] for c in non_literal)
+
+
+def test_p2b_every_drupal_node_survives_the_build(p2b):
+    """Core's label dedup in `build()` must not fold one Drupal node into
+    another (the core module `toolbar` into the hook `toolbar`, a local task
+    into the menu link with its label)."""
+    from graphify.build import build
+
+    extraction = p2b["extraction"]
+    graph = build([extraction], directed=True, root=CORPUS)
+    drupal = {n["id"] for n in extraction["nodes"] if _is_drupal(n)}
+    assert sorted(drupal - set(graph.nodes)) == []
+    assert graph.nodes["drupal_extension_toolbar"]["type"] == "drupal_extension"
+    assert graph.nodes["drupal_hook_toolbar"]["type"] == "drupal_hook"
