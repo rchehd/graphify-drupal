@@ -132,18 +132,23 @@ def type_attributes(t: PluginType) -> dict[str, Any]:
     return attrs
 
 
-def registry_owner_of(registry: Registry, path: Path) -> str:
-    """The extension whose directory contains `path` (longest match); `core`
-    for `core/lib/**` (mirrors `_Builder.owner_of`, but usable at extraction
-    time -- the builder itself does not survive past `build_registry`)."""
+def _owner(extensions: dict[str, str], path: Path) -> str:
+    """The extension whose directory contains `path` (longest match). The
+    pseudo-extension `core` is the web root's `core/` directory, so
+    `core/lib/**` (and `core/core.*.yml`) is `core`'s: no extension lives
+    under `core/lib`, so no longer match can take it away."""
     target = path.as_posix()
-    if registry.web_root is not None and target.startswith(f"{registry.web_root}/core/lib/"):
-        return "core"
     best, best_len = "", -1
-    for ext, directory in registry.extensions.items():
+    for ext, directory in extensions.items():
         if target.startswith(directory + "/") and len(directory) > best_len:
             best, best_len = ext, len(directory)
     return best
+
+
+def registry_owner_of(registry: Registry, path: Path) -> str:
+    """`_Builder.owner_of`, usable at extraction time -- the builder itself
+    does not survive past `build_registry`."""
+    return _owner(registry.extensions, path)
 
 
 #: `registry.by_class_file()` built once per registry object and cached as an
@@ -426,14 +431,7 @@ class _Builder:
     # -- types ---------------------------------------------------------------
 
     def owner_of(self, path: Path) -> str:
-        target = path.as_posix()
-        if self.web_root is not None and target.startswith((self.web_root / "core" / "lib").as_posix() + "/"):
-            return "core"
-        best, best_len = "", -1
-        for ext, directory in self.walk.extensions.items():
-            if target.startswith(directory + "/") and len(directory) > best_len:
-                best, best_len = ext, len(directory)
-        return best
+        return _owner(self.walk.extensions, path)
 
     def add_type(self, plugin_type: str, path: Path, cls: PhpClass, owner: str, service: str) -> None:
         if plugin_type in self.types:
@@ -690,8 +688,15 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
     pipeline) keeps the walk out of what the user excluded; without it every
     file under the web root counts. The walk runs inside `registry_walk()`, so
     the boundary trees `detect()` prunes are read here.
+
+    The root is resolved, as `detect()` resolves it: a checkout scanned through
+    a symlink gets the same paths `detect()` hands the extractors, so owners
+    and `src/Hook/` matches agree (final review minor 9).
     """
-    scan_root = Path(scan_root).absolute()
+    try:
+        scan_root = Path(scan_root).resolve()
+    except (OSError, RuntimeError):
+        scan_root = Path(scan_root).absolute()
     web_root = find_web_root(scan_root)
     base = web_root if web_root is not None else scan_root
     with registry_walk():
@@ -1104,7 +1109,11 @@ def prepare_run(
     `force_miss()` set, kept in process and in the file until
     `clear_force_miss()` is called after a completed extraction.
     """
-    root = Path(root)
+    try:
+        # As `detect()` does: a symlinked checkout is scanned at its real path.
+        root = Path(root).resolve()
+    except (OSError, RuntimeError):
+        root = Path(root)
     if not _looks_like_drupal(root):
         _drop_temp_registry()
         os.environ.pop(ENV_VAR, None)

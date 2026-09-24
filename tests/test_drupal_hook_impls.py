@@ -693,3 +693,30 @@ def test_the_seam_fails_loudly_when_core_id_helpers_move(monkeypatch, attr):
     monkeypatch.delattr(base, attr, raising=True)
     with pytest.raises(DrupalSeamError, match=rf"graphify\.extractors\.base\.{attr}"):
         _patch_extract(core)
+
+
+def test_a_symlinked_checkout_matches_detects_resolved_paths(tmp_path, _isolated_discovery_state):
+    """Final review minor 9: scanned through a symlink, `detect()` hands out
+    resolved paths; the registry must name the same ones, or `src/Hook`
+    files and owners stop matching."""
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.discovery import current_registry, registry_owner_of
+    from graphify.drupal.hooks import is_hook_class_file
+
+    real = _hooks_site(tmp_path / "real")
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    found = detect.detect(link, cache_root=tmp_path / "out")
+    detected = [Path(p) for p in found["files"]["code"]]
+    hook_file = next(p for p in detected if p.name == "FooHooks.php")
+    module = next(p for p in detected if p.name == "foo.module")
+
+    registry = current_registry()
+    assert registry is not None
+    assert is_hook_class_file(hook_file)
+    assert registry_owner_of(registry, hook_file) == "foo"
+    assert registry_owner_of(registry, module) == "foo"
+    impls = extract_hook_implementations(module, _core_php(module))
+    assert any(n["type"] == "drupal_hook_impl" for n in impls["nodes"])
