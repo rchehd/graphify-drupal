@@ -258,3 +258,113 @@ Corpus tests (FormsRemote):
   graph.json and re-materialised only when a file referencing it is
   re-extracted, so a boundary change alone (a composer update) leaves its old
   facts in place until then.
+
+## 10. Measured and the closing real run
+
+On `/home/user/Projects/FormsRemote`, 2026-09-24 (plan Task 7; the corpus
+acceptance tests are `tests/test_drupal_corpus.py::test_p2b_*`, run through
+the seam's `detect()` so the boundary is pruned as in a real run).
+
+### 10.1 Acceptance (§8)
+
+| Criterion | Measured |
+|---|---|
+| 1. realm | core for every directory of `web/core`, vendor for `vendor/**`, custom for `web/modules/custom`, `web/themes/custom`, `config`, `web/sites`; contrib for all 95 composer-installed contrib packages (93 modules, 2 themes; the lock has no contrib profile or recipe), re-derived from `composer.json`/`.lock` in the test. `tests/` excluded, as throughout this spec: `package_manager`'s fixtures under core hold composer projects of their own (`fake_site/` with a `composer.json` and lock), whose nearest-project answer is custom/vendor, not core |
+| pruned boundary (§4.2) | `boundary: {core 1, contrib 101, vendor 1, files 1}`, reasons `composer 102, vendor_dir 1, site_files 1`; no detected file outside custom |
+| 2. hook registry | 435 declarations, 51 with a variable pattern — as §2 |
+| 3. custom hooks | 31 `#[Hook(` (text scan, `tests/` excluded) and 23 procedural `<ext>_<declared hook>`; every one has its own `hook_implemented_by` edge at its line or is a candidate at its line. 19 attributes and all 23 procedural functions are implementations (42) |
+| 4. `hook_implemented_by` | 42 edges, every source and target in the graph; 39 `drupal_hook_impl` nodes (one per module and hook: 17 attribute, 22 procedural) |
+| 5. `prepare_run` | 1.9 s (three runs at load ≈ 2.1, 14 cores) — registry with 435 hooks, 1,581 services, 395 extensions |
+
+`hook_candidates`: 41 — `variable` 24 (`form_*_alter`, `preprocess_*`,
+`*_access`, `*_presave`, `*_insert`, `*_update`, `*_view`, `*_predelete`,
+`theme_suggestions_*_alter`), `undeclared` 3 (`eca_custom`'s
+`action_info_alter`, `eca_condition_info_alter`, `eca_event_info_alter` —
+plugin-info alters no `*.api.php` declares), `non_literal` 14, `misplaced` 0.
+
+### 10.2 The closing real run
+
+`uv run --frozen graphify extract /home/user/Projects/FormsRemote --code-only
+--out <scratch>/p2b-close`, twice, then once with `--no-gitignore` into
+another scratch dir; after the dedup fix (§10.3).
+
+| | full | unchanged rerun | `--no-gitignore` |
+|---|---|---|---|
+| wall time | 10.4 s | 6.0 s | 10.5 s |
+| code files | 1,144 | 2 re-extracted | 1,155 |
+| nodes / edges | 4,811 / 10,330 | identical | 4,826 / 10,344 |
+| `graph.json` | 7.4 MB | | 7.4 MB |
+
+- Second run: `incremental summary: 1142 files cached/unchanged, 2
+  re-extracted, 0 deleted` (P2a: about 52). The two are core's own re-queues,
+  never stamped: `webform_integrations_logs.links.action.yml` (empty, zero
+  nodes) and `docker/mssql/seed.sql` (no `tree_sitter_sql`). The shadowed
+  config copies (§6.1) are gone.
+- `--no-gitignore`: 286,749 nodes / 10 min 43 s before P2b; now 11 more
+  files, all custom (`web/sites/default/settings.*.php`, `.ddev/*.php`,
+  `.claude/*.json`, a test fixture), and the same boundary.
+- Node count: 4,811 against 4,563 + 71 hook nodes = 4,634, +3.8 %, inside the
+  20 % bound. The rest is core's PHP nodes for the `.module` family, now code,
+  and the 12 Drupal nodes core's dedup used to fold (§10.3).
+- No node's `source_file` outside custom: all 1,092 located files are custom.
+- `realm` over the 1,320 Drupal nodes: custom 990, contrib 148, core 111,
+  unknown 71. The unknown ones are all boundary stubs: route 27, library 15,
+  permission 7, config 4 (§4.3: `boundary: true` only), and 22 more against
+  the target of 0:
+  - `drupal_hook` 6 — hooks no `*.api.php` declares: `webform_submission_insert`
+    (a literal `invokeAll` of an `ENTITY_TYPE_insert` instance),
+    `system_type_info_alter` and `webform_integration_type_info_alter` (two
+    custom plugin managers' `alter_hook`), and `tiny_alter`, `small_alter`,
+    `big_alter` (see §10.4);
+  - `drupal_service` 6 — four decorator `*.inner` ids, which no services file
+    declares, and `logger.channel_base`, `default_plugin_manager`, abstract
+    parents the services index skips (it skips `abstract: true` and aliases);
+  - `drupal_menu_link` 5 and `drupal_local_task` 1 — core/contrib links named
+    as a `parent`; the registry indexes no links.
+- Hook nodes: `drupal_hook` 32 (all boundary stubs; custom code ships no
+  `*.api.php`, so `declares_hook` 0), `drupal_hook_impl` 39; edges
+  `implements_hook` 39 (42 emitted, folded to one per ordered pair),
+  `hook_implemented_by` 42, `invokes_hook` 6.
+- Boundary nodes: 332 — extension 194 (192 with `extension_type` and
+  `extension_path`; `default` and `development` are owners
+  `web/sites/*.services.yml` imply), service 43, hook 32, route 27,
+  library 15, permission 7, menu link 5, config 4, plugin type 4, local
+  task 1. `--no-gitignore`: 333 (one more config).
+- Nothing written into the project: `git -C /home/user/Projects/FormsRemote
+  status --porcelain` is empty, and the project's pre-existing
+  `graphify-out/` (from a run before the Task 4 `cache_root` fix) has the same
+  mtimes, file for file, before and after all runs and the corpus tests.
+
+### 10.3 Defect found and fixed: core's dedup merged Drupal nodes
+
+The first closing run reported `Deduplicated 12 node(s) (4 exact, 8 fuzzy)`:
+core's `deduplicate_entities` unifies `concept` nodes across files by label,
+and boundary stubs are `concept`. P2b's hook stubs added a collision — the
+core module `toolbar`'s extension stub was merged into the hook stub `toolbar`,
+so `installs_extension` and `config_depends_on` pointed at a hook — on top of
+11 merges since P1 (the local task `domain.admin` into the menu link
+`domain.admin`; 8 route and 2 menu-link stubs with near-identical labels, such
+as `entity.webform_integrations_log.canonical`/`.collection`/`.edit_form`,
+fuzzily into one another). A wrapper
+on `dedup._is_code` now keys every `drupal_*` node by id, as core keys code
+symbols (`fix(drupal): key Drupal nodes by id in core's entity dedup`,
+`tests/test_drupal_dedup.py`, `test_p2b_every_drupal_node_survives_the_build`).
+The graph gained those 12 nodes and 63 edges.
+
+### 10.4 Findings left open
+
+- **`invoke`/`alter` on any receiver** (plan Task 5's rule) reads calls that
+  are not the module handler's. All 14 `non_literal` candidates sit in custom
+  `tests/` trees — `ReflectionMethod::invoke($object, $arg)` and a unit test's
+  own `$this->alter([8, 22])` helper — and three `invokes_hook` edges (to
+  `tiny_alter`, `small_alter`, `big_alter`, with their stubs) come from that
+  helper's `$this->alter(['tiny', 'small', 'big'])`. Restricting the two
+  generic names to a module-handler or theme-manager receiver, or leaving
+  `tests/` out of the hook scan, is a ruling for the next phase.
+- **Nearest-project realm inside a boundary tree**: a composer project nested
+  in an install dir (core's `package_manager` fixtures) answers for itself.
+  Harmless while that tree is pruned; relevant only with `drupal.include`.
+- **Abstract services** have no boundary facts (above).
+- **Known, not ours:** core re-extracts the empty `links.action.yml` and
+  `seed.sql` on every run (never stamped); core's clustering raises
+  `ZeroDivisionError` on an edgeless graph (upstream).

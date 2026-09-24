@@ -204,9 +204,9 @@ working graph.
 | **P1** | Module-owned YAML | services, routing, permissions, libraries, links, breakpoints — 1,383 files on the reference corpus |
 | **P1b** | Configuration | config entities, **config_split**, domains, profiles, recipes, config `dependencies:`, `core.extension.yml` — 629 files |
 | **P2a** | Plugin discovery | plugin-type registry learned from the site's managers at the start of every `detect`, YAML-discovered plugins of learned types, `plugin_of_type` for P1's links and breakpoints, the unrecognised-family inventory and its `GRAPH_REPORT.md` section, `watch` rebuilds on Drupal YAML — see the P2a spec |
-| **P2b** | Hook discovery | hooks from `*.api.php` and invocation sites, `alter_hook` as a hook node |
+| **P2b** | Hooks and the boundary | the boundary: `realm` from composer, core/contrib/vendor trees not walked (`drupal.include` opt-in), boundary nodes with registry facts; the hook registry from every `*.api.php`; `drupal_hook`, `drupal_hook_impl`, `declares_hook`, `implements_hook`, `hook_implemented_by`, `invokes_hook` (incl. `alter_hook`); `.module`/`.install`/`.theme`/`.profile`/`<ext>.<group>.inc` become PHP; P2a's two carried fixes — see the P2b spec |
 | **P3** | Container producer | runner detection, `drush ev`, the artifact, merge as a distinct step with a divergence log |
-| **P4** | PHP semantics | annotations and attributes, plugin instances against learned types, procedural and `#[Hook]` implementations, forms, events, entity-type handlers, `\Drupal::service()` |
+| **P4** | PHP semantics | annotations and attributes, plugin instances against learned types, forms (and `form_FORM_ID_alter` binding), events, entity-type handlers (and `ENTITY_TYPE_*` hooks), `\Drupal::service()` |
 | **P5** | Presentation | theme hooks, templates, preprocess, override chain, SDC, library attachment |
 | **P6** | Heavy configuration | fields and bundles, `references_bundle`, displays, blocks, Views (trimmed), Layout Builder defaults, migrations |
 | **P7** | Operations | watcher by file type, frozen artifact and `graph.audit.json`, generated `realm`/`layer` slices |
@@ -232,6 +232,21 @@ working graph.
   the LLM `needs_update` flag — a P1/P1b gap. Once a changed services file can
   change the plugin registry it could no longer wait for P7; P2a wraps
   `watch._batch_triggers_rebuild` and `watch._has_non_code` (P2a spec §5.6).
+- **Procedural and `#[Hook]` implementations moved from P4 to P2b.** Hook
+  implementations are literal names checked against a registry, not PHP
+  semantics: `<ext>_<hook>()` needs only the extension list and the hook list
+  (vocabulary §5.5), and `#[Hook('x')]` is an attribute read. What stays in
+  P4–P6 is the binding of variable-segment hooks, which needs the form,
+  theme-hook and entity inventories; until then those are inventory
+  candidates. Making `.module` and its family PHP (core treats them as
+  unknown files) is part of the same move.
+- **The boundary model (P2b).** Measured with `--no-gitignore`, core and
+  contrib are about 99 % of a site's nodes (286,749 against 4,563) and 10 min
+  of extraction. The graph is now the site's own code plus a boundary: the
+  core/contrib/vendor things it references, as typed stub nodes carrying
+  registry facts, never their internals. Realm comes from `composer.lock`
+  first; the registries still read the boundary, so knowledge of core is not
+  lost, only its bulk.
 - **P3 before P4.** The container is the largest measured gain — 4 of 5
   `shortest_path` misses in the benchmark's G02 — and it is independent of the
   PHP work, because container edges reference service ids and PHP class nodes

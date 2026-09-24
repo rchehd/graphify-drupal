@@ -22,7 +22,7 @@ triples for no analytic gain. They are one attribute on every node:
 
 | Attribute | Values | Derivation |
 |---|---|---|
-| `realm` | `custom` \| `contrib` \| `core` | from path, via configurable rules (§1.2) |
+| `realm` | `custom` \| `contrib` \| `core` \| `vendor` | from composer, else from path via configurable rules (§1.2) |
 | `layer` | `extension` \| `di` \| `routing` \| `plugin` \| `hook` \| `model` \| `block` \| `presentation` \| `config` \| `infra` | from node type, fixed |
 
 `realm` is **inherited**: a service declared by a contrib module is `contrib`.
@@ -49,8 +49,34 @@ drupal.realm.contrib  = */modules/contrib/*, */themes/contrib/*, */profiles/cont
 drupal.realm.custom   = */modules/custom/*, */themes/custom/*, */profiles/*/modules/*, */profiles/*/themes/*
 ```
 
-First match wins, in the order core → contrib → custom. Anything unmatched is
-`unknown` and reported, never silently defaulted.
+First match wins, in the order core → contrib → custom.
+
+**From P2b, composer decides first** (P2b spec §4.1, `boundary.realm_of`), in
+this order:
+
+1. `.graphifyrc` `drupal.realm.<realm>` patterns, when the project sets any,
+   still win.
+2. The nearest *project root* — a directory holding both `composer.json` and
+   `composer.lock`. A `composer.json` with no lock beside it is a package's
+   own manifest (85 of 94 contrib modules on the reference corpus ship one)
+   and is walked past. Every package in the lock gets an install dir from
+   `extra.installer-paths` (`type:<type>` or the package name; `{$name}`,
+   `{$vendor}` and the package's own `extra.installer-name` substituted), or
+   `<vendor-dir>/<vendor>/<name>`. `drupal-core` → core; `drupal-module`,
+   `-theme`, `-profile`, `-recipe`, `-drush`, `-library`, `npm-asset`,
+   `bower-asset` → contrib; `drupal-custom-*` → custom; any other type, and the
+   vendor dir itself → vendor. Longest install dir wins; a path inside the
+   project but under no install dir is custom.
+3. No project root (or an unreadable `composer.json`/`composer.lock`, recorded
+   in the inventory as `composer_unreadable`): the web root's `core/` as a
+   whole is core, then the path rules above, then a `vendor/` beside the web
+   root is vendor.
+4. Everything else is custom.
+
+`realm_of` never answers `unknown`. A node still carries `realm: unknown` when
+it has no path to ask about: a boundary stub (§2.1) the registry knows nothing
+of — a route, library or permission named only by an edge, or a hook no
+`*.api.php` declares.
 
 ### 1.3 `file_type` must stay inside the core schema
 
@@ -96,10 +122,11 @@ Every node carries:
 | `id`, `label`, `source_file`, `source_location` | graphify core schema |
 | `file_type` | `code`, or `concept` for external — see §1.3 |
 | `type` | the Drupal taxonomy, e.g. `drupal_service` |
-| `realm` | `custom` \| `contrib` \| `core` \| `unknown` |
+| `realm` | `custom` \| `contrib` \| `core` \| `vendor` \| `unknown` (§1.2) |
 | `layer` | see §1.1 |
 | `_origin` | `static_yaml` \| `static_php` \| `learned` \| `container` |
 | `external` | `true` when the entity has no file in the repository |
+| `boundary` | `true` on a node materialised for something the site's code references but no scanned file declares (§2.1); absent otherwise |
 
 Whether an extension is installed is not a node attribute: it is the
 `installs_extension` edge from the `core.extension` config node (P1b deviation 4
@@ -109,6 +136,41 @@ incremental run, while the edge is re-emitted with `core.extension.yml`).
 Every edge carries `source`, `target`, `relation`, `confidence`
 (`EXTRACTED`/`INFERRED`/`AMBIGUOUS`), `source_file`, `source_location`, and
 `_origin`. Relation-specific attributes are named per entry below.
+
+### 2.1 The boundary
+
+From P2b a site's graph is its own code plus a **boundary** (P2b spec §4):
+core, contrib and vendor code appear only as the named things the site's code
+touches, never as their internals.
+
+- **Boundary trees are not walked.** In a Drupal run, `detect()` never descends
+  an install dir of a core, contrib or vendor realm, nor the vendor dir, whether
+  committed or gitignored; `--no-gitignore` no longer pulls core in. Each site's
+  public files directory (`sites/<site>/files`) is pruned too (reason
+  `site_files`; it is not a realm, and no opt-in brings it back). The registry
+  walks (plugin types, hooks, services, extensions) still read the boundary.
+  Non-Drupal runs are not affected.
+- **Opt-in:** `.graphifyrc` `drupal.include = contrib` (or `core, contrib`,
+  `vendor`) keeps the named realms in the graph.
+- **Boundary nodes** are the resolver's materialised stubs, with
+  `boundary: true`, `external: true`, and what the registry knows:
+
+| Stub type | Facts |
+|---|---|
+| `drupal_extension` | `extension_type` (`module`/`theme`/`profile`), `extension_path` (relative to the scan root when inside it, else absolute — not `path`, which core folds into `source_file`), `realm` |
+| `drupal_service` | `class_name`, `provider` (the `*.services.yml` stem), `realm` of the provider |
+| `drupal_plugin_type` | every §3.4 attribute, `realm` of the manager class file |
+| `drupal_hook` | `provider`, `declared_file`, `line`, `pattern` (variable hooks only), `realm` of the `*.api.php` |
+| `drupal_menu_link` and the other P1 link types | `plugin_of_type` when the family is a learned type's `yaml_name` |
+| route, library, permission, config | `boundary: true` only (reading core's YAML for them is later) |
+
+A stub the registry does not know keeps `realm: unknown`. Facts are refreshed
+only when a file referencing the stub is re-extracted: a composer update alone
+leaves the old facts until then (P2b spec §9).
+
+The inventory's summary counts the pruned directories —
+`boundary: {core, contrib, vendor, files}` — and `boundary_reasons`
+(`composer`, `path_rule`, `vendor_dir`, `site_files`).
 
 ---
 
@@ -190,7 +252,7 @@ emitted by the extraction of the manager's class file, so `source_file`/
 | `subdir` | `Plugin/Block`, from `parent::__construct`'s first argument when a literal |
 | `interface`, `annotation_class`, `attribute_class` | FQCNs from `parent::__construct`, when literal or `::class` |
 | `yaml_name` | the `YamlDiscovery`/`YamlDiscoveryDecorator` name, when any |
-| `alter_hook` | the `alterInfo('x')` literal, when any (a hook node comes in P2b) |
+| `alter_hook` | the `alterInfo('x')` literal, when any (P2b: an `invokes_hook` edge from the type to `<x>_alter`, §4.5) |
 | `deferred_to` | `P5` for SDC, `P6` for migrations; a deferred type is never `dynamic` |
 
 Empty attributes are omitted.
@@ -212,6 +274,18 @@ types and gain a `plugin_of_type` edge instead.
 | `drupal_hook_impl` | `drupal:hook_impl:<module>:<hook>` | procedural functions, `#[Hook]` |
 | `drupal_form` | `drupal:form:<form_id>` | `getFormId()`, `_form:` in routes |
 | `drupal_theme_hook` | `drupal:theme_hook:<hook>` | `hook_theme()` |
+
+**Emitted from P2b** (P2b spec §5): `drupal_hook` and `drupal_hook_impl`.
+`drupal_hook` carries `hook_name`, `provider`, `pattern` (each UPPERCASE
+segment run as `*`, e.g. `form_*_alter`, only for variable hooks); it comes
+from an in-graph `*.api.php` stub, else it is a boundary stub (§2.1).
+`drupal_hook_impl` carries `module`, `hook_name`, `via`
+(`attribute`/`procedural`), `function` or `class_name` + `method`, and
+`order` (the verbatim source text of `#[Hook(order: …)]`, never evaluated).
+There is one `drupal_hook_impl` node per (module, hook), however many
+functions or methods implement it; each implementation has its own
+`hook_implemented_by` edge. `drupal_form` and `drupal_theme_hook` stay for
+P4–P5.
 
 `drupal_form` and `drupal_theme_hook` sit in this layer because their reason for
 existing is to give `hook_form_FORM_ID_alter` and `hook_preprocess_HOOK` a
@@ -355,6 +429,41 @@ nodes can be bound: `plugin_implemented_by` and `derives_plugins` come in P4
 | `preprocesses` | hook_impl → theme_hook | `hook_preprocess_HOOK` |
 | `suggests_template` | hook_impl → theme_hook | `hook_theme_suggestions_*_alter`; always `AMBIGUOUS` |
 | `overrides_template` | template → template | filename specificity chain, e.g. `node--article--teaser` over `node` |
+
+P2b emits the first four:
+
+- `declares_hook` from the extension owning an in-graph `*.api.php` stub.
+- `implements_hook` (attributes `owner`, `target_name`) only for a literal,
+  declared hook name (§5.6): `#[Hook('x')]` (on a method, or on a class with
+  `method:` or `__invoke`) in the extension's `src/Hook/**/*.php` — where
+  Drupal's `HookCollectorPass` looks — with `module:` as the owner when given;
+  or a procedural `<ext>_<hook>()` in `<ext>.module`, `.install`, `.theme`,
+  `.profile` or `<ext>.<group>.inc` beside `<ext>.info.yml`. `order` is a
+  `drupal_hook_impl` attribute, not an edge attribute. An extension that
+  implements a hook it declares itself gets no `implements_hook`: that pair
+  already carries `declares_hook` (§1.4). `<ext>_update_N` and
+  `<ext>_post_update_*` are update functions, never hooks.
+- `hook_implemented_by` to the function/method node id core's PHP extractor
+  emits for that file, computed with core's id helpers and emitted only when
+  core emitted exactly that id.
+- `invokes_hook` from the enclosing function/method to the hook named by a
+  string literal of `invokeAll`, `invoke`, `invokeAllWith`, `alter`,
+  `hasImplementations` or a `*Deprecated` form, on any receiver; `alter('x')`
+  targets `x_alter`, `alter(['a', 'b'])` each. A hook no `*.api.php`
+  declares is still the target (a boundary stub) and the edge carries
+  `undeclared: true`. From a `drupal_plugin_type` with `alter_hook` to
+  `<alter_hook>_alter`. A non-literal name is not `AMBIGUOUS`: it is no edge,
+  and a `non_literal` inventory candidate.
+
+Everything that looks like a hook but is not a literal, declared name goes to
+the inventory's `hook_candidates` (kinds `variable` with the `pattern` it
+matched, `undeclared`, `misplaced` — `#[Hook]` outside `src/Hook/` —, and
+`non_literal`), never to an edge. A procedural `<ext>_<rest>()` naming no
+declared hook is a candidate only when it claims to be one (an
+`Implements hook_…` docblock, or `<rest>` starting with `<group>_` in
+`<ext>.<group>.inc`); any other `<ext>_*` is a helper. Variable-segment
+binding (`alters_form`, `preprocesses`, `suggests_template`, `ENTITY_TYPE_*`)
+waits for the form, theme-hook and entity inventories (P4–P6, §5.5).
 
 ### 4.6 Data model
 
