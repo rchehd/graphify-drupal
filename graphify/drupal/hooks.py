@@ -490,6 +490,9 @@ _ALTER_TYPE_POS = {
     "alter": 0,
     "alterDeprecated": 1,
 }
+# `_invocation_hook_names` reads the alter table first: a name in both would
+# silently lose its hook-name reading.
+assert not set(_INVOCATION_HOOK_POS) & set(_ALTER_TYPE_POS)
 _INVOCATION_METHODS = frozenset(_INVOCATION_HOOK_POS) | frozenset(_ALTER_TYPE_POS)
 #: Names other APIs share (`ReflectionMethod::invoke`, a class's own `alter()`):
 #: a call counts only on a receiver that is explicitly a module or theme
@@ -504,7 +507,7 @@ _HANDLER_EXPRESSIONS = frozenset({
     "Drupal::theme()",
 })
 _HANDLER_NAMES = frozenset({"modulehandler", "thememanager"})
-_RECEIVER_NAME = re.compile(r"(?:^\$|->|::\$)(\w+)$")
+_RECEIVER_NAME = re.compile(r"(?:^\$|->|::\$?)(\w+)(?:\(\))?$")
 _INVOCATION_MARKERS = (b"->invoke", b"->alter", b"->hasImplementations")
 
 
@@ -520,9 +523,10 @@ def has_hook_invocation_marker(path: Path) -> bool:
 
 def _is_handler_receiver(receiver: str) -> bool:
     """`\\Drupal::moduleHandler()`, `\\Drupal::service('module_handler')`,
-    `\\Drupal::service('theme.manager')`, `\\Drupal::theme()`, or a variable
-    or property named `moduleHandler`/`themeManager` (case-insensitive,
-    ignoring `_`: `$this->moduleHandler`, `$module_handler`)."""
+    `\\Drupal::service('theme.manager')`, `\\Drupal::theme()`, or a variable,
+    property or zero-argument method named `moduleHandler`/`themeManager`
+    (case-insensitive, ignoring `_`: `$this->moduleHandler`, `$module_handler`,
+    `$this?->moduleHandler`, `self::$moduleHandler`, `$this->moduleHandler()`)."""
     text = re.sub(r"\s+", "", receiver).lstrip("\\")
     if text in _HANDLER_EXPRESSIONS:
         return True
@@ -568,21 +572,28 @@ def _invocation_raw_name(call: PhpCall) -> str:
     return call.args[pos].raw
 
 
-def _unknown_receiver_candidate(call: PhpCall, path: Path, registry: Any) -> dict:
+def _invocation_site_candidate(kind: str, call: PhpCall, path: Path, registry: Any) -> dict:
+    """One invocation candidate; every kind carries the same fields."""
     from graphify.drupal.discovery import registry_owner_of
 
     module = registry_owner_of(registry, Path(path).absolute()) if registry is not None else ""
-    return {"kind": "unknown_receiver", "module": module or "", "name": _invocation_raw_name(call),
+    return {"kind": kind, "module": module or "", "name": _invocation_raw_name(call),
             "method": call.name, "file": str(path), "line": call.line}
 
 
 def _invocation_candidate(call: PhpCall, path: Path, registry: Any) -> dict | None:
-    """The candidate `call` is instead of an edge, or None when it is an edge."""
+    """The candidate `call` is instead of an edge, or None when it is an edge:
+    `unknown_receiver`, `non_literal`, or `top_level` for a call outside any
+    function or method (there is no source node for the edge)."""
     if _unknown_receiver(call):
-        return _unknown_receiver_candidate(call, path, registry)
-    if _invocation_hook_names(call) is None:
-        return _candidate("non_literal", "", _invocation_raw_name(call), path, call.line)
-    return None
+        kind = "unknown_receiver"
+    elif _invocation_hook_names(call) is None:
+        kind = "non_literal"
+    elif not call.function and not (call.class_name and call.method):
+        kind = "top_level"
+    else:
+        return None
+    return _invocation_site_candidate(kind, call, path, registry)
 
 
 def _invocation_candidates(path: Path, registry: Any) -> list[dict]:
@@ -628,10 +639,8 @@ def _extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
         names = _invocation_hook_names(call) or []
         if call.function:
             source = _make_id(stem, call.function)
-        elif call.class_name and call.method:
+        else:   # a method: `_invocation_candidate` took every top-level call
             source = _make_id(_make_id(stem, call.class_name), call.method)
-        else:
-            continue
         if source not in core_ids:
             continue
         for name in names:

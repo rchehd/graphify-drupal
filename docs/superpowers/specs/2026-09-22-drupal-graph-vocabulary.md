@@ -453,20 +453,25 @@ P2b emits the first four:
   share (`ReflectionMethod::invoke`), count only on an explicit module- or
   theme-handler receiver (`\Drupal::moduleHandler()`,
   `\Drupal::service('module_handler')`, `\Drupal::service('theme.manager')`,
-  `\Drupal::theme()`, or a variable/property named `moduleHandler` or
-  `themeManager`); on any other receiver the call is an `unknown_receiver`
-  candidate. The other names count on any receiver. A hook no `*.api.php`
+  `\Drupal::theme()`, or a variable, property or zero-argument method named
+  `moduleHandler` or `themeManager`, case-insensitive and ignoring `_` —
+  `$module_handler`, `$this?->moduleHandler`, `self::$moduleHandler`,
+  `$this->moduleHandler()`); on any other receiver the call is an
+  `unknown_receiver` candidate. `?->` calls count like `->` calls. The other names count on any receiver. A hook no `*.api.php`
   declares is still the target: a boundary stub with `missing: true` and no
   `provider`/`declared_file`, which is what says it is undeclared (the edge
   carries no such flag: it would go stale on an incremental run that re-reads
   the declaring file but not the invoking one). From a `drupal_plugin_type` with `alter_hook` to
-  `<alter_hook>_alter`. A non-literal name is not `AMBIGUOUS`: it is no edge,
-  and a `non_literal` inventory candidate.
+  `<alter_hook>_alter`. A non-literal name (an interpolated string such as
+  `"{$type}_presave"` included) is not `AMBIGUOUS`: it is no edge, and a
+  `non_literal` inventory candidate. A call outside any function or method has
+  no source node: a `top_level` candidate. Every invocation candidate carries
+  `module`, `name` (the argument's source text), `method`, `file` and `line`.
 
 Everything that looks like a hook but is not a literal, declared name goes to
 the inventory's `hook_candidates` (kinds `variable` with the `pattern` it
 matched, `undeclared`, `misplaced` — `#[Hook]` outside `src/Hook/` —,
-`non_literal` and `unknown_receiver`), never to an edge. A procedural
+`non_literal`, `unknown_receiver` and `top_level`), never to an edge. A procedural
 `<ext>_<rest>()` naming no declared hook is a candidate only when it claims to be one (an
 `Implements hook_…` docblock, or `<rest>` starting with `<group>_` in
 `<ext>.<group>.inc`); any other `<ext>_*` is a helper. Variable-segment

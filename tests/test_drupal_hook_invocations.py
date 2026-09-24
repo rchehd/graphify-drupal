@@ -140,7 +140,8 @@ def test_invocation_edges_and_non_literal_candidate(tmp_path, _isolated_discover
     assert not any("undeclared" in e for e in result["edges"])
 
     assert result["hook_candidates"] == [
-        {"kind": "non_literal", "module": "", "name": "$name", "file": str(path), "line": 14},
+        {"kind": "non_literal", "module": "foo", "name": "$name", "method": "invokeAll",
+         "file": str(path), "line": 14},
     ]
 
 
@@ -197,7 +198,8 @@ def test_edges_only_target_a_source_core_actually_emitted(tmp_path, _isolated_di
     assert starved["edges"] == []
     # The non-literal candidate does not depend on the source resolving.
     assert starved["hook_candidates"] == [
-        {"kind": "non_literal", "module": "", "name": "$name", "file": str(path), "line": 14},
+        {"kind": "non_literal", "module": "foo", "name": "$name", "method": "invokeAll",
+         "file": str(path), "line": 14},
     ]
 
 
@@ -212,7 +214,7 @@ def test_the_inventory_lists_the_non_literal_invocation_candidate(tmp_path, _iso
 
     inventory = build_inventory(registry, detected, root)
     assert inventory["hook_candidates"] == [
-        {"kind": "non_literal", "module": "", "name": "$name",
+        {"kind": "non_literal", "module": "foo", "name": "$name", "method": "invokeAll",
          "file": f"{FOO}/src/Invoker.php", "line": 14},
     ]
 
@@ -478,3 +480,83 @@ def test_dispatch_does_not_read_php_files_for_the_marker(tmp_path, monkeypatch, 
     monkeypatch.undo()
     result = handler(path)
     assert any(e["relation"] == "invokes_hook" for e in result["edges"])
+
+
+# -- receivers reached through a method or `?->`; uniform candidates (final review minors 1, 4)
+
+METHOD_RECEIVERS_PHP = """<?php
+
+namespace Drupal\\foo;
+
+class MethodReceivers {
+
+  public function run($name) {
+    $this->moduleHandler()->alter('via_method', $d);
+    $this->getThemeManager()->alter('not_a_handler', $d);
+    $this?->moduleHandler?->invoke('m', 'nullsafe_invoke');
+    $handler?->invokeAll('nullsafe_all');
+    self::$moduleHandler->alter('static_prop');
+    $this->moduleHandler->invokeAll($name);
+  }
+
+}
+"""
+
+TOP_LEVEL_PHP = """<?php
+
+\\Drupal::moduleHandler()->invokeAll('at_top');
+$handler->invokeAll($dynamic);
+
+function foo_helper() {
+  \\Drupal::moduleHandler()->invokeAll('in_function');
+}
+"""
+
+
+def test_method_and_nullsafe_receivers_count(tmp_path, _isolated_discovery_state):
+    install()
+    files = {
+        "web/core/core.api.php": CORE_API_PHP,
+        **_module("foo", "services: {}\n", {"src/MethodReceivers.php": METHOD_RECEIVERS_PHP}),
+    }
+    root = _site(tmp_path, files)
+    prepare_run(root)
+    path = root / FOO / "src/MethodReceivers.php"
+
+    result = extract_hook_invocations(path, _core_php(path))
+
+    assert sorted(e["target_name"] for e in result["edges"]) == [
+        "nullsafe_all", "nullsafe_invoke", "static_prop_alter", "via_method_alter"]
+    assert result["hook_candidates"] == [
+        {"kind": "unknown_receiver", "module": "foo", "name": "'not_a_handler'", "method": "alter",
+         "file": str(path), "line": 9},
+        {"kind": "non_literal", "module": "foo", "name": "$name", "method": "invokeAll",
+         "file": str(path), "line": 13},
+    ]
+
+
+def test_a_call_outside_any_function_is_a_top_level_candidate(tmp_path, _isolated_discovery_state):
+    install()
+    files = {
+        "web/core/core.api.php": CORE_API_PHP,
+        **_module("foo", "services: {}\n", {"foo.inc.php": TOP_LEVEL_PHP}),
+    }
+    root = _site(tmp_path, files)
+    prepare_run(root)
+    path = root / FOO / "foo.inc.php"
+
+    result = extract_hook_invocations(path, _core_php(path))
+
+    assert [e["target_name"] for e in result["edges"]] == ["in_function"]
+    assert result["hook_candidates"] == [
+        {"kind": "top_level", "module": "foo", "name": "'at_top'", "method": "invokeAll",
+         "file": str(path), "line": 3},
+        {"kind": "non_literal", "module": "foo", "name": "$dynamic", "method": "invokeAll",
+         "file": str(path), "line": 4},
+    ]
+
+
+def test_the_invocation_position_tables_are_disjoint():
+    import graphify.drupal.hooks as hooks
+
+    assert not set(hooks._INVOCATION_HOOK_POS) & set(hooks._ALTER_TYPE_POS)

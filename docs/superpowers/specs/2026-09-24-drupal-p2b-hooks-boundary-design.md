@@ -194,7 +194,9 @@ extractor (as P1b composes `settings.php`). `watch` sees them through
   - an invocation whose hook name is not a literal (`non_literal`, with file
     and line);
   - an `invoke`/`alter` call on a receiver that is not explicitly a module or
-    theme handler (`unknown_receiver`, with `method`; §10.4).
+    theme handler (`unknown_receiver`, with `method`; §10.4);
+  - an invocation outside any function or method (`top_level`).
+  Invocation candidates all carry `module`, `name`, `method`, `file`, `line`.
 
 ### 5.5 A changed hook set re-extracts implementers
 
@@ -373,9 +375,11 @@ The graph gained those 12 nodes and 63 edges (4,799 / 10,267 → 4,811 /
   `unknown_receiver` candidate (`module`, `name`, `method`, `file`, `line`).
   `invokeAll`, `invokeAllWith`, `hasImplementations` and the `*Deprecated`
   forms are Drupal's alone and count on any receiver (`fix(drupal): invoke/alter
-  are hook invocations only on a handler receiver`). A handler reached through
-  a method (`$this->moduleHandler()`) is outside the rule and becomes a
-  candidate.
+  are hook invocations only on a handler receiver`). After the final review the
+  rule also accepts a zero-argument method at the end of the receiver
+  (`$this->moduleHandler()`, `$this->themeManager()`), a static property
+  (`self::$moduleHandler`) and nullsafe calls (`$this?->moduleHandler?->invoke(…)`);
+  a getter under any other name (`$this->getModuleHandler()`) stays a candidate.
 - **Accepted as documented** (controller ruling): the unknown realms above,
   and the next two items.
 - **Nearest-project realm inside a boundary tree**: a composer project nested

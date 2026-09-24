@@ -361,7 +361,7 @@ class PhpCall:
 
 
 def read_php_calls(path: Path, names: "frozenset[str]") -> list[PhpCall]:
-    """Every `->name(...)` member call in `path` whose method name is in
+    """Every `->name(...)` (or `?->name(...)`) member call in `path` whose method name is in
     `names`, attributed to the nearest enclosing named function or method --
     a closure or arrow function nested inside one does not change the
     attribution (P2b spec §5.3). Never raises: bad input yields an empty
@@ -377,10 +377,16 @@ def read_php_calls(path: Path, names: "frozenset[str]") -> list[PhpCall]:
         return []
 
 
+_MEMBER_CALLS = ("member_call_expression", "nullsafe_member_call_expression")
+
+
 def _collect_calls(
     node: "tree_sitter.Node", names: "frozenset[str]",
     function: str, class_name: str, method: str, out: list[PhpCall],
 ) -> None:
+    # Closures and arrow functions are not matched below, so they fall through
+    # to the last branch and their calls stay attributed to the enclosing
+    # named function or method (spec §5.3).
     for child in node.named_children:
         if child.type == "function_definition":
             name = _text(child.child_by_field_name("name"))
@@ -400,7 +406,7 @@ def _collect_calls(
             if body is not None:
                 _collect_calls(body, names, "", class_name, name, out)
             continue
-        if child.type == "member_call_expression":
+        if child.type in _MEMBER_CALLS:
             name_node = child.child_by_field_name("name")
             call_name = _text(name_node)
             if call_name in names:
