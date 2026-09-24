@@ -318,7 +318,7 @@ def _attributes(decl: "tree_sitter.Node", namespace: str, uses: dict[str, str]) 
                 if not values:
                     continue
                 value = values[-1]
-                string = _string_value(value) if value.type in ("string", "encapsed_string") else None
+                string = _literal_string(value)
                 args.append(AttrArg(_text(arg_name), _text(value), string))
             found.append(PhpAttribute(resolve_name(_text(name_node), namespace, uses),
                                       attr.start_point[0] + 1, tuple(args)))
@@ -429,8 +429,9 @@ def _call_arg_from_value(value_node: "tree_sitter.Node | None") -> CallArg:
     if value_node is None:
         return CallArg("other", "")
     raw = _text(value_node)
-    if value_node.type in ("string", "encapsed_string"):
-        return CallArg("string", _string_value(value_node), raw=raw)
+    literal_value = _literal_string(value_node)
+    if literal_value is not None:
+        return CallArg("string", literal_value, raw=raw)
     if value_node.type == "array_creation_expression":
         items: list[str] = []
         literal = True
@@ -438,8 +439,9 @@ def _call_arg_from_value(value_node: "tree_sitter.Node | None") -> CallArg:
             value = element
             if element.type == "array_element_initializer":
                 value = element.named_children[-1] if element.named_children else None
-            if value is not None and value.type in ("string", "encapsed_string"):
-                items.append(_string_value(value))
+            item = _literal_string(value)
+            if item is not None:
+                items.append(item)
             else:
                 literal = False
                 break
@@ -574,8 +576,9 @@ def _arg_from_value(
 ) -> Arg:
     if value_node is None:
         return Arg("other", "")
-    if value_node.type in ("string", "encapsed_string"):
-        return Arg("string", _string_value(value_node))
+    literal_value = _literal_string(value_node)
+    if literal_value is not None:
+        return Arg("string", literal_value)
     if value_node.type == "class_constant_access_expression":
         children = [c for c in value_node.named_children]
         if len(children) == 2 and _text(children[1]) == "class":
@@ -584,19 +587,32 @@ def _arg_from_value(
     return Arg("other", "")
 
 
-def _string_value(node: "tree_sitter.Node") -> str:
+_STRING_TYPES = ("string", "encapsed_string")
+_LITERAL_PARTS = frozenset({"string_content", "escape_sequence"})
+
+
+def _literal_string(node: "tree_sitter.Node | None") -> str | None:
+    """The value of a plain PHP string literal, or None for anything else.
+
+    The one place every reader (call arguments, attribute arguments,
+    `alterInfo()`) decides what a literal is: a single- or double-quoted
+    string whose parts are all text or escapes. A double-quoted string with
+    an interpolated part (`"{$type}_presave"`, `"$x"`, `"${x}_y"`) names
+    nothing fixed, so it is not a literal; neither is a heredoc or nowdoc.
+    """
+    if node is None or node.type not in _STRING_TYPES:
+        return None
+    if any(child.type not in _LITERAL_PARTS for child in node.named_children):
+        return None
     parts: list[str] = []
-    for child in node.children:
-        if child.type == "string_content":
-            parts.append(_text(child))
-        elif child.type == "escape_sequence":
-            text = _text(child)
+    for child in node.named_children:
+        text = _text(child)
+        if child.type == "escape_sequence":
             if text == "\\\\":
-                parts.append("\\")
+                text = "\\"
             elif text == "\\'":
-                parts.append("'")
-            else:
-                parts.append(text)
+                text = "'"
+        parts.append(text)
     return "".join(parts)
 
 

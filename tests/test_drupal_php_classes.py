@@ -208,3 +208,67 @@ def test_pathologically_nested_source_returns_none_rather_than_raising(tmp_path)
         assert read_php_class(p) is None
     finally:
         sys.setrecursionlimit(saved)
+
+
+# -- interpolated strings are not literals (final review C1) -----------------------
+
+INTERPOLATED_CALLS = r"""<?php
+namespace Drupal\foo;
+class Calls {
+  public function run($x) {
+    $h->invokeAll("{$x}_y");
+    $h->invokeAll("$x");
+    $h->invokeAll("${x}_z");
+    $h->invokeAll(<<<EOT
+{$x}_here
+EOT);
+    $h->invokeAll("cron");
+    $h->invokeAll("a\\b");
+    $h->alter(["plain", "{$x}_form"]);
+  }
+}
+"""
+
+
+def test_an_interpolated_call_argument_is_not_a_string_literal(tmp_path):
+    from graphify.drupal.php_classes import read_php_calls
+
+    path = _write(tmp_path, INTERPOLATED_CALLS)
+    args = [c.args[0] for c in read_php_calls(path, frozenset({"invokeAll", "alter"}))]
+    assert [(a.kind, a.value) for a in args[:4]] == [("other", "")] * 4
+    assert [a.raw for a in args[:3]] == ['"{$x}_y"', '"$x"', '"${x}_z"']
+    assert (args[4].kind, args[4].value) == ("string", "cron")
+    assert (args[5].kind, args[5].value) == ("string", "a\\b")
+    assert (args[6].kind, args[6].items) == ("array", None)
+
+
+INTERPOLATED_ATTRIBUTES = r"""<?php
+namespace Drupal\foo\Hook;
+use Drupal\Core\Hook\Attribute\Hook;
+class FooHooks {
+  #[Hook("{$x}_alter")]
+  public function a() {}
+  #[Hook("cron")]
+  public function b() {}
+  #[Hook('help', module: "$m")]
+  public function c() {}
+}
+"""
+
+
+def test_an_interpolated_attribute_argument_has_no_string_value(tmp_path):
+    from graphify.drupal.php_classes import read_php_attributes
+
+    path = _write(tmp_path, INTERPOLATED_ATTRIBUTES, "FooHooks.php")
+    (cls,) = read_php_attributes(path)
+    a, b, c = (m.attributes[0] for m in cls.methods)
+    assert (a.args[0].text, a.args[0].string) == ('"{$x}_alter"', None)
+    assert b.args[0].string == "cron"
+    assert (c.args[0].string, c.args[1].string) == ("help", None)
+
+
+def test_an_interpolated_alter_info_is_not_read(tmp_path):
+    text = D11_MANAGER.replace("$this->alterInfo('foo_info');", '$this->alterInfo("{$type}_info");')
+    assert read_php_class(_write(tmp_path, text, "FooManager.php")).alter_info is None
+    text = D11_MANAGER.replace("$this->alterInfo('foo_info');", '$this->alterInfo("foo_info");')
+    assert read_php_class(_write(tmp_path, text, "FooManager.php")).alter_info == "foo_info"

@@ -384,3 +384,42 @@ def test_the_inventory_lists_unknown_receiver_candidates(tmp_path, _isolated_dis
     inventory = build_inventory(registry, detected, root)
     assert [(c["kind"], c["method"], c["line"]) for c in inventory["hook_candidates"]] == [
         ("unknown_receiver", "invoke", 9), ("unknown_receiver", "alter", 10)]
+
+
+# -- interpolated hook names are candidates, never edges (final review C1) --------
+
+INTERPOLATED_PHP = """<?php
+
+namespace Drupal\\foo;
+
+class Interpolated {
+
+  public function run($type) {
+    $this->moduleHandler->invokeAll("{$type}_presave", []);
+    $this->moduleHandler->invokeAll("${type}_insert");
+    $this->moduleHandler->alter("$type");
+    $this->moduleHandler->invokeAll("cron");
+  }
+
+}
+"""
+
+
+def test_an_interpolated_hook_name_is_a_non_literal_candidate(tmp_path, _isolated_discovery_state):
+    install()
+    files = {
+        "web/core/core.api.php": CORE_API_PHP,
+        **_module("foo", "services: {}\n", {"src/Interpolated.php": INTERPOLATED_PHP}),
+    }
+    root = _site(tmp_path, files)
+    prepare_run(root)
+    path = root / FOO / "src/Interpolated.php"
+
+    result = extract_hook_invocations(path, _core_php(path))
+
+    assert [e["target_name"] for e in result["edges"]] == ["cron"]
+    assert [(c["kind"], c["name"], c["line"]) for c in result["hook_candidates"]] == [
+        ("non_literal", '"{$type}_presave"', 8),
+        ("non_literal", '"${type}_insert"', 9),
+        ("non_literal", '"$type"', 10),
+    ]
