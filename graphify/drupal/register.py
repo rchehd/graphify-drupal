@@ -1,9 +1,10 @@
 """The single point where graphify.drupal touches graphify core.
 
 Nothing in core is edited. `install()` places a finder on `sys.meta_path` that
-wraps the loader for `graphify.cache`, `graphify.detect`, `graphify.extract` and
-`graphify.report`, applying the patch immediately after each module finishes
-executing — and patches either directly if it is already in `sys.modules`.
+wraps the loader for `graphify.cache`, `graphify.cli`, `graphify.detect`,
+`graphify.extract`, `graphify.report` and `graphify.watch`, applying the patch
+immediately after each module finishes executing — and patches any of them
+directly if it is already in `sys.modules`.
 
 The hook exists rather than an eager `import graphify.extract` because
 `graphify/__init__.py` is deliberately lazy: importing it costs 1 ms, importing
@@ -257,6 +258,7 @@ def _patch_extract(extract: ModuleType) -> None:
         has_hook_invocation_marker,
     )
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group, compose_handlers
+    from graphify.drupal.resolvers import scanning
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
@@ -363,7 +365,10 @@ def _patch_extract(extract: ModuleType) -> None:
                 if len(widened) > len(given):
                     _strip_context(kwargs, widened[len(given):], anchor)
                     paths = widened
-            result = original(paths, cache_root, **kwargs)
+            # Boundary stubs name their paths relative to the scan root; the
+            # resolver runs inside this call but is not handed the root.
+            with scanning(kwargs.get("root")):
+                result = original(paths, cache_root, **kwargs)
             # Only now are the forced files re-extracted; an exception above
             # leaves the set in place for the next run to carry over.
             clear_force_miss()
@@ -640,8 +645,73 @@ def _patch_watch(watch: ModuleType) -> None:
     _wrap(watch, "_has_non_code", _non_code)
 
 
+def _declared_in_paths(graph_path: Path, root: Path) -> set[str]:
+    """Every `declared_in` entry in `graph_path`, as a root-relative POSIX path
+    (P1b stores them so; an absolute one, from a root-less extract, is made
+    relative when inside `root`). Raises on an unreadable or malformed file."""
+    import json
+
+    data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+    found: set[str] = set()
+    for node in data.get("nodes", []):
+        declared = node.get("declared_in") if isinstance(node, dict) else None
+        if not isinstance(declared, list):
+            continue
+        for entry in declared:
+            if isinstance(entry, str) and entry:
+                found.add(_root_relative(entry, root))
+    return found
+
+
+def _root_relative(path: str, root: Path) -> str:
+    """`path` (absolute, or relative to `root`) as a root-relative POSIX path,
+    NFC-normalised as core compares `source_file`; unchanged when outside."""
+    from graphify.paths import nfc
+
+    p = Path(path)
+    if p.is_absolute():
+        try:
+            p = p.resolve().relative_to(root)
+        except (ValueError, OSError, RuntimeError):
+            return nfc(p.as_posix())
+    return nfc(p.as_posix())
+
+
+def _patch_cli(cli: ModuleType) -> None:
+    """Stop core's zero-node heal re-queuing shadowed configuration copies (P2b §6.1).
+
+    `_zero_node_stamped_code_sources` re-queues every stamped code file that
+    owns no node in graph.json. A configuration copy P1b's collapse gave to
+    another copy (a module's `config/install` default shadowed by `config/sync`)
+    owns none by design, yet its path is in the survivor's `declared_in`: it
+    was extracted, so the stamp is honest. `watch` never calls the heal.
+    """
+    if not callable(getattr(cli, "_zero_node_stamped_code_sources", None)):
+        raise DrupalSeamError(
+            "graphify.cli._zero_node_stamped_code_sources is missing — graphify core "
+            "changed shape; graphify/drupal/register.py must be updated"
+        )
+
+    def _heal(original):
+        # `cli` calls it by bare name, so the module attribute is what it gets.
+        def _zero_node_stamped_code_sources(graph_path, scan_root, unchanged_code):
+            healed = original(graph_path, scan_root, unchanged_code)
+            if not healed:
+                return healed
+            try:
+                root = Path(scan_root).resolve()
+                declared = _declared_in_paths(graph_path, root)
+            except Exception:
+                return healed
+            return [f for f in healed if _root_relative(str(f), root) not in declared]
+        return _zero_node_stamped_code_sources
+
+    _wrap(cli, "_zero_node_stamped_code_sources", _heal)
+
+
 _PATCHERS = {
     "graphify.cache": _patch_cache,
+    "graphify.cli": _patch_cli,
     "graphify.detect": _patch_detect,
     "graphify.extract": _patch_extract,
     "graphify.report": _patch_report,

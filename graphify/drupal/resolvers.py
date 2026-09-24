@@ -18,6 +18,8 @@ silently, which is the exact failure class this project exists to avoid.
 """
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +72,7 @@ def _owner_name(source_file: Path) -> str:
 
 
 def _materialise_owner(edge: dict[str, Any]) -> dict[str, Any]:
-    from graphify.drupal.paths import resolve_realm
+    from graphify.drupal.boundary import realm_of
 
     source_file = Path(str(edge.get("source_file", "")))
     # `_owner_name` derives an owner from the source file's name/directory
@@ -85,7 +87,7 @@ def _materialise_owner(edge: dict[str, Any]) -> dict[str, Any]:
         "file_type": "concept",
         "type": "drupal_extension",
         "layer": "extension",
-        "realm": resolve_realm(source_file),
+        "realm": realm_of(source_file),
         "external": True,
         "_origin": "static_yaml",
         "source_file": str(source_file),
@@ -198,6 +200,151 @@ def _schema_edge(schema: str, config: dict, confidence: str) -> dict[str, Any]:
     }
 
 
+# -- boundary facts (P2b spec §4.3) ----------------------------------------------
+
+#: The scan root of the `extract()` call the resolver runs inside. The resolver's
+#: signature has no root, so the seam's `extract` wrapper sets it (see
+#: `scanning`); without one, boundary paths stay absolute.
+_scan_root: Path | None = None
+
+
+@contextmanager
+def scanning(root: Path | None) -> Iterator[None]:
+    """Resolve boundary paths against `root` for the duration of one `extract()`."""
+    global _scan_root
+    saved = _scan_root
+    _scan_root = Path(root).resolve() if root is not None else None
+    try:
+        yield
+    finally:
+        _scan_root = saved
+
+
+def _portable(path: str) -> str:
+    """Relative to the scan root when inside it, else absolute (POSIX)."""
+    if _scan_root is not None:
+        try:
+            return Path(path).resolve().relative_to(_scan_root).as_posix()
+        except (ValueError, OSError, RuntimeError):
+            pass
+    return Path(path).as_posix()
+
+
+#: A link stub's type -> the P1 family a learned plugin type reads it from.
+_LINK_FAMILIES = {
+    "drupal_menu_link": "links.menu",
+    "drupal_local_task": "links.task",
+    "drupal_local_action": "links.action",
+    "drupal_contextual_link": "links.contextual",
+}
+
+
+class _BoundaryIndex:
+    """Registry facts keyed by the node id a stub carries, each map built on first use.
+
+    Keyed by id rather than label: a stub's label is its edge's `target_name`,
+    which is absent on some edges (the label is then the id itself)."""
+
+    def __init__(self, registry: Any) -> None:
+        self.registry = registry
+        self._maps: dict[str, dict[str, Any]] = {}
+
+    def _map(self, kind: str) -> dict[str, Any]:
+        found = self._maps.get(kind)
+        if found is None:
+            found = self._maps[kind] = self._build(kind)
+        return found
+
+    def _build(self, kind: str) -> dict[str, Any]:
+        from graphify.drupal.discovery import type_id
+        from graphify.drupal.hooks import hook_id
+        from graphify.drupal.yaml_common import service_id
+        from graphify.drupal.yaml_extract import extension_id
+
+        r = self.registry
+        if kind == "drupal_extension":
+            return {extension_id(name): name for name in r.extensions}
+        if kind == "drupal_service":
+            return {service_id(sid): sid for sid in r.services}
+        if kind == "drupal_plugin_type":
+            return {type_id(pt): t for pt, t in r.types.items()}
+        if kind == "drupal_hook":
+            return {hook_id(name): decl for name, decl in r.hooks.items()}
+        return {}
+
+    def _extension_realm(self, name: str) -> str | None:
+        from graphify.drupal.boundary import realm_of
+
+        directory = self.registry.extensions.get(name)
+        return realm_of(Path(directory)) if directory else None
+
+    def facts(self, node: dict[str, Any]) -> dict[str, Any]:
+        """What the registry knows about the stub `node` (nothing when it knows nothing)."""
+        from graphify.drupal.boundary import realm_of
+        from graphify.drupal.discovery import type_attributes
+
+        kind = node.get("type")
+        found = self._map(str(kind)).get(node.get("id"))
+        if found is None:
+            return {}
+        r = self.registry
+        facts: dict[str, Any] = {}
+        if kind == "drupal_extension":
+            info = r.extension_info.get(found)
+            if info is not None:
+                facts["extension_type"] = info[0]
+            directory = r.extensions[found]
+            facts["path"] = _portable(directory)
+            facts["realm"] = realm_of(Path(directory))
+        elif kind == "drupal_service":
+            class_name, provider = r.services[found]
+            facts["class_name"], facts["provider"] = class_name, provider
+            realm = self._extension_realm(provider)
+            if realm is not None:
+                facts["realm"] = realm
+        elif kind == "drupal_plugin_type":
+            facts.update(type_attributes(found))
+            facts["realm"] = realm_of(Path(found.class_file))
+        elif kind == "drupal_hook":
+            facts["provider"] = found.provider
+            facts["declared_file"] = _portable(found.file)
+            facts["line"] = found.line
+            if found.pattern:
+                facts["pattern"] = found.pattern
+            facts["realm"] = realm_of(Path(found.file))
+        return facts
+
+
+def _mark_boundary(created: dict[str, dict[str, Any]]) -> None:
+    """Every materialised node is the boundary; with a registry it gets its facts."""
+    from graphify.drupal.discovery import current_registry
+
+    registry = current_registry()
+    index = _BoundaryIndex(registry) if registry is not None else None
+    for stub in created.values():
+        stub["boundary"] = True
+        if index is not None:
+            stub.update(index.facts(stub))
+
+
+def _link_type_edge(stub: dict[str, Any], edge: dict[str, Any]) -> dict[str, Any] | None:
+    """`plugin_of_type` from a materialised link stub to its family's learned type."""
+    from graphify.drupal.yaml_plugins import plugin_type_for_family
+
+    family = _LINK_FAMILIES.get(str(stub.get("type")))
+    plugin_type = plugin_type_for_family(family) if family else None
+    if plugin_type is None:
+        return None
+    type_id_, type_name = plugin_type
+    return {
+        "source": stub["id"], "target": type_id_, "relation": "plugin_of_type",
+        "confidence": "EXTRACTED", "_origin": "static_yaml",
+        "source_file": edge.get("source_file", ""),
+        "source_location": edge.get("source_location", "L1"),
+        "target_name": type_name,
+    }
+
+
 def resolve_missing_targets(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -208,6 +355,10 @@ def resolve_missing_targets(
     Targets of the relations in `_RESOLVABLE` and `_BY_PREFIX_RELATIONS`, and
     owners (sources) of the `declares_*` / `defines_*` relations whose file has no
     `*.info.yml`. Configuration decisions that need the whole corpus run first.
+
+    Every node made here is the boundary (`boundary: true`) and carries what the
+    registry knows about it (spec §4.3); a link stub also gets `plugin_of_type`
+    to its family's learned type.
     """
     from graphify.drupal.yaml_common import config_id
 
@@ -219,7 +370,12 @@ def resolve_missing_targets(
     core_extension = config_id("core.extension")
     created: dict[str, dict[str, Any]] = {}
 
-    for edge in all_edges:
+    # By index: a link stub's `plugin_of_type` edge is appended below and is
+    # resolved in turn (its type may itself be a boundary stub).
+    i = 0
+    while i < len(all_edges):
+        edge = all_edges[i]
+        i += 1
         source = edge.get("source")
         relation = edge.get("relation")
         if source and source not in known and source not in created:
@@ -283,7 +439,12 @@ def resolve_missing_targets(
             # that is mostly a type the registry knows but whose manager lives
             # in gitignored core/contrib, which the graph leaves out.
             created[target]["missing"] = True
+        if relation == "parent_link":
+            typed = _link_type_edge(created[target], edge)
+            if typed is not None:
+                all_edges.append(typed)
 
+    _mark_boundary(created)
     all_nodes.extend(created.values())
 
 

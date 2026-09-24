@@ -113,6 +113,24 @@ def type_id(plugin_type: str) -> str:
     return make_id("drupal", "plugin_type", plugin_type)
 
 
+def type_attributes(t: PluginType) -> dict[str, Any]:
+    """A `drupal_plugin_type` node's §4.1 attributes: the four always present,
+    the rest only when non-empty. The in-graph node and the resolver's boundary
+    stub (P2b §4.3) both carry exactly these."""
+    attrs: dict[str, Any] = {
+        "plugin_type": t.plugin_type,
+        "discovery": t.discovery,
+        "manager_class": t.manager_class,
+        "registered": t.registered,
+    }
+    for key in ("manager_service", "subdir", "interface", "annotation_class",
+                "attribute_class", "yaml_name", "alter_hook", "deferred_to"):
+        value = getattr(t, key)
+        if value:
+            attrs[key] = value
+    return attrs
+
+
 def registry_owner_of(registry: Registry, path: Path) -> str:
     """The extension whose directory contains `path` (longest match); `core`
     for `core/lib/**` (mirrors `_Builder.owner_of`, but usable at extraction
@@ -170,19 +188,8 @@ def extract_plugin_types(path: Path) -> dict[str, Any]:
     edges: list[dict[str, Any]] = []
     for t in types:
         tid = type_id(t.plugin_type)
-        attrs: dict[str, Any] = {
-            "plugin_type": t.plugin_type,
-            "discovery": t.discovery,
-            "manager_class": t.manager_class,
-            "registered": t.registered,
-        }
-        for key in ("manager_service", "subdir", "interface", "annotation_class",
-                    "attribute_class", "yaml_name", "alter_hook", "deferred_to"):
-            value = getattr(t, key)
-            if value:
-                attrs[key] = value
         nodes.append(node(tid, t.plugin_type, type="drupal_plugin_type", layer="plugin",
-                          path=path, line=t.line, **attrs))
+                          path=path, line=t.line, **type_attributes(t)))
         if t.owner:
             # A second-net manager outside every extension has no owner; an
             # edge from `extension_id("")` would invent one.
