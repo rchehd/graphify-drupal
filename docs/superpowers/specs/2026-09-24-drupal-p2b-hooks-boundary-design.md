@@ -260,8 +260,10 @@ Corpus tests (FormsRemote):
   events are ignored there, which is the intended behaviour.
 - **Boundary facts go stale on a registry-only change**: a stub is carried by
   graph.json and re-materialised only when a file referencing it is
-  re-extracted, so a boundary change alone (a composer update) leaves its old
-  facts in place until then.
+  re-extracted, so a change to what the registry knows about a boundary thing
+  (a contrib service's class after a composer update) leaves its old facts in
+  place until then. A change of where the boundary lies is not in this class
+  any more (§10.5, I3): it re-extracts the files that point across it.
 
 ## 10. Measured and the closing real run
 
@@ -297,7 +299,7 @@ another scratch dir; after the dedup fix (§10.3) and the receiver rule
 
 | | full | unchanged rerun | `--no-gitignore` |
 |---|---|---|---|
-| wall time | 8.0 s | 7.4 s | 10.6 s |
+| wall time | 8.0 s (7.5 s after §10.5) | 7.4 s (6.9 s) | 10.6 s (10.6 s) |
 | code files | 1,144 | 2 re-extracted | 1,155 |
 | nodes / edges | 4,808 / 10,327 | identical | 4,823 / 10,341 |
 | `graph.json` | 7.4 MB | | 7.4 MB |
@@ -389,3 +391,54 @@ The graph gained those 12 nodes and 63 edges (4,799 / 10,267 → 4,811 /
 - **Known, not ours:** core re-extracts the empty `links.action.yml` and
   `seed.sql` on every run (never stamped); core's clustering raises
   `ZeroDivisionError` on an edgeless graph (upstream).
+
+### 10.5 The final review's fix wave, and the re-measured closing run
+
+The whole-branch review (8ade5de..3c4f834) found, and the fix wave fixed:
+
+- **C1 — interpolated strings read as literals.** `invokeAll("{$type}_presave")`
+  targeted `_presave`, `#[Hook("{$x}_alter")]` named `_alter`, `alterInfo("…")`
+  likewise. One helper (`php_classes._literal_string`) now decides what a literal
+  is for every reader: any interpolated part makes it `non_literal`.
+- **I1 — `graphify watch` wrote absolute paths** into boundary facts
+  (`extract(cache_root=…)` without `root`): the resolver's anchor is `root`,
+  else `cache_root`.
+- **I2 — `undeclared: true` went stale** on `invokes_hook`: the flag is gone;
+  the target stub says it. That needed a second fix: core's dedup survivor rule
+  (`dedup._defines_id`) is False for every Drupal id, so a stale stub carried by
+  graph.json beat the node a newly declaring `*.api.php` emits. The seam wraps
+  it: a Drupal node defines its id unless it is a boundary stub.
+- **I3 — a moved boundary dropped stubs and edges** (`drupal.include` toggled, a
+  composer update): `drupal-discovery.json` records a `boundary_digest`
+  (`drupal.include`, `drupal.realm.*`, the install map's `(dir, realm)` list, the
+  site files dirs); when it changes, every in-graph file the registry knows that
+  points at extensions, services or hooks is forced to re-extract. A run with no
+  changed file never calls `extract()`, so the seam's `detect_incremental`
+  reports forced unchanged code files as new (this also closes the same gap
+  for a registry-only change). Not covered: an in-graph PHP file whose only
+  cross-boundary edge is an `invokes_hook` (not a file the registry walk knows).
+- **I4** — core's PHP id helpers (`extractors.base._file_stem`, `_make_id`) and
+  `detect._MANIFEST_PATH` are asserted by the seam.
+- Minors: handler receivers through a zero-argument method, a static property
+  or `?->` (§10.4); every invocation candidate carries `module`, `name`,
+  `method`, `file`, `line`, and a call outside any function is `top_level`;
+  `boundary_dir` honours `drupal.realm.*`; composer path-repository packages are
+  custom and `vendor:<name>` selects; GRAPH_REPORT shows the boundary counts,
+  reasons and `composer_unreadable`; the hook-set comparison includes the
+  provider; a symlinked checkout is scanned at its resolved path; dispatch no
+  longer reads every PHP file for the invocation marker.
+
+Closing run repeated as in §10.2 (fresh out dirs, twice, then `--no-gitignore`),
+2026-09-24: full 7.5 s, 4,808 nodes / 10,327 edges, `graph.json` 7.4 MB;
+rerun 6.9 s, identical, `1142 files cached/unchanged, 2 re-extracted` (core's
+two, as before); `--no-gitignore` 10.6 s, 4,823 / 10,341. Every other figure
+of §10.2 is unchanged: realm over 1,317 Drupal nodes custom 990, contrib 148,
+core 111, unknown 68 (same types); `drupal_hook` 29, `drupal_hook_impl` 39,
+`implements_hook` 39, `hook_implemented_by` 42, `invokes_hook` 3 (none carries
+`undeclared`); boundary nodes 329 (330), 192 of 194 extension stubs with
+`extension_type` and `extension_path`; `hook_candidates` 42 — variable 24,
+unknown_receiver 15, undeclared 3, `non_literal` and `top_level` 0 (custom code
+has no interpolated hook name and no top-level invocation); boundary
+`{core 1, contrib 101, vendor 1, files 1}`, reasons `composer 102, vendor_dir 1,
+site_files 1`; all 1,092 located files custom. FormsRemote: `git status
+--porcelain` empty, `graphify-out/` mtimes identical before and after.
