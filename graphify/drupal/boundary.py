@@ -149,14 +149,19 @@ def _substitute(pattern: str, package_name: str, installer_name: str | None = No
 
 
 def _selector_matches(selectors: object, package_type: str, package_name: str) -> bool:
+    """composer/installers' selectors: the package name, `type:<type>` or
+    `vendor:<vendor>`."""
     if not isinstance(selectors, list):
         return False
+    vendor = package_name.partition("/")[0] if "/" in package_name else ""
     for selector in selectors:
         if not isinstance(selector, str):
             continue
         if selector == package_name:
             return True
         if selector == f"type:{package_type}":
+            return True
+        if vendor and selector == f"vendor:{vendor}":
             return True
     return False
 
@@ -167,7 +172,7 @@ def _install_dir_for(
     installer_paths: dict,
     project_root: Path,
     installer_name: str | None = None,
-) -> str:
+) -> str | None:
     """The install directory for one package, per spec S4.1, relative-resolved.
 
     `installer_name` is composer's own `extra.installer-name` on the package
@@ -231,6 +236,11 @@ def _build_install_map(project_root: str) -> InstallMap:
             vendor, _sep, pkg_name = name.partition("/")
             install_dir = (Path(vendor_dir) / vendor / (installer_name or pkg_name)).as_posix()
         realm = _type_to_realm(package_type)
+        dist = package.get("dist")
+        if isinstance(dist, dict) and dist.get("type") == "path":
+            # A path repository: the project's own code, symlinked or copied
+            # into place from inside the repository -- custom, whatever its type.
+            realm = "custom"
         # Longest match wins later; first writer for a given dir wins here too,
         # which only matters for exact duplicate install dirs (not expected).
         if install_dir not in entries:
@@ -301,19 +311,39 @@ def _is_site_files(abs_path: Path) -> bool:
     return len(parts) >= 3 and parts[0] == "sites" and parts[2] == "files"
 
 
+def _rc_realm(abs_path: Path) -> str | None:
+    """The realm `.graphifyrc`'s `drupal.realm.*` rules give `abs_path`, or
+    None when there are none or they do not cover it. `realm_of` and
+    `boundary_dir` both ask it first, so the two stay in lockstep."""
+    rc_dir = _graphifyrc_dir_for(_dir_of(abs_path))
+    if rc_dir is None:
+        return None
+    rc_rules = _realm_rules_for(rc_dir)
+    # `load_realm_rules` only overrides the realm keys the file defines, and
+    # `resolve_realm` on the result returns "unknown" for anything none of
+    # the (possibly-overridden) rules cover, which we treat as "keep going".
+    if rc_rules == DEFAULT_REALM_RULES:
+        return None
+    realm = resolve_realm(abs_path, rc_rules)
+    return None if realm == "unknown" else realm
+
+
 def boundary_dir(path: Path) -> tuple[str, str] | None:
     """`(realm, reason)` when `path` is or is inside a core/contrib/vendor
-    install dir (after `.graphifyrc`'s `drupal.include`); `("files",
-    "site_files")` for a site's public files directory, which no
-    `drupal.include` brings back (`files` is not a realm: `realm_of` never
-    returns it); else `None`."""
+    install dir (after `.graphifyrc`'s `drupal.realm.*` rules, which win as in
+    `realm_of`, and its `drupal.include`); `("files", "site_files")` for a
+    site's public files directory, which no `drupal.include` brings back
+    (`files` is not a realm: `realm_of` never returns it); else `None`."""
     abs_path = Path(path).absolute()
     if _is_site_files(abs_path):
         return ("files", "site_files")
     included = included_realms_of(abs_path)
 
-    imap = install_map(abs_path)
-    if imap is not None and not imap.error:
+    rc_realm = _rc_realm(abs_path)
+    imap = install_map(abs_path) if rc_realm is None else None
+    if rc_realm is not None:
+        realm, reason = rc_realm, "rc_rule"
+    elif imap is not None and not imap.error:
         match = _install_dir_match(imap, abs_path)
         if match is None:
             return None
@@ -330,17 +360,10 @@ def realm_of(path: Path) -> str:
     """`core` | `contrib` | `vendor` | `custom`, per spec S4.1. Never `unknown`."""
     abs_path = Path(path).absolute()
 
-    rc_dir = _graphifyrc_dir_for(_dir_of(abs_path))
-    if rc_dir is not None:
-        rc_rules = _realm_rules_for(rc_dir)
-        # `.graphifyrc` `drupal.realm.*` wins, but only for the realm keys it
-        # actually defines -- `load_realm_rules` only overrides those, and
-        # `resolve_realm` on the result returns "unknown" for anything none of
-        # the (possibly-overridden) rules cover, which we treat as "keep going".
-        if rc_rules != DEFAULT_REALM_RULES:
-            rc_realm = resolve_realm(abs_path, rc_rules)
-            if rc_realm != "unknown":
-                return rc_realm
+    # `.graphifyrc` `drupal.realm.*` wins.
+    rc_realm = _rc_realm(abs_path)
+    if rc_realm is not None:
+        return rc_realm
 
     imap = install_map(abs_path)
     if imap is not None and not imap.error:

@@ -281,3 +281,41 @@ def test_boundary_digest_never_raises(tmp_path):
     _touch(tmp_path, "composer.lock", "{}")
     assert isinstance(boundary_digest(tmp_path / "missing", None), str)
     assert isinstance(boundary_digest(tmp_path), str)
+
+
+# -- final review minors 2 and 3 --------------------------------------------------------
+
+
+def test_boundary_dir_honours_graphifyrc_realm_rules(tmp_path):
+    root = _composer_project(tmp_path)
+    _touch(root, "web/modules/contrib/token/token.info.yml")
+    _touch(root, ".graphifyrc",
+           "drupal.realm.contrib = */nothing/*\ndrupal.realm.custom = */modules/contrib/token*\n")
+    token = root / "web/modules/contrib/token"
+    assert realm_of(token / "token.info.yml") == "custom"
+    assert boundary_dir(token) is None
+    # A path the rules do not cover still follows composer.
+    assert boundary_dir(root / "vendor") == ("vendor", "vendor_dir")
+
+    _touch(root, ".graphifyrc", "drupal.realm.contrib = */modules/custom/legacy*\n")
+    clear_caches()
+    assert boundary_dir(root / "web/modules/custom/legacy") == ("contrib", "rc_rule")
+    assert realm_of(root / "web/modules/custom/legacy/x.php") == "contrib"
+
+
+def test_a_composer_path_repository_package_is_custom(tmp_path):
+    packages = _PACKAGES + [{"name": "acme/local_mod", "type": "drupal-module",
+                             "dist": {"type": "path", "url": "packages/local_mod"}}]
+    root = _composer_project(tmp_path, packages=packages)
+    local = root / "web/modules/contrib/local_mod"
+    assert realm_of(local / "local_mod.info.yml") == "custom"
+    assert boundary_dir(local) is None
+    assert boundary_dir(root / "web/modules/contrib/token") == ("contrib", "composer")
+
+
+def test_the_vendor_selector_of_composer_installers(tmp_path):
+    installer_paths = {**_INSTALLER_PATHS, "web/modules/acme/{$name}": ["vendor:acme"]}
+    packages = _PACKAGES + [{"name": "acme/widget", "type": "library"}]
+    root = _composer_project(tmp_path, installer_paths=installer_paths, packages=packages)
+    assert boundary_dir(root / "web/modules/acme/widget") == ("vendor", "composer")
+    assert realm_of(root / "vendor/acme/widget/x.php") == "vendor"
