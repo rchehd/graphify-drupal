@@ -239,3 +239,45 @@ def test_caches_are_cleared(tmp_path):
     # A composer.lock edit after clear_caches() must be seen on the next call.
     _touch(root, "composer.lock", json.dumps({"packages": [], "packages-dev": []}))
     assert realm_of(root / "web/modules/contrib/token/token.info.yml") == "custom"
+
+
+# -- the boundary digest (final review I3) -------------------------------------------
+
+
+def test_boundary_digest_moves_with_include_rules_and_the_lock(tmp_path):
+    from graphify.drupal.boundary import boundary_digest
+
+    root = _composer_project(tmp_path)
+    web = (root / "web").as_posix()
+    first = boundary_digest(root, web)
+    clear_caches()
+    assert boundary_digest(root, web) == first
+
+    _touch(root, ".graphifyrc", "drupal.include = contrib\n")
+    clear_caches()
+    included = boundary_digest(root, web)
+    assert included != first
+
+    _touch(root, ".graphifyrc", "drupal.include = contrib\ndrupal.realm.custom = web/modules/contrib/x/*\n")
+    clear_caches()
+    assert boundary_digest(root, web) != included
+
+    _touch(root, "composer.lock", json.dumps({"packages": _PACKAGES[:2], "packages-dev": []}))
+    _touch(root, ".graphifyrc", "")
+    clear_caches()
+    assert boundary_digest(root, web) not in (first, included)
+
+    (root / "web/sites/default/files").mkdir(parents=True)
+    before = boundary_digest(root, web)
+    clear_caches()
+    (root / "web/sites/other/files").mkdir(parents=True)
+    assert boundary_digest(root, web) != before
+
+
+def test_boundary_digest_never_raises(tmp_path):
+    from graphify.drupal.boundary import boundary_digest
+
+    _touch(tmp_path, "composer.json", "{not json")
+    _touch(tmp_path, "composer.lock", "{}")
+    assert isinstance(boundary_digest(tmp_path / "missing", None), str)
+    assert isinstance(boundary_digest(tmp_path), str)

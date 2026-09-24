@@ -368,6 +368,32 @@ def included_realms_of(path: Path) -> frozenset[str]:
     return _included_realms_for(rc_dir)
 
 
+def boundary_digest(root: Path, web_root: str | None = None) -> str:
+    """A fingerprint of everything that decides where the boundary lies for a
+    scan of `root`: `.graphifyrc`'s `drupal.include` and `drupal.realm.*`,
+    the composer install map's `(dir, realm)` list (or its error), and each
+    site's public files directory under `web_root`. Two runs with the same
+    digest prune the same trees (spec §4.2). Never raises."""
+    import hashlib
+
+    abs_root = Path(root).absolute()
+    try:
+        rc_dir = _graphifyrc_dir_for(_dir_of(abs_root))
+        rules = sorted((k, list(v)) for k, v in _realm_rules_for(rc_dir).items()) if rc_dir else []
+        imap = install_map(abs_root)
+        installs = None if imap is None else (
+            imap.error, sorted([d, realm] for d, realm, _reason in imap.paths))
+        files: list[str] = []
+        if web_root:
+            files = sorted(p.as_posix() for p in (Path(web_root) / "sites").glob("*/files"))
+        facts = {"include": sorted(included_realms_of(abs_root)), "realm_rules": rules,
+                 "installs": installs, "site_files": files}
+        text = json.dumps(facts, sort_keys=True)
+    except Exception as exc:  # noqa: BLE001 -- a digest must never fail a run
+        text = f"unreadable: {exc}"
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
 def clear_caches() -> None:
     for cached in (
         _build_install_map,

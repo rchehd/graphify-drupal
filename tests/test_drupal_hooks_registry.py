@@ -281,3 +281,58 @@ def test_corpus_hook_count_and_registry_build_time(tmp_path, _isolated_discovery
     assert len(registry.hooks) == 435
     # Spec §8 item 5 / constraints.md: registry + boundary build stays under 5s.
     assert elapsed < 5.0
+
+
+def test_a_moved_boundary_affects_only_in_graph_dependents(tmp_path):
+    """`boundary_changed` (final review I3): every in-graph file that points at
+    extensions, services or hooks -- never a file that is now the boundary."""
+    root = _hooks_site(tmp_path, {
+        "web/modules/contrib/token/token.info.yml": "name: Token\ntype: module\n",
+        "web/modules/contrib/token/token.services.yml": "services: {}\n",
+        "web/modules/contrib/token/token.module": "<?php\n\nfunction token_cron() {\n}\n",
+        "web/modules/custom/foo/foo.module": "<?php\n\nfunction foo_cron() {\n}\n",
+    })
+    registry = build_registry(root)
+    foo = root / "web/modules/custom/foo"
+
+    assert affected_files(registry, registry) == set()
+    forced = affected_files(registry, registry, boundary_changed=True)
+    for name in ("foo.info.yml", "foo.services.yml", "foo.module", "foo.api.php"):
+        assert (foo / name).as_posix() in forced, name
+    assert not any("/contrib/" in p or "/core/" in p for p in forced), sorted(forced)
+
+
+def test_affected_files_returns_the_api_php_whose_declaration_was_removed(tmp_path):
+    """Final review minor 11: a removed declaration, not only an added one."""
+    root = _hooks_site(tmp_path)
+    previous = build_registry(root)
+    api = root / "web/modules/custom/foo/foo.api.php"
+    api.write_text("<?php\n", encoding="utf-8")
+    (root / "web/modules/custom/foo/foo.module").write_text(
+        "<?php\n\nfunction foo_cron() {\n}\n", encoding="utf-8")
+    current = build_registry(root)
+
+    forced = affected_files(previous, current)
+    assert api.as_posix() in forced
+    # The hook set changed, so implementers are stale too.
+    assert (root / "web/modules/custom/foo/foo.module").as_posix() in forced
+
+
+def test_affected_files_re_evaluates_implementers_on_a_provider_or_pattern_change(tmp_path):
+    """Final review minors 8 and 11: a hook that moves provider changes the
+    self-declared rule, so implementers are forced; a pattern change too."""
+    root = _hooks_site(tmp_path)
+    (root / "web/modules/custom/foo/foo.module").write_text(
+        "<?php\n\nfunction foo_foo_info() {\n}\n", encoding="utf-8")
+    previous = build_registry(root)
+    module = (root / "web/modules/custom/foo/foo.module").as_posix()
+
+    moved = Registry.from_json(previous.to_json())
+    decl = moved.hooks["foo_info"]
+    moved.hooks["foo_info"] = HookDecl(decl.name, "core", decl.file, decl.line, decl.pattern)
+    assert module in affected_files(previous, moved)
+
+    repatterned = Registry.from_json(previous.to_json())
+    decl = repatterned.hooks["cron"]
+    repatterned.hooks["cron"] = HookDecl(decl.name, decl.provider, decl.file, decl.line, "c*")
+    assert module in affected_files(previous, repatterned)

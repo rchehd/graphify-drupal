@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from graphify.drupal.boundary import boundary_digest
 from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_id, hook_pattern, read_hook_stubs
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
@@ -776,6 +777,8 @@ _env_cache_force_miss: frozenset[str] = frozenset()
 #: The registry file's key for `force_miss()`, read by a spawned worker. It is
 #: not part of `Registry`: next run's `from_json` ignores it.
 _FORCE_MISS_KEY = "force_miss"
+#: The registry file's key for `boundary.boundary_digest` of the run that wrote it.
+_BOUNDARY_DIGEST_KEY = "boundary_digest"
 
 
 #: Prefix of the private temp file a worker reads the registry from when the
@@ -850,19 +853,25 @@ def _sorted_types(types: list[PluginType]) -> list[PluginType]:
     return sorted(types, key=lambda t: t.plugin_type)
 
 
-def affected_files(previous: Registry | None, current: Registry | None) -> set[str]:
+def affected_files(previous: Registry | None, current: Registry | None,
+                   boundary_changed: bool = False) -> set[str]:
     """Absolute paths whose extraction depends on what changed between two registries.
 
     For every `yaml_name` whose type was added, removed or changed in any field,
     the extension-root files `*.<yaml_name>.yml` of either registry (its plugins
     are typed by it); for every manager class file whose types changed, that
-    file (it carries the type nodes). Empty when there is no previous registry:
+    file (it carries the type nodes). When the boundary moved
+    (`boundary_changed`, see `prepare_run`), every in-graph file the registry
+    walk knows that points at extensions, services or hooks
+    (`_boundary_dependent_files`). Empty when there is no previous registry:
     a first run extracts everything anyway.
     """
     if previous is None:
         return set()
     current = current if current is not None else Registry(web_root=None)
     result: set[str] = set()
+    if boundary_changed:
+        result |= _boundary_dependent_files(previous) | _boundary_dependent_files(current)
 
     old_families, new_families = previous.by_yaml_name(), current.by_yaml_name()
     suffixes = tuple(
@@ -891,16 +900,51 @@ def affected_files(previous: Registry | None, current: Registry | None) -> set[s
             if decl is not None:
                 result.add(decl.file)
 
-    # What an implementation is depends only on which names are declared and
-    # their patterns: when that changes, every in-graph procedural file and
-    # `src/Hook/**/*.php` (spec §5.5).
+    # What an implementation is depends only on which names are declared,
+    # their patterns and their providers (an extension implementing its own
+    # hook gets no `implements_hook`): when that changes, every in-graph
+    # procedural file and `src/Hook/**/*.php` (spec §5.5).
     if _hook_names(old_hooks) != _hook_names(new_hooks):
         result |= hook_dependent_files(previous) | hook_dependent_files(current)
     return result
 
 
-def _hook_names(hooks: dict[str, HookDecl]) -> dict[str, str]:
-    return {name: decl.pattern for name, decl in hooks.items()}
+def _boundary_dependent_files(registry: Registry) -> set[str]:
+    """What a moved boundary makes stale (final review I3): the files of the
+    registry's in-graph extensions (after the current boundary) that emit
+    edges to extensions, services or hooks -- each `<ext>.info.yml`, every
+    extension-root `*.yml` (`root_yaml`), the procedural and `src/Hook/`
+    files, in-graph manager class files and `*.api.php` declarations. A file
+    that just left the graph is not listed: the widening must not pull a
+    pruned file back in. Absolute POSIX paths."""
+    from graphify.drupal.boundary import boundary_dir
+
+    in_graph: set[str] = set()
+    out: set[str] = set()
+    for ext, directory in registry.extensions.items():
+        try:
+            if boundary_dir(Path(directory)) is not None:
+                continue
+        except Exception:
+            continue
+        in_graph.add(directory)
+        out.add(f"{directory}/{ext}.info.yml")
+    out.update(p for p in registry.root_yaml if Path(p).parent.as_posix() in in_graph)
+    out |= hook_dependent_files(registry)
+
+    def kept(path: str) -> bool:
+        try:
+            return boundary_dir(Path(path).parent) is None
+        except Exception:
+            return False
+
+    out.update(t.class_file for t in registry.types.values() if kept(t.class_file))
+    out.update(d.file for d in registry.hooks.values() if kept(d.file))
+    return out
+
+
+def _hook_names(hooks: dict[str, HookDecl]) -> dict[str, tuple[str, str]]:
+    return {name: (decl.pattern, decl.provider) for name, decl in hooks.items()}
 
 
 def force_miss() -> frozenset[str]:
@@ -1069,10 +1113,12 @@ def prepare_run(
     target = out_dir(root, cache_root) / _REGISTRY_FILENAME
 
     previous: Registry | None = None
+    previous_digest: str | None = None
     carried: set[str] = set()
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
         previous = Registry.from_json(data)
+        previous_digest = data.get(_BOUNDARY_DIGEST_KEY)
         # A set no extract() consumed yet (an interrupted run, or one with
         # nothing to extract) is carried over, minus files that are gone.
         carried = {str(p) for p in data.get(_FORCE_MISS_KEY) or [] if Path(str(p)).exists()}
@@ -1092,9 +1138,15 @@ def prepare_run(
     # check does not prune what `detect()` itself never descends (spec S4.2).
     with registry_walk():
         registry = build_registry(root, _scan_predicate(root, extra_excludes, gitignore=False))
-    forced = frozenset(affected_files(previous, registry) | carried)
+    # A moved boundary (`drupal.include` toggled, a composer update moving a
+    # package into contrib/vendor) changes which nodes are stubs without
+    # changing any file that points at them (final review I3).
+    digest = boundary_digest(root, registry.web_root)
+    forced = frozenset(
+        affected_files(previous, registry, boundary_changed=previous_digest != digest) | carried)
 
-    payload = json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced)},
+    payload = json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced),
+                          _BOUNDARY_DIGEST_KEY: digest},
                          sort_keys=True, indent=1)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)

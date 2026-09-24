@@ -353,3 +353,47 @@ def test_the_real_cli_function_is_wrapped():
     import graphify.cli as cli
 
     assert getattr(cli._zero_node_stamped_code_sources, "_drupal_patched", False)
+
+
+# -- a boundary change re-extracts what points across it (final review I3) --------
+
+
+def _token_view(graph: dict) -> tuple:
+    """The token extension node's boundary facts and every edge touching it."""
+    tok = extension_id("token")
+    node = _by_id(graph["nodes"]).get(tok, {})
+    links = graph.get("links") or graph.get("edges")
+    touching = sorted((e["source"], e["relation"], e["target"]) for e in links
+                      if tok in (e["source"], e["target"]))
+    return (node.get("boundary"), node.get("realm"), node.get("extension_path")), touching
+
+
+def test_removing_drupal_include_restores_the_boundary_stubs(tmp_path):
+    root = _boundary_site(tmp_path / "site")
+    (root / "web/modules/contrib/token/token.module").write_text(
+        "<?php\n\nfunction token_cron() {\n}\n", encoding="utf-8")
+    out = tmp_path / "out"
+    (root / ".graphifyrc").write_text("drupal.include = contrib\n", encoding="utf-8")
+    included, _ = _cli(root, out)
+    assert _token_view(included)[0][0] is None       # contrib is in the graph: a real node
+
+    (root / ".graphifyrc").write_text("", encoding="utf-8")
+    after, _ = _cli(root, out)
+    fresh, _ = _cli(root, tmp_path / "fresh")
+
+    assert _token_view(after) == _token_view(fresh)
+    assert _token_view(after)[0] == (True, "contrib", "web/modules/contrib/token")
+    assert (extension_id("foo"), "depends_on_module", extension_id("token")) in _token_view(after)[1]
+    assert not any("contrib" in str(n.get("source_file")) for n in after["nodes"]
+                   if n.get("file_type") != "concept")
+
+
+def test_adding_drupal_include_matches_a_fresh_run(tmp_path):
+    root = _boundary_site(tmp_path / "site")
+    out = tmp_path / "out"
+    _cli(root, out)
+    (root / ".graphifyrc").write_text("drupal.include = contrib\n", encoding="utf-8")
+    after, _ = _cli(root, out)
+    fresh, _ = _cli(root, tmp_path / "fresh")
+    assert _token_view(after) == _token_view(fresh)
+    assert _token_view(after)[0][0] is None

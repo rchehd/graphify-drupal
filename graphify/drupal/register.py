@@ -227,17 +227,44 @@ def _patch_detect(detect: ModuleType) -> None:
             manifest = args[0] if args else kwargs.get("manifest_path")
             default = getattr(detect, "_MANIFEST_PATH", None)
             if manifest is None or str(manifest) == str(default):
-                return original(root, *args, **kwargs)
+                return _promote_forced(original(root, *args, **kwargs), root)
             out = Path(manifest).resolve().parent
             incremental_cache_root.append(_cache_root_for(out))
             try:
                 with using_out_dir(out):
-                    return original(root, *args, **kwargs)
+                    return _promote_forced(original(root, *args, **kwargs), root)
             finally:
                 incremental_cache_root.pop()
         detect_incremental_.__name__ = detect_incremental_.__qualname__ = "detect_incremental"
         detect_incremental_.__doc__ = original.__doc__
         return detect_incremental_
+
+    def _promote_forced(result, root):
+        # The widening in the `extract` wrapper only runs when core extracts
+        # something: a run whose only change is the registry or the boundary
+        # (`drupal.include` toggled, final review I3) has no changed file, so
+        # core never calls `extract()` and the forced files stay cached. An
+        # unchanged code file this run must re-extract is reported as new.
+        from graphify.drupal.discovery import force_miss
+
+        forced = force_miss()
+        if not forced or not isinstance(result, dict):
+            return result
+        unchanged = (result.get("unchanged_files") or {}).get("code")
+        new = (result.get("new_files") or {}).get("code")
+        if not isinstance(unchanged, list) or not isinstance(new, list):
+            return result
+        wanted = {Path(p).resolve().as_posix() for p in forced}
+        base = Path(root)
+        promoted = [f for f in unchanged
+                    if (Path(f) if Path(f).is_absolute() else base / f).resolve().as_posix() in wanted]
+        if promoted:
+            moved = set(promoted)
+            result["unchanged_files"]["code"] = [f for f in unchanged if f not in moved]
+            new.extend(promoted)
+            if isinstance(result.get("new_total"), int):
+                result["new_total"] += len(promoted)
+        return result
 
     _wrap(detect, "classify_file", _classify)
     _wrap(detect, "_is_graphable_source", _graphable)
