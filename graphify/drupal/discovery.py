@@ -578,6 +578,10 @@ def _read_provider(builder: _Builder, path: Path) -> list[str]:
 
 
 #: How many registry walks are in progress in this process (`registry_walk`).
+#: Process-wide, not thread-local: a registry walk and the `detect()` walk it
+#: must not affect never run concurrently today -- `prepare_run` finishes the
+#: walk before core's own walk starts, on the same thread, and extraction
+#: workers are separate processes that never walk.
 _registry_walks = 0
 
 

@@ -209,7 +209,7 @@ def test_inventory_counts_the_pruned_install_dirs(tmp_path, _isolated_discovery_
     detect.detect(_composer_site(tmp_path))
     inventory = current_inventory()
 
-    assert inventory["summary"]["boundary"] == {"core": 1, "contrib": 1, "vendor": 1}
+    assert inventory["summary"]["boundary"] == {"core": 1, "contrib": 1, "vendor": 1, "files": 0}
     assert inventory["summary"]["boundary_reasons"] == {"composer": 2, "vendor_dir": 1}
     assert "composer_unreadable" not in inventory
 
@@ -221,7 +221,7 @@ def test_inventory_boundary_counts_honour_include(tmp_path, _isolated_discovery_
 
     detect.detect(_composer_site(tmp_path, include="contrib"))
 
-    assert current_inventory()["summary"]["boundary"] == {"core": 1, "contrib": 0, "vendor": 1}
+    assert current_inventory()["summary"]["boundary"] == {"core": 1, "contrib": 0, "vendor": 1, "files": 0}
 
 
 def test_inventory_without_composer_counts_path_rule_dirs(tmp_path, _isolated_discovery_state):
@@ -238,7 +238,7 @@ def test_inventory_without_composer_counts_path_rule_dirs(tmp_path, _isolated_di
     summary = current_inventory()["summary"]
 
     assert not [f for f in _scanned(result) if "/modules/contrib/" in f or "/core/modules/" in f]
-    assert summary["boundary"] == {"core": 1, "contrib": 1, "vendor": 0}
+    assert summary["boundary"] == {"core": 1, "contrib": 1, "vendor": 0, "files": 0}
     assert summary["boundary_reasons"] == {"path_rule": 2}
 
 
@@ -267,3 +267,56 @@ def test_the_cli_graph_has_no_boundary_source_file(tmp_path):
     sources = {str(n.get("source_file") or "") for n in graph["nodes"]}
     assert not [s for s in sources if _in_boundary("/" + s.lstrip("/"))]
     assert any("web/modules/custom/foo/" in s for s in sources)
+
+
+# -- fix round 1: public files and a composer-less core ------------------------
+
+
+def test_public_files_are_a_boundary_not_a_realm(tmp_path):
+    from graphify.drupal.boundary import boundary_dir, realm_of
+
+    root = _composer_site(tmp_path, include="core, contrib, vendor")
+    files = root / "web/sites/default/files"
+    (files / "js").mkdir(parents=True)
+    (files / "js/js_abc.js").write_text("var a = 1;\n", encoding="utf-8")
+
+    # Not subject to drupal.include, whatever realms it names.
+    assert boundary_dir(files) == ("files", "site_files")
+    assert boundary_dir(files / "js") == ("files", "site_files")
+    assert boundary_dir(root / "web/sites/default") is None
+    assert realm_of(files / "js/js_abc.js") in ("core", "contrib", "vendor", "custom")
+
+
+@pytest.mark.parametrize("honour_gitignore", [True, False], ids=["gitignore", "no-gitignore"])
+def test_detect_never_lists_public_files(tmp_path, _isolated_discovery_state, honour_gitignore):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.inventory import current_inventory
+
+    root = _composer_site(tmp_path)
+    for site in ("default", "other"):
+        js = root / f"web/sites/{site}/files/js/js_abc.js"
+        js.parent.mkdir(parents=True)
+        js.write_text("var a = 1;\n", encoding="utf-8")
+    (root / "web/sites/default/settings.php").write_text("<?php\n$x = 1;\n", encoding="utf-8")
+
+    scanned = _scanned(detect.detect(root, gitignore=honour_gitignore))
+
+    assert not [f for f in scanned if "/files/" in f]
+    assert any(f.endswith("/web/sites/default/settings.php") for f in scanned)
+    summary = current_inventory()["summary"]
+    assert summary["boundary"] == {"core": 1, "contrib": 1, "vendor": 1, "files": 2}
+    assert summary["boundary_reasons"] == {"composer": 2, "site_files": 2, "vendor_dir": 1}
+
+
+def test_without_composer_the_whole_core_dir_is_the_boundary(tmp_path, _isolated_discovery_state):
+    install()
+    import graphify.detect as detect
+    from graphify.drupal.boundary import boundary_dir
+
+    _site(tmp_path, {**_module("foo", FOO_SERVICES), "web/core/composer.json": "{}\n"})
+    assert boundary_dir(tmp_path / "web/core") == ("core", "path_rule")
+
+    scanned = _scanned(detect.detect(tmp_path))
+    assert not [f for f in scanned if "/web/core/" in f]
+    assert any(f.endswith("/foo/foo.info.yml") for f in scanned)

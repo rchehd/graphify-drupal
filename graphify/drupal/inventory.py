@@ -154,7 +154,15 @@ def _deferred_entries(
     return entries, component_files | migrate_drupal_files | migrations_files
 
 
-_BOUNDARY_REALMS = ("core", "contrib", "vendor")
+#: `files` is not a realm: it counts each site's public files directory.
+_BOUNDARY_KINDS = ("core", "contrib", "vendor", "files")
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError):
+        return Path(path).absolute()
 
 
 def _boundary_counts(registry: Registry, root: Path) -> tuple[dict[str, int], dict[str, int], str]:
@@ -166,7 +174,8 @@ def _boundary_counts(registry: Registry, root: Path) -> tuple[dict[str, int], di
     not inside another counted one (a package under `vendor/` is pruned with
     it). Without a usable install map the pruning follows P0's path rules, so
     the candidates are the registry's extension directories plus the vendor
-    directory beside the web root.
+    directory beside the web root. Every site's `sites/<site>/files` counts
+    under `files`.
     """
     imap = install_map(root)
     if imap is not None and not imap.error:
@@ -175,24 +184,31 @@ def _boundary_counts(registry: Registry, root: Path) -> tuple[dict[str, int], di
         candidates = [Path(d) for d in registry.extensions.values()]
         if registry.web_root:
             candidates.append(Path(registry.web_root).parent / "vendor")
+    if registry.web_root:
+        try:
+            candidates.extend(sorted((Path(registry.web_root) / "sites").glob("*/files")))
+        except OSError:
+            pass
 
+    scan_root = _resolved(root)
     pruned: dict[str, tuple[str, str]] = {}
     for candidate in candidates:
+        resolved = _resolved(candidate)
         try:
-            candidate.relative_to(root)
+            resolved.relative_to(scan_root)
         except ValueError:
             continue
         if not candidate.is_dir():
             continue
         found = boundary_dir(candidate)
         if found is not None:
-            pruned[candidate.as_posix()] = found
+            pruned[resolved.as_posix()] = found
     outermost = [
         d for d in pruned
         if not any(d != other and d.startswith(other + "/") for other in pruned)
     ]
 
-    boundary = dict.fromkeys(_BOUNDARY_REALMS, 0)
+    boundary = dict.fromkeys(_BOUNDARY_KINDS, 0)
     reasons: dict[str, int] = {}
     for d in outermost:
         realm, reason = pruned[d]

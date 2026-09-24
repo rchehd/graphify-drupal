@@ -263,28 +263,53 @@ def _install_dir_match(imap: InstallMap, abs_path: Path) -> tuple[str, str] | No
     return None
 
 
+def _is_within(target: str, directory: str) -> bool:
+    return target == directory or target.startswith(directory + "/")
+
+
 def _fallback_realm(abs_path: Path) -> tuple[str, str]:
-    """`(realm, reason)` when no usable composer install map applies: P0's
-    path rules for core/contrib, a `vendor` directory that is a sibling of
-    the web root, else custom. `reason` is `""` for the custom catch-all --
-    it is never a boundary dir. Shared by `realm_of` and `boundary_dir` so
-    the two stay in lockstep."""
+    """`(realm, reason)` when no usable composer install map applies: the
+    web root's `core/` directory as a whole (the one holding `lib/Drupal.php`)
+    and P0's path rules for core/contrib, a `vendor` directory that is a
+    sibling of the web root, else custom. `reason` is `""` for the custom
+    catch-all -- it is never a boundary dir. Shared by `realm_of` and
+    `boundary_dir` so the two stay in lockstep."""
+    web_root = _web_root_for(_dir_of(abs_path))
+    target = abs_path.as_posix()
+    if web_root is not None and _is_within(target, (Path(web_root) / "core").as_posix()):
+        return ("core", "path_rule")
     realm = resolve_realm(abs_path)
     if realm in ("core", "contrib"):
         return (realm, "path_rule")
-    web_root = _web_root_for(_dir_of(abs_path))
-    if web_root is not None:
-        vendor_dir = (Path(web_root).parent / "vendor").as_posix()
-        target = abs_path.as_posix()
-        if target == vendor_dir or target.startswith(vendor_dir + "/"):
-            return ("vendor", "vendor_dir")
+    if web_root is not None and _is_within(target, (Path(web_root).parent / "vendor").as_posix()):
+        return ("vendor", "vendor_dir")
     return ("custom", "")
+
+
+def _is_site_files(abs_path: Path) -> bool:
+    """`abs_path` is, or is inside, `<web root>/sites/<site>/files` -- Drupal's
+    default public files directory (uploads, generated CSS/JS aggregates,
+    never source). `settings.php`'s `file_public_path` is not read: only the
+    default location counts."""
+    web_root = _web_root_for(_dir_of(abs_path))
+    if web_root is None:
+        return False
+    try:
+        parts = abs_path.relative_to(web_root).parts
+    except ValueError:
+        return False
+    return len(parts) >= 3 and parts[0] == "sites" and parts[2] == "files"
 
 
 def boundary_dir(path: Path) -> tuple[str, str] | None:
     """`(realm, reason)` when `path` is or is inside a core/contrib/vendor
-    install dir (after `.graphifyrc`'s `drupal.include`); else `None`."""
+    install dir (after `.graphifyrc`'s `drupal.include`); `("files",
+    "site_files")` for a site's public files directory, which no
+    `drupal.include` brings back (`files` is not a realm: `realm_of` never
+    returns it); else `None`."""
     abs_path = Path(path).absolute()
+    if _is_site_files(abs_path):
+        return ("files", "site_files")
     included = included_realms_of(abs_path)
 
     imap = install_map(abs_path)

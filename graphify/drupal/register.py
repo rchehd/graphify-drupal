@@ -101,6 +101,8 @@ def _patch_detect(detect: ModuleType) -> None:
         # Only in a Drupal run (a registry is current): P0's path rules would
         # otherwise prune `*/core/lib/*` or `*/modules/contrib/*` in any
         # repository. Never while the registry walks: it must read the boundary.
+        # `graphify watch` builds its ignore predicate this way too, so boundary
+        # events are ignored -- once its first rebuild has made a registry current.
         def _is_noise_dir(part, parent=None):
             if original(part, parent):
                 return True

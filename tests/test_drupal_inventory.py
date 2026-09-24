@@ -88,9 +88,9 @@ def test_build_inventory_partitions_the_site(tmp_path, _isolated_discovery_state
         "unrecognised_families": 1,
         "unrecognised_files": 1,
         "filtered": 1,
-        # No composer project and nothing under a core/contrib path rule.
-        "boundary": {"core": 0, "contrib": 0, "vendor": 0},
-        "boundary_reasons": {},
+        # No composer project: web/core as a whole is the one boundary dir.
+        "boundary": {"core": 1, "contrib": 0, "vendor": 0, "files": 0},
+        "boundary_reasons": {"path_rule": 1},
     }
 
 
