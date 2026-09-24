@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_pattern, read_hook_stubs
+from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_id, hook_pattern, read_hook_stubs
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
 from graphify.drupal.yaml_common import load_drupal_yaml
@@ -192,6 +192,12 @@ def extract_plugin_types(path: Path) -> dict[str, Any]:
             edges.append(edge(service_id(t.manager_service), tid, "plugin_manager_for",
                               path=path, line=t.line, source_name=t.manager_service,
                               target_name=t.plugin_type))
+        if t.alter_hook:
+            # `alterInfo('foo_info')` -> the manager invokes `foo_info_alter`
+            # on every plugin definition it discovers (spec §5.3).
+            alter_name = f"{t.alter_hook}_alter"
+            edges.append(edge(tid, hook_id(alter_name), "invokes_hook", path=path, line=t.line,
+                              target_name=alter_name))
     return {"nodes": nodes, "edges": edges}
 
 

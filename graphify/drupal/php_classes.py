@@ -340,6 +340,111 @@ def read_php_functions(path: Path) -> list[PhpFunction]:
         return []
 
 
+@dataclass(frozen=True)
+class CallArg:
+    kind: str                        # "string" | "array" | "other"
+    value: str                       # the string literal's value; "" otherwise
+    items: tuple[str, ...] | None = None   # kind=="array": each element's literal string value,
+                                            # None when some element is not a plain string literal
+    raw: str = ""                    # the argument's verbatim source text
+
+
+@dataclass(frozen=True)
+class PhpCall:
+    name: str            # the called method's name (`->name(...)`)
+    line: int
+    args: tuple[CallArg, ...]
+    function: str        # enclosing top-level function name, "" when inside a class
+    class_name: str       # enclosing class name, "" when none
+    method: str            # enclosing method name, "" when none
+
+
+def read_php_calls(path: Path, names: "frozenset[str]") -> list[PhpCall]:
+    """Every `->name(...)` member call in `path` whose method name is in
+    `names`, attributed to the nearest enclosing named function or method --
+    a closure or arrow function nested inside one does not change the
+    attribution (P2b spec §5.3). Never raises: bad input yields an empty
+    list."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return []
+        found: list[PhpCall] = []
+        _collect_calls(parsed[1], names, "", "", "", found)
+        return found
+    except Exception:
+        return []
+
+
+def _collect_calls(
+    node: "tree_sitter.Node", names: "frozenset[str]",
+    function: str, class_name: str, method: str, out: list[PhpCall],
+) -> None:
+    for child in node.named_children:
+        if child.type == "function_definition":
+            name = _text(child.child_by_field_name("name"))
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _collect_calls(body, names, name, "", "", out)
+            continue
+        if child.type == "class_declaration":
+            name = _text(child.child_by_field_name("name"))
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _collect_calls(body, names, "", name, "", out)
+            continue
+        if child.type == "method_declaration":
+            name = _text(child.child_by_field_name("name"))
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _collect_calls(body, names, "", class_name, name, out)
+            continue
+        if child.type == "member_call_expression":
+            name_node = child.child_by_field_name("name")
+            call_name = _text(name_node)
+            if call_name in names:
+                args_node = child.child_by_field_name("arguments")
+                out.append(PhpCall(call_name, child.start_point[0] + 1,
+                                   _build_call_args(args_node), function, class_name, method))
+            _collect_calls(child, names, function, class_name, method, out)
+            continue
+        _collect_calls(child, names, function, class_name, method, out)
+
+
+def _build_call_args(args_node: "tree_sitter.Node | None") -> tuple[CallArg, ...]:
+    if args_node is None:
+        return ()
+    result: list[CallArg] = []
+    for arg in args_node.named_children:
+        if arg.type != "argument":
+            continue
+        value_node = arg.named_children[0] if arg.named_children else None
+        result.append(_call_arg_from_value(value_node))
+    return tuple(result)
+
+
+def _call_arg_from_value(value_node: "tree_sitter.Node | None") -> CallArg:
+    if value_node is None:
+        return CallArg("other", "")
+    raw = _text(value_node)
+    if value_node.type in ("string", "encapsed_string"):
+        return CallArg("string", _string_value(value_node), raw=raw)
+    if value_node.type == "array_creation_expression":
+        items: list[str] = []
+        literal = True
+        for element in value_node.named_children:
+            value = element
+            if element.type == "array_element_initializer":
+                value = element.named_children[-1] if element.named_children else None
+            if value is not None and value.type in ("string", "encapsed_string"):
+                items.append(_string_value(value))
+            else:
+                literal = False
+                break
+        return CallArg("array", "", tuple(items) if literal else None, raw=raw)
+    return CallArg("other", "", raw=raw)
+
+
 def _collect_functions(node: "tree_sitter.Node", found: list[PhpFunction]) -> None:
     for child in node.named_children:
         if child.type == "namespace_definition":

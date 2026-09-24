@@ -48,8 +48,10 @@ from typing import Any
 
 from graphify.drupal.php_classes import (
     PhpAttribute,
+    PhpCall,
     PhpFunction,
     read_php_attributes,
+    read_php_calls,
     read_php_functions,
 )
 from graphify.ids import make_id
@@ -373,9 +375,10 @@ def _scan(path: Path, registry: Any) -> tuple[list[_Impl], list[dict]]:
 
 
 def find_hook_candidates(path: Path, registry: Any) -> list[dict]:
-    """The `hook_candidates` entries of one file (spec §5.4). Never raises."""
+    """The `hook_candidates` entries of one file (spec §5.4), implementation
+    and invocation alike. Never raises."""
     try:
-        return _scan(path, registry)[1]
+        return _scan(path, registry)[1] + _invocation_candidates(path)
     except Exception:
         return []
 
@@ -450,13 +453,146 @@ def _extract_hook_implementations(path: Path, core_result: dict) -> dict[str, An
 
 
 def extract_php_with_hooks(path: Path) -> dict[str, Any]:
-    """Core's own PHP handler for `path`, plus its hook implementations: the
-    handler for procedural files and `src/Hook/**/*.php` (spec §5.2).
-    `register.py` asserts that core's `.php` handler exists."""
+    """Core's own PHP handler for `path`, plus its hook implementations and
+    invocation sites: the handler for procedural files and
+    `src/Hook/**/*.php` (spec §5.2). `register.py` asserts that core's
+    `.php` handler exists."""
     import graphify.extract as core
     from graphify.drupal.merge import compose_handlers
 
-    return compose_handlers(core._DISPATCH[".php"], [extract_hook_implementations])(path)
+    return compose_handlers(
+        core._DISPATCH[".php"], [extract_hook_implementations, extract_hook_invocations]
+    )(path)
+
+
+# -- invocations (spec §5.3) ----------------------------------------------------
+
+#: `ModuleHandlerInterface`'s hook-name argument position, 0-based, for each
+#: method that takes a hook name directly (`web/core/lib/Drupal/Core/Extension/
+#: ModuleHandlerInterface.php`).
+_INVOCATION_HOOK_POS = {
+    "hasImplementations": 0,
+    "invokeAllWith": 0,
+    "invokeAll": 0,
+    "invoke": 1,
+    "invokeAllDeprecated": 1,
+    "invokeDeprecated": 2,
+}
+#: Same, for the two `alter()` forms -- their argument is a plugin/form
+#: `$type`, not a hook name; the target hook is `<type>_alter`.
+_ALTER_TYPE_POS = {
+    "alter": 0,
+    "alterDeprecated": 1,
+}
+_INVOCATION_METHODS = frozenset(_INVOCATION_HOOK_POS) | frozenset(_ALTER_TYPE_POS)
+_INVOCATION_MARKERS = (b"->invoke", b"->alter", b"->hasImplementations")
+
+
+def has_hook_invocation_marker(path: Path) -> bool:
+    """Cheap text pre-check: does `path` contain a byte sequence any of the
+    invocation methods' calls would produce? False for unreadable files."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    return any(marker in data for marker in _INVOCATION_MARKERS)
+
+
+def _invocation_calls(path: Path) -> list[PhpCall]:
+    path = Path(path)
+    if not has_hook_invocation_marker(path):
+        return []
+    return read_php_calls(path, _INVOCATION_METHODS)
+
+
+def _invocation_hook_names(call: PhpCall) -> list[str] | None:
+    """The literal hook name(s) `call` targets, or None when its relevant
+    argument is missing or not a literal (spec §5.3-§5.4)."""
+    if call.name in _ALTER_TYPE_POS:
+        pos = _ALTER_TYPE_POS[call.name]
+        if pos >= len(call.args):
+            return None
+        arg = call.args[pos]
+        if arg.kind == "string":
+            return [f"{arg.value}_alter"]
+        if arg.kind == "array" and arg.items:
+            return [f"{item}_alter" for item in arg.items]
+        return None
+    pos = _INVOCATION_HOOK_POS.get(call.name)
+    if pos is None or pos >= len(call.args):
+        return None
+    arg = call.args[pos]
+    return [arg.value] if arg.kind == "string" else None
+
+
+def _invocation_raw_name(call: PhpCall) -> str:
+    pos = _ALTER_TYPE_POS.get(call.name, _INVOCATION_HOOK_POS.get(call.name))
+    if pos is None or pos >= len(call.args):
+        return ""
+    return call.args[pos].raw
+
+
+def _invocation_candidates(path: Path) -> list[dict]:
+    return [
+        _candidate("non_literal", "", _invocation_raw_name(call), path, call.line)
+        for call in _invocation_calls(path)
+        if _invocation_hook_names(call) is None
+    ]
+
+
+def extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
+    """`invokes_hook` edges from the enclosing PHP function/method to the
+    hook(s) each call targets, plus the file's non-literal invocation
+    `hook_candidates` (spec §5.3-§5.4). `core_result` is core's own PHP
+    extraction of the same `path`: the source id is computed with core's id
+    helpers and emitted only when core emitted that very id. Never raises."""
+    try:
+        return _extract_hook_invocations(Path(path), core_result)
+    except Exception:
+        return {"nodes": [], "edges": [], "hook_candidates": []}
+
+
+def _extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.yaml_common import edge
+    from graphify.extractors.base import _file_stem, _make_id
+
+    registry = current_registry()
+    if registry is None:
+        return {"nodes": [], "edges": [], "hook_candidates": []}
+    calls = _invocation_calls(path)
+    if not calls:
+        return {"nodes": [], "edges": [], "hook_candidates": []}
+
+    core_ids = {n.get("id") for n in (core_result or {}).get("nodes") or ()}
+    stem = _file_stem(path)
+    edges: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for call in calls:
+        names = _invocation_hook_names(call)
+        if names is None:
+            candidates.append(_candidate("non_literal", "", _invocation_raw_name(call), path, call.line))
+            continue
+        if call.function:
+            source = _make_id(stem, call.function)
+        elif call.class_name and call.method:
+            source = _make_id(_make_id(stem, call.class_name), call.method)
+        else:
+            continue
+        if source not in core_ids:
+            continue
+        for name in names:
+            pair = (source, hook_id(name))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            attrs: dict[str, Any] = {"target_name": name}
+            if name not in registry.hooks:
+                attrs["undeclared"] = True
+            edges.append(edge(source, hook_id(name), "invokes_hook", path=path, line=call.line, **attrs))
+    return {"nodes": [], "edges": edges, "hook_candidates": candidates}
 
 
 def hook_dependent_files(registry: Any) -> set[str]:

@@ -251,7 +251,11 @@ def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor, is_api_php
-    from graphify.drupal.hooks import extract_hook_declarations
+    from graphify.drupal.hooks import (
+        extract_hook_declarations,
+        extract_hook_invocations,
+        has_hook_invocation_marker,
+    )
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group, compose_handlers
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
@@ -301,6 +305,14 @@ def _patch_extract(extract: ModuleType) -> None:
                 # Only an in-graph file reaches this dispatch at all -- a
                 # boundary api.php never gets scanned (Task 2 prunes it).
                 extras.append(hook_declarations_extra)
+            if path.suffix == ".php" and has_hook_invocation_marker(path):
+                # Any other in-graph PHP file (a service, a controller, a
+                # manager, `settings.php`, `*.api.php`) that calls
+                # `invoke`/`alter`/`hasImplementations` on some receiver gets
+                # its invocation sites too (spec §5.3). Procedural files and
+                # `src/Hook/**/*.php` already carry this through
+                # `hooks.extract_php_with_hooks` (`drupal_extractor`, above).
+                extras.append(extract_hook_invocations)
             # A `#[Hook]` outside `<extension>/src/Hook/` is no implementation
             # (Drupal never collects it): the inventory lists it as `misplaced`.
             return compose_handlers(base, extras) if extras else base
