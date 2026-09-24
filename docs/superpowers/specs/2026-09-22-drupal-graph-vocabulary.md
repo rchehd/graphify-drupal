@@ -448,8 +448,14 @@ P2b emits the first four:
   core emitted exactly that id.
 - `invokes_hook` from the enclosing function/method to the hook named by a
   string literal of `invokeAll`, `invoke`, `invokeAllWith`, `alter`,
-  `hasImplementations` or a `*Deprecated` form, on any receiver; `alter('x')`
-  targets `x_alter`, `alter(['a', 'b'])` each. A hook no `*.api.php`
+  `hasImplementations` or a `*Deprecated` form; `alter('x')` targets
+  `x_alter`, `alter(['a', 'b'])` each. `invoke` and `alter`, names other APIs
+  share (`ReflectionMethod::invoke`), count only on an explicit module- or
+  theme-handler receiver (`\Drupal::moduleHandler()`,
+  `\Drupal::service('module_handler')`, `\Drupal::service('theme.manager')`,
+  `\Drupal::theme()`, or a variable/property named `moduleHandler` or
+  `themeManager`); on any other receiver the call is an `unknown_receiver`
+  candidate. The other names count on any receiver. A hook no `*.api.php`
   declares is still the target (a boundary stub) and the edge carries
   `undeclared: true`. From a `drupal_plugin_type` with `alter_hook` to
   `<alter_hook>_alter`. A non-literal name is not `AMBIGUOUS`: it is no edge,
@@ -457,9 +463,9 @@ P2b emits the first four:
 
 Everything that looks like a hook but is not a literal, declared name goes to
 the inventory's `hook_candidates` (kinds `variable` with the `pattern` it
-matched, `undeclared`, `misplaced` — `#[Hook]` outside `src/Hook/` —, and
-`non_literal`), never to an edge. A procedural `<ext>_<rest>()` naming no
-declared hook is a candidate only when it claims to be one (an
+matched, `undeclared`, `misplaced` — `#[Hook]` outside `src/Hook/` —,
+`non_literal` and `unknown_receiver`), never to an edge. A procedural
+`<ext>_<rest>()` naming no declared hook is a candidate only when it claims to be one (an
 `Implements hook_…` docblock, or `<rest>` starting with `<group>_` in
 `<ext>.<group>.inc`); any other `<ext>_*` is a helper. Variable-segment
 binding (`alters_form`, `preprocesses`, `suggests_template`, `ENTITY_TYPE_*`)
