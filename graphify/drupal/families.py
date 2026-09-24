@@ -94,3 +94,16 @@ def drupal_extractor(path: Path) -> Callable[[Path], dict] | None:
 
 def is_drupal_file(path: Path) -> bool:
     return drupal_extractor(path) is not None
+
+
+_API_PHP_SUFFIX = ".api.php"
+
+
+def is_api_php(path: Path) -> bool:
+    """True for `<ext>.api.php` -- an extension's declared-hooks file (P2b §5.1).
+
+    Already `.php`, so core classifies and extracts it on its own; this is
+    only the predicate `register.py` uses to compose `hooks.extract_hook_declarations`
+    onto core's own PHP handler for the file.
+    """
+    return path.name.endswith(_API_PHP_SUFFIX) and len(path.name) > len(_API_PHP_SUFFIX)

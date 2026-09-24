@@ -204,7 +204,8 @@ def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.config_stores import clear_caches
     from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
-    from graphify.drupal.families import drupal_extractor
+    from graphify.drupal.families import drupal_extractor, is_api_php
+    from graphify.drupal.hooks import extract_hook_declarations
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
@@ -224,8 +225,8 @@ def _patch_extract(extract: ModuleType) -> None:
     def _compose(base, extra):
         """A handler that runs core's `base` first, then appends `extra(p)`'s
         nodes and edges -- core's PHP nodes are kept either way, and a file
-        that is both cases at once cannot occur (settings.php is never a
-        manager class file), so one helper serves both compositions."""
+        is never more than one of settings.php, a manager class file or an
+        `*.api.php` at once, so one helper serves every composition."""
         def handler(p: Path, _base=base, _extra=extra):
             result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
             ours = _extra(p)
@@ -246,6 +247,11 @@ def _patch_extract(extract: ModuleType) -> None:
             if path.suffix == ".php" and is_manager_class_file(path):
                 # Keep core's PHP nodes; add the type's node and edges (spec §5.4).
                 return _compose(base, extract_plugin_types)
+            if is_api_php(path):
+                # Keep core's PHP nodes; add the hook nodes and edges (spec §5.3).
+                # Only an in-graph file reaches this dispatch at all -- a
+                # boundary api.php never gets scanned (Task 2 prunes it).
+                return _compose(base, extract_hook_declarations)
             return base
         return _get_extractor
 

@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from graphify.drupal.hooks import HookDecl, hook_pattern, read_hook_stubs
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
 from graphify.drupal.yaml_common import load_drupal_yaml
@@ -66,6 +67,11 @@ class Registry:
     unresolved: list[dict[str, str]] = field(default_factory=list)
     extensions: dict[str, str] = field(default_factory=dict)
     root_yaml: list[str] = field(default_factory=list)
+    hooks: dict[str, HookDecl] = field(default_factory=dict)
+    #: service id -> (class, provider extension), every `*.services.yml` (P2b §4.3).
+    services: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: extension name -> (type "module"|"theme"|"profile", dir), every `*.info.yml`.
+    extension_info: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     def by_yaml_name(self) -> dict[str, PluginType]:
         """Non-deferred types that read `<ext>.<yaml_name>.yml` files."""
@@ -84,6 +90,9 @@ class Registry:
             "unresolved": [dict(u) for u in self.unresolved],
             "extensions": dict(self.extensions),
             "root_yaml": list(self.root_yaml),
+            "hooks": {k: asdict(v) for k, v in self.hooks.items()},
+            "services": {k: list(v) for k, v in self.services.items()},
+            "extension_info": {k: list(v) for k, v in self.extension_info.items()},
         }
 
     @classmethod
@@ -94,11 +103,28 @@ class Registry:
             unresolved=[dict(u) for u in data.get("unresolved") or []],
             extensions=dict(data.get("extensions") or {}),
             root_yaml=list(data.get("root_yaml") or []),
+            hooks={k: HookDecl(**v) for k, v in (data.get("hooks") or {}).items()},
+            services={k: tuple(v) for k, v in (data.get("services") or {}).items()},
+            extension_info={k: tuple(v) for k, v in (data.get("extension_info") or {}).items()},
         )
 
 
 def type_id(plugin_type: str) -> str:
     return make_id("drupal", "plugin_type", plugin_type)
+
+
+def registry_owner_of(registry: Registry, path: Path) -> str:
+    """The extension whose directory contains `path` (longest match); `core`
+    for `core/lib/**` (mirrors `_Builder.owner_of`, but usable at extraction
+    time -- the builder itself does not survive past `build_registry`)."""
+    target = path.as_posix()
+    if registry.web_root is not None and target.startswith(f"{registry.web_root}/core/lib/"):
+        return "core"
+    best, best_len = "", -1
+    for ext, directory in registry.extensions.items():
+        if target.startswith(directory + "/") and len(directory) > best_len:
+            best, best_len = ext, len(directory)
+    return best
 
 
 #: `registry.by_class_file()` built once per registry object and cached as an
@@ -187,6 +213,30 @@ def find_web_root(scan_root: Path) -> Path | None:
     return None
 
 
+_INFO_TYPE_RE = re.compile(r"(?m)^type:\s*([\w.]+)")
+_API_PHP_SUFFIX = ".api.php"
+
+
+def _read_extension_type(path: Path) -> str:
+    """`type:` of `path`'s `*.info.yml`, or `"module"` when absent/unrecognised.
+
+    A cheap regex scan, not a full YAML parse: an info.yml is a handful of
+    lines and the registry walk reads one per extension (~1,140 on the
+    reference corpus), so this must stay far under the per-file cost of
+    `yaml.safe_load`.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "module"
+    match = _INFO_TYPE_RE.search(text)
+    if match:
+        value = match.group(1).strip().strip("'\"")
+        if value in ("module", "theme", "profile"):
+            return value
+    return "module"
+
+
 @dataclass
 class _Walk:
     extensions: dict[str, str] = field(default_factory=dict)
@@ -194,6 +244,8 @@ class _Walk:
     managers: list[Path] = field(default_factory=list)
     providers: list[Path] = field(default_factory=list)
     root_yaml: list[str] = field(default_factory=list)
+    api_php: list[Path] = field(default_factory=list)
+    extension_info: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 def _walk(base: Path, core_dir: Path | None,
@@ -222,6 +274,10 @@ def _walk(base: Path, core_dir: Path | None,
         exts = [extension_machine_name(Path(n)) for n in info]
         for ext in exts:
             found.extensions.setdefault(ext, directory.as_posix())
+        for ext, info_name in zip(exts, info):
+            if ext not in found.extension_info:
+                found.extension_info[ext] = (
+                    _read_extension_type(directory / info_name), directory.as_posix())
         is_core_dir = core_dir is not None and directory == core_dir
         in_src = "src" in Path(dirpath[len(str(base)):]).parts
         for name in names:
@@ -235,6 +291,9 @@ def _walk(base: Path, core_dir: Path | None,
             elif name.endswith("Manager.php") and in_src:
                 if kept(path):
                     found.managers.append(path)
+            elif name.endswith(_API_PHP_SUFFIX) and len(name) > len(_API_PHP_SUFFIX):
+                if kept(path):
+                    found.api_php.append(path)
             if name.startswith(".") or not name.endswith(".yml") or name in info:
                 continue
             if (any(name.startswith(f"{ext}.") for ext in exts)
@@ -249,6 +308,9 @@ class _Builder:
         self.walk = walk
         self.unresolved: list[dict[str, str]] = []
         self.types: dict[str, PluginType] = {}
+        self.hooks: dict[str, HookDecl] = {}
+        #: service id -> (class, provider extension); every service `_read_services` reaches.
+        self.services: dict[str, tuple[str, str]] = {}
         self._classes: dict[str, tuple[Path, PhpClass] | None] = {}
         self._reaches: dict[str, bool] = {}
         self._noted: set[tuple[str, str, str]] = set()
@@ -530,6 +592,8 @@ def _read_services(builder: _Builder, path: Path) -> set[str]:
         if definition is not None and not isinstance(definition, dict):
             continue
         fqcn = _service_class(sid, services)
+        if fqcn:
+            builder.services.setdefault(sid, (fqcn, stem))
         if not fqcn.startswith("Drupal\\"):
             continue
         found = builder.lookup(fqcn)
@@ -648,12 +712,28 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
         if found is not None and builder.is_manager(found[1]):
             builder.note(fqcn, path.as_posix(), "service_provider_alter")
 
+    # Every `function hook_<name>(` stub in every `*.api.php` (boundary
+    # included -- the walk ran inside `registry_walk()`), keyed by name; the
+    # first extension to declare a name wins, matching `add_type`'s rule.
+    for path in walk.api_php:
+        owner = builder.owner_of(path)
+        for name, line in read_hook_stubs(path):
+            if name in builder.hooks:
+                continue
+            builder.hooks[name] = HookDecl(
+                name=name, provider=owner, file=path.as_posix(), line=line,
+                pattern=hook_pattern(name),
+            )
+
     return Registry(
         web_root=web_root.as_posix() if web_root is not None else None,
         types=builder.types,
         unresolved=builder.unresolved,
         extensions=walk.extensions,
         root_yaml=walk.root_yaml,
+        hooks=builder.hooks,
+        services=builder.services,
+        extension_info=walk.extension_info,
     )
 
 
@@ -785,6 +865,20 @@ def affected_files(previous: Registry | None, current: Registry | None) -> set[s
     for path in old_files.keys() | new_files.keys():
         if _sorted_types(old_files.get(path, [])) != _sorted_types(new_files.get(path, [])):
             result.add(path)
+
+    # A hook added, removed or changed (name, provider, pattern, or which
+    # file declares it): the `*.api.php` file(s) that declared the old and/or
+    # new version. Task 4 widens this further to every in-graph procedural
+    # file and `src/Hook/**/*.php` (spec §5.5) -- this only re-extracts the
+    # `*.api.php` files themselves, so their own `drupal_hook` nodes stay current.
+    old_hooks, new_hooks = previous.hooks, current.hooks
+    for name in old_hooks.keys() | new_hooks.keys():
+        old_decl, new_decl = old_hooks.get(name), new_hooks.get(name)
+        if old_decl == new_decl:
+            continue
+        for decl in (old_decl, new_decl):
+            if decl is not None:
+                result.add(decl.file)
     return result
 
 
