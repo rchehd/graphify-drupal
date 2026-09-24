@@ -35,6 +35,12 @@ Readings of spec §5.2-§5.4, settled for P2b:
   it, and each implementation gets its own `hook_implemented_by` edge;
 - a non-literal hook name, `module:` or class-level `method:` is a
   `non_literal` candidate, never an implementation;
+- `invoke` and `alter` are names other APIs share (`ReflectionMethod::invoke`,
+  a class's own `alter()`), so they are invocations only on an explicit
+  module- or theme-handler receiver (`_is_handler_receiver`); on any other
+  receiver the call is an `unknown_receiver` candidate. `invokeAll`,
+  `invokeAllWith`, `hasImplementations` and the `*Deprecated` forms count on
+  any receiver;
 - an extension implementing a hook it declares itself gets no
   `implements_hook`: that pair already carries `declares_hook`.
 """
@@ -378,7 +384,7 @@ def find_hook_candidates(path: Path, registry: Any) -> list[dict]:
     """The `hook_candidates` entries of one file (spec §5.4), implementation
     and invocation alike. Never raises."""
     try:
-        return _scan(path, registry)[1] + _invocation_candidates(path)
+        return _scan(path, registry)[1] + _invocation_candidates(path, registry)
     except Exception:
         return []
 
@@ -485,6 +491,20 @@ _ALTER_TYPE_POS = {
     "alterDeprecated": 1,
 }
 _INVOCATION_METHODS = frozenset(_INVOCATION_HOOK_POS) | frozenset(_ALTER_TYPE_POS)
+#: Names other APIs share (`ReflectionMethod::invoke`, a class's own `alter()`):
+#: a call counts only on a receiver that is explicitly a module or theme
+#: handler (`_is_handler_receiver`). The other names are Drupal's alone.
+_GENERIC_INVOCATION_METHODS = frozenset({"invoke", "alter"})
+_HANDLER_EXPRESSIONS = frozenset({
+    "Drupal::moduleHandler()",
+    "Drupal::service('module_handler')",
+    'Drupal::service("module_handler")',
+    "Drupal::service('theme.manager')",
+    'Drupal::service("theme.manager")',
+    "Drupal::theme()",
+})
+_HANDLER_NAMES = frozenset({"modulehandler", "thememanager"})
+_RECEIVER_NAME = re.compile(r"(?:^\$|->|::\$)(\w+)$")
 _INVOCATION_MARKERS = (b"->invoke", b"->alter", b"->hasImplementations")
 
 
@@ -496,6 +516,22 @@ def has_hook_invocation_marker(path: Path) -> bool:
     except OSError:
         return False
     return any(marker in data for marker in _INVOCATION_MARKERS)
+
+
+def _is_handler_receiver(receiver: str) -> bool:
+    """`\\Drupal::moduleHandler()`, `\\Drupal::service('module_handler')`,
+    `\\Drupal::service('theme.manager')`, `\\Drupal::theme()`, or a variable
+    or property named `moduleHandler`/`themeManager` (case-insensitive,
+    ignoring `_`: `$this->moduleHandler`, `$module_handler`)."""
+    text = re.sub(r"\s+", "", receiver).lstrip("\\")
+    if text in _HANDLER_EXPRESSIONS:
+        return True
+    match = _RECEIVER_NAME.search(text)
+    return match is not None and match.group(1).replace("_", "").lower() in _HANDLER_NAMES
+
+
+def _unknown_receiver(call: PhpCall) -> bool:
+    return call.name in _GENERIC_INVOCATION_METHODS and not _is_handler_receiver(call.receiver)
 
 
 def _invocation_calls(path: Path) -> list[PhpCall]:
@@ -532,12 +568,26 @@ def _invocation_raw_name(call: PhpCall) -> str:
     return call.args[pos].raw
 
 
-def _invocation_candidates(path: Path) -> list[dict]:
-    return [
-        _candidate("non_literal", "", _invocation_raw_name(call), path, call.line)
-        for call in _invocation_calls(path)
-        if _invocation_hook_names(call) is None
-    ]
+def _unknown_receiver_candidate(call: PhpCall, path: Path, registry: Any) -> dict:
+    from graphify.drupal.discovery import registry_owner_of
+
+    module = registry_owner_of(registry, Path(path).absolute()) if registry is not None else ""
+    return {"kind": "unknown_receiver", "module": module or "", "name": _invocation_raw_name(call),
+            "method": call.name, "file": str(path), "line": call.line}
+
+
+def _invocation_candidate(call: PhpCall, path: Path, registry: Any) -> dict | None:
+    """The candidate `call` is instead of an edge, or None when it is an edge."""
+    if _unknown_receiver(call):
+        return _unknown_receiver_candidate(call, path, registry)
+    if _invocation_hook_names(call) is None:
+        return _candidate("non_literal", "", _invocation_raw_name(call), path, call.line)
+    return None
+
+
+def _invocation_candidates(path: Path, registry: Any) -> list[dict]:
+    found = (_invocation_candidate(call, path, registry) for call in _invocation_calls(path))
+    return [c for c in found if c is not None]
 
 
 def extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
@@ -571,10 +621,11 @@ def _extract_hook_invocations(path: Path, core_result: dict) -> dict[str, Any]:
     seen_pairs: set[tuple[str, str]] = set()
 
     for call in calls:
-        names = _invocation_hook_names(call)
-        if names is None:
-            candidates.append(_candidate("non_literal", "", _invocation_raw_name(call), path, call.line))
+        candidate = _invocation_candidate(call, path, registry)
+        if candidate is not None:
+            candidates.append(candidate)
             continue
+        names = _invocation_hook_names(call) or []
         if call.function:
             source = _make_id(stem, call.function)
         elif call.class_name and call.method:

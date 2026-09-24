@@ -320,3 +320,67 @@ def _cli(root: Path, out: Path) -> None:
         capture_output=True, text=True, cwd=root, env=env,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# -- `invoke`/`alter` need a module- or theme-handler receiver (controller ruling) ---
+
+RECEIVERS_PHP = """<?php
+
+namespace Drupal\\foo;
+
+class Receivers {
+
+  public function run($object, $d) {
+    $method = new \\ReflectionMethod($object, 'build');
+    $method->invoke($object, 'reflected');
+    $this->alter(['tiny', 'small']);
+    $this->moduleHandler->alter('p', $d);
+    \\Drupal::moduleHandler()->invoke('m', 'cron');
+    $module_handler->alter('q', $d);
+    \\Drupal::service('module_handler')->invoke('m', 'r');
+    \\Drupal::service('theme.manager')->alter('s', $d);
+    \\Drupal::theme()->alter('t', $d);
+    $this->themeManager->alter('u', $d);
+    $handler->invokeAll('kept');
+    $handler->hasImplementations('also_kept');
+  }
+
+}
+"""
+
+
+def _receivers_site(tmp_path: Path) -> Path:
+    files = {
+        "web/core/core.api.php": CORE_API_PHP,
+        **_module("foo", "services: {}\n", {"src/Receivers.php": RECEIVERS_PHP}),
+    }
+    return _site(tmp_path, files)
+
+
+def test_invoke_and_alter_count_only_on_a_handler_receiver(tmp_path, _isolated_discovery_state):
+    install()
+    root = _receivers_site(tmp_path)
+    prepare_run(root)
+    path = root / FOO / "src/Receivers.php"
+
+    result = extract_hook_invocations(path, _core_php(path))
+
+    assert sorted(e["target_name"] for e in result["edges"]) == [
+        "also_kept", "cron", "kept", "p_alter", "q_alter", "r", "s_alter", "t_alter", "u_alter"]
+    assert result["hook_candidates"] == [
+        {"kind": "unknown_receiver", "module": "foo", "name": "'reflected'", "method": "invoke",
+         "file": str(path), "line": 9},
+        {"kind": "unknown_receiver", "module": "foo", "name": "['tiny', 'small']", "method": "alter",
+         "file": str(path), "line": 10},
+    ]
+
+
+def test_the_inventory_lists_unknown_receiver_candidates(tmp_path, _isolated_discovery_state):
+    install()
+    root = _receivers_site(tmp_path)
+    registry = prepare_run(root)
+    detected = {str(p) for p in root.rglob("*") if p.is_file()}
+
+    inventory = build_inventory(registry, detected, root)
+    assert [(c["kind"], c["method"], c["line"]) for c in inventory["hook_candidates"]] == [
+        ("unknown_receiver", "invoke", 9), ("unknown_receiver", "alter", 10)]

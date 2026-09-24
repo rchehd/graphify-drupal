@@ -774,8 +774,8 @@ def test_p2b_criterion_3_no_custom_hook_is_silent(p2b):
 
     by_kind = collections.Counter(c["kind"] for c in inventory["hook_candidates"])
     # 24 variable-segment names (form_*_alter, preprocess_*, *_access, ...) and
-    # 3 plugin-info alters no `*.api.php` declares. The `non_literal` entries
-    # are invocation sites; see test_p2b_invocations.
+    # 3 plugin-info alters no `*.api.php` declares. The invocation-site
+    # entries (`unknown_receiver`) are in test_p2b_invocations.
     assert (by_kind["variable"], by_kind["undeclared"]) == (24, 3)
     assert inventory["summary"]["hook_candidates"] == len(inventory["hook_candidates"])
 
@@ -833,14 +833,16 @@ def test_p2b_the_graph_is_own_code_plus_a_named_boundary(p2b):
 
 def test_p2b_invocations(p2b):
     edges = [e for e in p2b["extraction"]["edges"] if e["relation"] == "invokes_hook"]
-    # Two custom plugin managers' alter hooks, one kernel test's invokeAll,
-    # and three from a unit test's own `$this->alter([...])` helper, which the
-    # any-receiver rule (plan Task 5) reads as a module-handler alter.
-    assert len(edges) == 6
-    non_literal = [c for c in p2b["inventory"]["hook_candidates"] if c["kind"] == "non_literal"]
-    # All in custom tests/ trees (ReflectionMethod::invoke, the same helper).
-    assert len(non_literal) == 14
-    assert all("/tests/" in c["file"] for c in non_literal)
+    # Two custom plugin managers' alter hooks and one kernel test's invokeAll.
+    assert sorted(e["target_name"] for e in edges) == [
+        "system_type_info_alter", "webform_integration_type_info_alter",
+        "webform_submission_insert"]
+    by_kind = collections.Counter(c["kind"] for c in p2b["inventory"]["hook_candidates"])
+    # `invoke`/`alter` on no handler: ReflectionMethod::invoke and a unit test's
+    # own `alter()` helper, all in custom tests/ trees; no literal-less handler call.
+    unknown = [c for c in p2b["inventory"]["hook_candidates"] if c["kind"] == "unknown_receiver"]
+    assert (len(unknown), by_kind["non_literal"]) == (15, 0)
+    assert all("/tests/" in c["file"] for c in unknown)
 
 
 def test_p2b_every_drupal_node_survives_the_build(p2b):

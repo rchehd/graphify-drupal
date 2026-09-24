@@ -357,6 +357,7 @@ class PhpCall:
     function: str        # enclosing top-level function name, "" when inside a class
     class_name: str       # enclosing class name, "" when none
     method: str            # enclosing method name, "" when none
+    receiver: str = ""     # the called object's verbatim source text (`$this->moduleHandler`)
 
 
 def read_php_calls(path: Path, names: "frozenset[str]") -> list[PhpCall]:
@@ -405,7 +406,8 @@ def _collect_calls(
             if call_name in names:
                 args_node = child.child_by_field_name("arguments")
                 out.append(PhpCall(call_name, child.start_point[0] + 1,
-                                   _build_call_args(args_node), function, class_name, method))
+                                   _build_call_args(args_node), function, class_name, method,
+                                   _text(child.child_by_field_name("object"))))
             _collect_calls(child, names, function, class_name, method, out)
             continue
         _collect_calls(child, names, function, class_name, method, out)
