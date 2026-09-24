@@ -1,7 +1,7 @@
 """The single point where graphify.drupal touches graphify core.
 
 Nothing in core is edited. `install()` places a finder on `sys.meta_path` that
-wraps the loader for `graphify.cache`, `graphify.cli`, `graphify.detect`,
+wraps the loader for `graphify.cache`, `graphify.cli`, `graphify.dedup`, `graphify.detect`,
 `graphify.extract`, `graphify.report` and `graphify.watch`, applying the patch
 immediately after each module finishes executing — and patches any of them
 directly if it is already in `sys.modules`.
@@ -719,9 +719,35 @@ def _patch_cli(cli: ModuleType) -> None:
     _wrap(cli, "_zero_node_stamped_code_sources", _heal)
 
 
+def _patch_dedup(dedup: ModuleType) -> None:
+    """Key Drupal nodes by id in core's entity dedup, as core keys code symbols.
+
+    `deduplicate_entities` merges `concept` nodes across files by label, exactly
+    and fuzzily; `_is_code` is what exempts a node, and core asks it by bare
+    name. A Drupal id is the entity itself (`make_id` of its kind and name) and
+    the same id from several files is already one node, so a label match is
+    never evidence of sameness: boundary stubs are `concept` (vocabulary §1.3),
+    and without this the core module `toolbar` merged into the hook `toolbar`,
+    and route, menu-link and local-task stubs sharing a label into each other.
+    """
+    if not callable(getattr(dedup, "_is_code", None)):
+        raise DrupalSeamError(
+            "graphify.dedup._is_code is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _identity(original):
+        def _is_code(node):
+            return original(node) or str(node.get("type", "")).startswith("drupal_")
+        return _is_code
+
+    _wrap(dedup, "_is_code", _identity)
+
+
 _PATCHERS = {
     "graphify.cache": _patch_cache,
     "graphify.cli": _patch_cli,
+    "graphify.dedup": _patch_dedup,
     "graphify.detect": _patch_detect,
     "graphify.extract": _patch_extract,
     "graphify.report": _patch_report,
