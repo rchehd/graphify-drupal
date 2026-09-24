@@ -347,6 +347,15 @@ _MAX_RENDERED_FAMILIES = 15
 _MAX_RENDERED_CLASSES = 5
 
 
+def _counts(counts: object, order: tuple[str, ...] = ()) -> str:
+    """`core 1, contrib 101` -- `order`'s keys first, then the rest by name;
+    "none" for a missing or empty mapping."""
+    if not isinstance(counts, dict) or not counts:
+        return "none"
+    keys = [k for k in order if k in counts] + sorted(k for k in counts if k not in order)
+    return ", ".join(f"{k} {counts[k]}" for k in keys)
+
+
 def render_section(inventory: dict) -> str:
     """Markdown "Drupal coverage" section appended to `GRAPH_REPORT.md`.
 
@@ -358,6 +367,11 @@ def render_section(inventory: dict) -> str:
     lines = ["## Drupal coverage", "", "| metric | value |", "| --- | --- |"]
     for key, label in _SUMMARY_LABELS:
         lines.append(f"| {label} | {summary.get(key, 0)} |")
+    lines.append(f"| boundary dirs | {_counts(summary.get('boundary'), _BOUNDARY_KINDS)} |")
+    lines.append(f"| boundary reasons | {_counts(summary.get('boundary_reasons'))} |")
+    if inventory.get("composer_unreadable"):
+        lines += ["", f"composer: {inventory['composer_unreadable']} -- P0's path rules "
+                      "decided the realms and the boundary instead."]
 
     lines += ["", "### Unrecognised YAML families"]
     unrecognised = inventory.get("unrecognised_yaml") or []

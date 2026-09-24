@@ -240,3 +240,18 @@ def test_yaml_plugins_counts_only_the_entries_extraction_emits(tmp_path, _isolat
 
     inventory = build_inventory(registry, _detected_yaml(root), root)
     assert inventory["summary"]["yaml_plugins"] == 2
+
+
+def test_render_section_shows_the_boundary_and_an_unreadable_composer():
+    """Final review minor 5: GRAPH_REPORT carries the boundary counts, their
+    reasons and `composer_unreadable`, not only the JSON inventory."""
+    text = render_section({
+        "summary": {"boundary": {"core": 1, "contrib": 101, "vendor": 1, "files": 1},
+                    "boundary_reasons": {"composer": 102, "site_files": 1, "vendor_dir": 1}},
+        "composer_unreadable": "composer.lock unreadable: Expecting value",
+    })
+    assert "| boundary dirs | core 1, contrib 101, vendor 1, files 1 |" in text
+    assert "| boundary reasons | composer 102, site_files 1, vendor_dir 1 |" in text
+    assert "composer.lock unreadable: Expecting value" in text
+    assert "| boundary dirs | none |" in render_section({})
+    assert "composer" not in render_section({}).lower()
