@@ -248,11 +248,11 @@ def _patch_detect(detect: ModuleType) -> None:
 def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.boundary import clear_caches as clear_boundary_caches
     from graphify.drupal.config_stores import clear_caches
-    from graphify.drupal.discovery import clear_force_miss, current_registry
+    from graphify.drupal.discovery import clear_force_miss
     from graphify.drupal.discovery import extract_plugin_types, is_manager_class_file
     from graphify.drupal.families import drupal_extractor, is_api_php
-    from graphify.drupal.hooks import extract_hook_declarations, extract_hook_implementations
-    from graphify.drupal.merge import collapse_drupal_duplicates, collision_group
+    from graphify.drupal.hooks import extract_hook_declarations
+    from graphify.drupal.merge import collapse_drupal_duplicates, collision_group, compose_handlers
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
@@ -275,21 +275,6 @@ def _patch_extract(extract: ModuleType) -> None:
             "graphify.extract._DISPATCH has no '.php' handler — graphify core changed "
             "shape; graphify/drupal/register.py must be updated"
         )
-
-    def _compose(base, extras):
-        """A handler that runs core's `base` first, then appends each extra's
-        nodes and edges. An extra is called as `extra(p, core_result)` with
-        core's own result for `p`, so it can point at core's nodes; core's
-        PHP nodes are kept either way."""
-        def handler(p: Path, _base=base, _extras=tuple(extras)):
-            result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
-            core_result = dict(result)
-            for extra in _extras:
-                ours = extra(p, core_result)
-                result["nodes"] = list(result.get("nodes", [])) + ours["nodes"]
-                result["edges"] = list(result.get("edges", [])) + ours["edges"]
-            return result
-        return handler
 
     def _path_only(extra):
         return lambda p, _core_result: extra(p)
@@ -316,11 +301,9 @@ def _patch_extract(extract: ModuleType) -> None:
                 # Only an in-graph file reaches this dispatch at all -- a
                 # boundary api.php never gets scanned (Task 2 prunes it).
                 extras.append(hook_declarations_extra)
-            if path.suffix == ".php" and base is not None and current_registry() is not None:
-                # A `#[Hook]` outside `src/Hook` (spec §5.4); the extractor's
-                # own text check keeps this to one read of a hook-free file.
-                extras.append(extract_hook_implementations)
-            return _compose(base, extras) if extras else base
+            # A `#[Hook]` outside `<extension>/src/Hook/` is no implementation
+            # (Drupal never collects it): the inventory lists it as `misplaced`.
+            return compose_handlers(base, extras) if extras else base
         return _get_extractor
 
     _wrap(extract, "_get_extractor", _dispatch)

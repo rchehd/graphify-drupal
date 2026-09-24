@@ -12,13 +12,16 @@ per stub plus a `declares_hook` edge from the owning extension, composed onto
 core's own PHP nodes for that file (see `register.py`'s `_compose`).
 
 `extract_hook_implementations` reads what implements a hook (spec §5.4):
-`#[Hook]` attributes in any PHP file, and procedural `<ext>_<hook>()`
+`#[Hook]` attributes in an extension's `src/Hook/**/*.php`
+(`is_hook_class_file`, where Drupal's `HookCollectorPass` looks; one
+anywhere else is a `misplaced` candidate), and procedural `<ext>_<hook>()`
 functions in an extension's procedural files (`is_procedural_file`), which
-the seam makes PHP for detection and extraction (spec §5.2). Only a literal,
+the seam makes PHP for detection and extraction (spec §5.2). `<ext>_update_N`
+and `<ext>_post_update_*` are update functions, never hooks, and are skipped. Only a literal,
 declared hook name becomes an implementation; everything else that looks
 like one is a `hook_candidates` inventory entry (vocabulary §5.6).
 
-Three readings of spec §5.2-§5.4, settled for P2b:
+Readings of spec §5.2-§5.4, settled for P2b:
 - a procedural `<ext>_<rest>()` naming no declared hook is an `undeclared`
   candidate only when it claims to be a hook -- its docblock reads
   `Implements hook_…`, or it sits in a group file `<ext>.<group>.inc` and
@@ -29,7 +32,11 @@ Three readings of spec §5.2-§5.4, settled for P2b:
   classification and handler (`register.py`'s `classify_file`);
 - the id `drupal:hook_impl:<module>:<hook>` is one node however many
   functions or methods implement that hook for that module: the first names
-  it, and each implementation gets its own `hook_implemented_by` edge.
+  it, and each implementation gets its own `hook_implemented_by` edge;
+- a non-literal hook name, `module:` or class-level `method:` is a
+  `non_literal` candidate, never an implementation;
+- an extension implementing a hook it declares itself gets no
+  `implements_hook`: that pair already carries `declares_hook`.
 """
 from __future__ import annotations
 
@@ -147,6 +154,7 @@ HOOK_ATTRIBUTE = "Drupal\\Core\\Hook\\Attribute\\Hook"
 _HOOK_PARAMS = ("hook", "method", "module", "order")
 _INVOKE = "__invoke"
 _IMPLEMENTS_DOC = "Implements hook_"
+_UPDATE_FUNCTION = re.compile(r"update_\d+|post_update_.+")
 
 
 def hook_impl_id(module: str, hook: str) -> str:
@@ -180,12 +188,26 @@ def is_procedural_file(path: Path) -> bool:
 
 
 def is_hook_class_file(path: Path) -> bool:
-    """A `.php` file under some `src/Hook/` directory -- where Drupal 11
-    looks for `#[Hook]` classes."""
-    if Path(path).suffix != ".php":
+    """A `.php` file under `<extension>/src/Hook/` -- the only place Drupal's
+    `HookCollectorPass` collects `#[Hook]` classes from -- for the extension
+    that owns it in the current registry. False without a registry."""
+    if Path(path).suffix != ".php" or "/src/Hook/" not in Path(path).as_posix():
         return False
-    parts = Path(path).parts
-    return any(parts[i] == "src" and parts[i + 1] == "Hook" for i in range(len(parts) - 2))
+    from graphify.drupal.discovery import current_registry
+
+    registry = current_registry()
+    return registry is not None and _is_hook_class_file(path, registry)
+
+
+def _is_hook_class_file(path: Path, registry: Any) -> bool:
+    from graphify.drupal.discovery import registry_owner_of
+
+    target = Path(path).absolute()
+    owner = registry_owner_of(registry, target)
+    directory = registry.extensions.get(owner)
+    if not directory:
+        return False
+    return target.as_posix().startswith(directory.rstrip("/") + "/src/Hook/")
 
 
 @dataclass(frozen=True)
@@ -256,6 +278,10 @@ def _procedural(path: Path, ext: str, registry: Any, impls: list[_Impl], candida
         if not function.name.startswith(prefix) or len(function.name) == len(prefix):
             continue
         rest = function.name[len(prefix):]
+        if _UPDATE_FUNCTION.fullmatch(rest):
+            # `hook_update_N` / `hook_post_update_NAME` are run by the update
+            # system, not collected as hooks (Drupal's HookCollectorPass skips them).
+            continue
         kind, pattern = _classify(rest, registry)
         if kind == "declared":
             impls.append(_Impl(ext, rest, "procedural", function.line, function=function.name))
@@ -275,25 +301,41 @@ def _hook_args(attribute: PhpAttribute) -> dict[str, Any]:
     return args
 
 
-def _attribute(path: Path, owner: str, class_name: str, method: str, attribute: PhpAttribute,
-               registry: Any, impls: list[_Impl], candidates: list[dict]) -> None:
+def _attribute(path: Path, owner: str, class_name: str, method: str, class_level: bool,
+               attribute: PhpAttribute, placed: bool, registry: Any,
+               impls: list[_Impl], candidates: list[dict]) -> None:
+    """One `#[Hook]`: an implementation only when it sits in a hook class
+    file (`placed`) and its hook, `module:` and (class-level) `method:` are
+    literals naming a declared hook; otherwise the candidate saying why."""
     args = _hook_args(attribute)
-    module_arg = args.get("module")
-    module = (module_arg.string if module_arg is not None else None) or owner
-    hook_arg = args.get("hook")
-    if not module or hook_arg is None:
+    hook_arg, module_arg, method_arg = args.get("hook"), args.get("module"), args.get("method")
+    if hook_arg is None:
         return
+    name = hook_arg.string if hook_arg.string is not None else hook_arg.text
+    module = owner if module_arg is None else (
+        module_arg.string if module_arg.string is not None else module_arg.text)
+    if not placed:
+        # Drupal collects `#[Hook]` only from `<extension>/src/Hook/`.
+        candidates.append(_candidate("misplaced", module, name, path, attribute.line))
+        return
+    literal = hook_arg.string is not None \
+        and (module_arg is None or module_arg.string is not None) \
+        and (not class_level or method_arg is None or method_arg.string is not None)
+    if not literal:
+        candidates.append(_candidate("non_literal", module, name, path, attribute.line))
+        return
+    if not module:
+        return
+    if class_level:
+        method = (method_arg.string if method_arg is not None else "") or _INVOKE
     order_arg = args.get("order")
     order = order_arg.text if order_arg is not None else ""
-    if hook_arg.string is None:
-        candidates.append(_candidate("non_literal", module, hook_arg.text, path, attribute.line))
-        return
-    kind, pattern = _classify(hook_arg.string, registry)
+    kind, pattern = _classify(name, registry)
     if kind == "declared":
-        impls.append(_Impl(module, hook_arg.string, "attribute", attribute.line,
+        impls.append(_Impl(module, name, "attribute", attribute.line,
                            class_name=class_name, method=method, order=order))
     else:
-        candidates.append(_candidate(kind, module, hook_arg.string, path, attribute.line, pattern))
+        candidates.append(_candidate(kind, module, name, path, attribute.line, pattern))
 
 
 def _attributes(path: Path, registry: Any, impls: list[_Impl], candidates: list[dict]) -> None:
@@ -305,16 +347,17 @@ def _attributes(path: Path, registry: Any, impls: list[_Impl], candidates: list[
     except OSError:
         return
     owner = registry_owner_of(registry, Path(path).absolute())
+    placed = _is_hook_class_file(path, registry)
     for cls in read_php_attributes(path):
         for attribute in cls.attributes:
             if attribute.name == HOOK_ATTRIBUTE:
-                method_arg = _hook_args(attribute).get("method")
-                method = (method_arg.string if method_arg is not None else None) or _INVOKE
-                _attribute(path, owner, cls.name, method, attribute, registry, impls, candidates)
+                _attribute(path, owner, cls.name, "", True, attribute, placed, registry,
+                           impls, candidates)
         for method in cls.methods:
             for attribute in method.attributes:
                 if attribute.name == HOOK_ATTRIBUTE:
-                    _attribute(path, owner, cls.name, method.name, attribute, registry, impls, candidates)
+                    _attribute(path, owner, cls.name, method.name, False, attribute, placed,
+                               registry, impls, candidates)
 
 
 def _scan(path: Path, registry: Any) -> tuple[list[_Impl], list[dict]]:
@@ -390,8 +433,13 @@ def _extract_hook_implementations(path: Path, core_result: dict) -> dict[str, An
                 attrs["order"] = impl.order
             nodes.append(node(impl_id, f"{impl.module}:{impl.hook}", type="drupal_hook_impl",
                               layer="hook", path=path, line=impl.line, **attrs))
-        add_edge(extension_id(impl.module), hook_id(impl.hook), "implements_hook", impl.line,
-                 owner=impl.module, target_name=impl.hook)
+        declaration = registry.hooks.get(impl.hook)
+        if declaration is None or declaration.provider != impl.module:
+            # One relation per ordered node pair: an extension implementing
+            # its own hook already has `declares_hook` to it, so the pair is
+            # not doubled (the impl node and `hook_implemented_by` still say it).
+            add_edge(extension_id(impl.module), hook_id(impl.hook), "implements_hook", impl.line,
+                     owner=impl.module, target_name=impl.hook)
         if impl.function:
             target = _make_id(stem, impl.function)
         else:
@@ -406,12 +454,9 @@ def extract_php_with_hooks(path: Path) -> dict[str, Any]:
     handler for procedural files and `src/Hook/**/*.php` (spec §5.2).
     `register.py` asserts that core's `.php` handler exists."""
     import graphify.extract as core
+    from graphify.drupal.merge import compose_handlers
 
-    result = dict(core._DISPATCH[".php"](path))
-    ours = extract_hook_implementations(path, result)
-    result["nodes"] = list(result.get("nodes") or []) + ours["nodes"]
-    result["edges"] = list(result.get("edges") or []) + ours["edges"]
-    return result
+    return compose_handlers(core._DISPATCH[".php"], [extract_hook_implementations])(path)
 
 
 def hook_dependent_files(registry: Any) -> set[str]:

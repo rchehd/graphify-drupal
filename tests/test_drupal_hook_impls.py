@@ -13,6 +13,7 @@ from graphify.drupal.hooks import (
     extract_hook_implementations,
     hook_id,
     hook_impl_id,
+    is_hook_class_file,
     is_procedural_file,
 )
 from graphify.drupal.inventory import build_inventory, render_section
@@ -498,9 +499,9 @@ def test_corpus_custom_implementations_are_edges_or_candidates(tmp_path, _isolat
     # Measured on FormsRemote (task-4-report.md): spec §2 counts 19 attribute
     # hooks naming a declared hook literally and 23 procedural ones.
     assert impls == {"attribute": 19, "procedural": 23}
-    # 12 attribute candidates (3 undeclared, 9 variable) + 64 procedural
-    # variable ones (49 of them `update_N`), none under tests/.
-    assert candidates == {"undeclared": 3, "variable": 73}
+    # 12 attribute candidates (3 undeclared, 9 variable) + 15 procedural
+    # variable ones (`update_N` / `post_update_*` are not hooks), none under tests/.
+    assert candidates == {"undeclared": 3, "variable": 24}
 
 
 # -- fix round 1 ---------------------------------------------------------------------
@@ -553,3 +554,124 @@ def test_an_incremental_run_with_out_writes_nothing_into_the_site(tmp_path):
     graph = json.loads(next(out.rglob("graph.json")).read_text(encoding="utf-8"))
     edges = graph.get("links") or graph.get("edges")
     assert any(e.get("relation") == "implements_hook" for e in edges)
+
+
+# -- minors round ------------------------------------------------------------------
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+_HOOK_USE = "<?php\nnamespace Drupal\\foo\\Hook;\nuse Drupal\\Core\\Hook\\Attribute\\Hook;\n"
+
+
+def test_is_hook_class_file_is_relative_to_the_owning_extension(tmp_path, _isolated_discovery_state):
+    root = _hooks_site(tmp_path)
+    hooks = root / FOO / "src/Hook/FooHooks.php"
+    nested = _write(root / FOO / "lib/src/Hook/Nested.php", "<?php\n")
+    stray = _write(root / "web/libraries/x/src/Hook/X.php", "<?php\n")
+    assert not is_hook_class_file(hooks)  # no registry
+    prepare_run(root)
+    assert is_hook_class_file(hooks)
+    assert not is_hook_class_file(nested)
+    assert not is_hook_class_file(stray)
+    assert not is_hook_class_file(root / FOO / "src/NotHooks.php")
+
+
+def test_a_hook_attribute_outside_src_hook_is_misplaced(tmp_path, _isolated_discovery_state):
+    install()
+    import graphify.extract as core
+
+    root = _hooks_site(tmp_path)
+    path = _write(root / FOO / "src/Other/Misplaced.php",
+                  "<?php\nnamespace Drupal\\foo\\Other;\nuse Drupal\\Core\\Hook\\Attribute\\Hook;\n"
+                  "class Misplaced {\n  #[Hook('cron')]\n  public function cron() {}\n}\n")
+    prepare_run(root)
+
+    result = extract_hook_implementations(path, _core_php(path))
+    assert result["nodes"] == [] and result["edges"] == []
+    assert result["hook_candidates"] == [{
+        "kind": "misplaced", "module": "foo", "name": "cron", "file": str(path), "line": 5}]
+    # Not composed at all: core's own handler.
+    assert core._get_extractor(path) is core._DISPATCH[".php"]
+
+
+def test_non_literal_module_or_method_is_a_candidate(tmp_path, _isolated_discovery_state):
+    root = _hooks_site(tmp_path)
+    path = _write(root / FOO / "src/Hook/Dynamic.php", _HOOK_USE + (
+        "#[Hook('cron', method: self::M)]\n"
+        "class Dynamic {\n"
+        "  #[Hook('entity_insert', module: self::MODULE)]\n"
+        "  public function insert() {}\n"
+        "}\n"))
+    prepare_run(root)
+
+    result = extract_hook_implementations(path, _core_php(path))
+    assert result["nodes"] == [] and result["edges"] == []
+    assert result["hook_candidates"] == [
+        {"kind": "non_literal", "module": "foo", "name": "cron", "file": str(path), "line": 4},
+        {"kind": "non_literal", "module": "self::MODULE", "name": "entity_insert",
+         "file": str(path), "line": 6},
+    ]
+
+
+def test_an_extension_implementing_its_own_hook_has_no_implements_edge(tmp_path, _isolated_discovery_state):
+    root = _hooks_site(tmp_path)
+    _write(root / FOO / "foo.api.php", "<?php\nfunction hook_foo_info() {\n}\n")
+    path = root / FOO / "foo.module"
+    path.write_text(FOO_MODULE + "\nfunction foo_foo_info() {\n}\n", encoding="utf-8")
+    prepare_run(root)
+    core_result = _core_php(path)
+
+    result = extract_hook_implementations(path, core_result)
+    impl = hook_impl_id("foo", "foo_info")
+    _node(result, impl)
+    rel = _rel(result)
+    # `declares_hook` already joins foo -> foo_info: one relation per pair.
+    assert (extension_id("foo"), "implements_hook", hook_id("foo_info")) not in rel
+    assert (impl, "hook_implemented_by", _core_id(core_result, "foo_foo_info()")) in rel
+    assert (extension_id("foo"), "implements_hook", hook_id("cron")) in rel
+
+
+def test_update_functions_are_neither_implementations_nor_candidates(tmp_path, _isolated_discovery_state):
+    root = _hooks_site(tmp_path)
+    (root / "web/core/core.api.php").write_text(
+        CORE_API_PHP + "\nfunction hook_update_N() {\n}\nfunction hook_post_update_NAME() {\n}\n"
+        "function hook_update_last_removed() {\n}\n", encoding="utf-8")
+    path = _write(root / FOO / "foo.install", (
+        "<?php\nfunction foo_update_10001() {}\nfunction foo_post_update_fix() {}\n"
+        "function foo_update_last_removed() {}\n"))
+    prepare_run(root)
+
+    result = extract_hook_implementations(path, _core_php(path))
+    assert [n["hook_name"] for n in result["nodes"]] == ["update_last_removed"]
+    assert result["hook_candidates"] == []
+
+
+def test_several_hooks_on_one_method_and_a_duplicate_target(tmp_path, _isolated_discovery_state):
+    root = _hooks_site(tmp_path)
+    path = _write(root / FOO / "src/Hook/Multi.php", _HOOK_USE + (
+        "#[Hook('cron', method: 'run')]\n"
+        "class Multi {\n"
+        "  #[Hook('cron')]\n"
+        "  #[Hook('entity_insert'), Hook('form_alter')]\n"
+        "  public function run() {}\n"
+        "}\n"))
+    prepare_run(root)
+    core_result = _core_php(path)
+    run = _core_id(core_result, ".run()")
+
+    result = extract_hook_implementations(path, core_result)
+    cron, insert = hook_impl_id("foo", "cron"), hook_impl_id("foo", "entity_insert")
+    assert sorted(n["id"] for n in result["nodes"]) == sorted([cron, insert])
+    # Class-level and method-level `cron` name the same method: one edge.
+    assert sorted((e["source"], e["relation"], e["target"]) for e in result["edges"]) == sorted([
+        (extension_id("foo"), "implements_hook", hook_id("cron")),
+        (cron, "hook_implemented_by", run),
+        (extension_id("foo"), "implements_hook", hook_id("entity_insert")),
+        (insert, "hook_implemented_by", run),
+    ])
+    assert [c["name"] for c in result["hook_candidates"]] == ["form_alter"]

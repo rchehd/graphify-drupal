@@ -23,6 +23,23 @@ _ORIGIN = "static_yaml"
 _NO_RANK = 99
 
 
+def compose_handlers(base, extras):
+    """A per-file handler that runs core's `base` first, then appends each
+    extra's nodes and edges. An extra is called as `extra(p, core_result)`
+    with core's own result for `p`, so it can point at core's nodes; core's
+    nodes are kept either way, and any other key an extra returns (e.g.
+    `hook_candidates`) is not part of the file's result."""
+    def handler(p: Path, _base=base, _extras=tuple(extras)):
+        result = dict(_base(p)) if _base else {"nodes": [], "edges": []}
+        core_result = dict(result)
+        for extra in _extras:
+            ours = extra(p, core_result)
+            result["nodes"] = list(result.get("nodes") or []) + ours["nodes"]
+            result["edges"] = list(result.get("edges") or []) + ours["edges"]
+        return result
+    return handler
+
+
 def _relative(source_file: str, root: Path | None) -> str:
     """`declared_in` reaches graph.json as-is, so it must not carry the checkout path."""
     if root is None:
