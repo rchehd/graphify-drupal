@@ -76,7 +76,9 @@ def test_criterion_2_the_tolerant_loader_finds_every_service(corpus_extraction):
     services = [n for n in corpus_extraction["nodes"] if n["type"] == "drupal_service"]
     declared = [n for n in services if not n.get("external")]
     # 2,205 declarations; 14 are overrides of a service declared elsewhere.
-    assert len(declared) == 2191, "1628 means safe_load crept back in"
+    # 2,192 since FormsRemote 60b010db (webform 6.3.0-rc1 -> 6.3.1, whose
+    # security fix adds `webform_ui.route_subscriber`).
+    assert len(declared) == 2192, "1628 means safe_load crept back in"
 
 
 def test_criterion_3_no_family_file_is_dropped_as_a_secret(family_files):
@@ -99,7 +101,9 @@ def test_criterion_4_only_info_yml_declares_extensions(corpus_extraction):
         if n["type"] in ("drupal_module", "drupal_theme", "drupal_profile")
     ]
     # 1,140 files; three pairs are core's name-collision fixtures, one node each.
-    assert len(declared) == 1137
+    # 1,138 since FormsRemote 60b010db: webform 6.3.1 ships the test module
+    # `webform_scheduled_email_exception_test`.
+    assert len(declared) == 1138
     assert all(n["source_file"].endswith(".info.yml") for n in declared)
     # Any other extension node is one the resolver made for a name nothing declares.
     others = [n for n in corpus_extraction["nodes"]
@@ -841,7 +845,9 @@ def test_p2b_invocations(p2b):
     # `invoke`/`alter` on no handler: ReflectionMethod::invoke and a unit test's
     # own `alter()` helper, all in custom tests/ trees; no literal-less handler call.
     unknown = [c for c in p2b["inventory"]["hook_candidates"] if c["kind"] == "unknown_receiver"]
-    assert (len(unknown), by_kind["non_literal"]) == (15, 0)
+    # 14 since FormsRemote 9f933cdb deleted SharepointCredentialsTest.php and
+    # its `$method->invoke($client, ...)` (ReflectionMethod::invoke).
+    assert (len(unknown), by_kind["non_literal"]) == (14, 0)
     assert all("/tests/" in c["file"] for c in unknown)
 
 
@@ -859,29 +865,122 @@ def test_p2b_every_drupal_node_survives_the_build(p2b):
     assert graph.nodes["drupal_hook_toolbar"]["type"] == "drupal_hook"
 
 
-@pytest.mark.skipif(os.environ.get("DRUPAL_CONTAINER_LIVE") != "1",
-                    reason="needs the corpus site running (DRUPAL_CONTAINER_LIVE=1)")
-def test_p3_collect_the_live_container(tmp_path):
-    """The collector through the corpus's own runner. Nothing is written into
-    the corpus: the registry `collect` may build goes under `tmp_path`, and
-    the artifact is written there too."""
+# -- P3: the container overlay (spec 2026-09-25-drupal-p3-container §12) --
+#
+# A normal build never runs drush, and neither do these tests: the live half
+# reads an artifact already collected from the running site
+# (`graphify drupal container <corpus> --out <file>`) named by
+# DRUPAL_CONTAINER_ARTIFACT, and skips without it. The build is the one
+# `graphify extract --code-only` does, under a temporary out dir.
+
+_ARTIFACT = os.environ.get("DRUPAL_CONTAINER_ARTIFACT")
+_needs_artifact = pytest.mark.skipif(
+    not (_ARTIFACT and Path(_ARTIFACT).is_file()),
+    reason="needs an artifact collected from the running corpus (DRUPAL_CONTAINER_ARTIFACT=<file>)")
+
+
+@contextlib.contextmanager
+def _artifact_env(value: str | None):
+    from graphify.drupal.container import ENV_ARTIFACT
+
+    saved = os.environ.get(ENV_ARTIFACT)
+    if value is None:
+        os.environ.pop(ENV_ARTIFACT, None)
+    else:
+        os.environ[ENV_ARTIFACT] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(ENV_ARTIFACT, None)
+        else:
+            os.environ[ENV_ARTIFACT] = saved
+
+
+def _p3_build(out: Path, artifact: str | None) -> dict:
+    """detect -> extract -> build, as `extract --code-only`; the seam's
+    build wrapper lays the artifact (if any) over the graph. Also times
+    `run_for_build` on the built graph: the overlay's own cost."""
+    import time
+
+    import graphify  # noqa: F401
+    from graphify.build import build
+    from graphify.detect import detect
+    from graphify.drupal.container_overlay import run_for_build
+    from graphify.drupal.inventory import current_inventory
+    from graphify.extract import extract
+
+    with _restored_discovery_state(), _artifact_env(artifact):
+        detected = detect(CORPUS, cache_root=out)
+        code = sorted(Path(p) for p in detected["files"]["code"])
+        extraction = extract(code, cache_root=out, root=CORPUS)
+        graph = build([extraction], directed=True, root=CORPUS)
+        container = dict(current_inventory()["container"])
+        started = time.perf_counter()
+        again = run_for_build(graph)
+        elapsed = time.perf_counter() - started
+    return {"graph": graph, "container": container, "again": again, "elapsed": elapsed}
+
+
+def test_p3_without_an_artifact_the_graph_is_static_and_says_so(tmp_path):
+    built = _p3_build(tmp_path, None)
+    graph = built["graph"]
+    assert built["container"]["status"] == "unavailable"
+    assert [n for n, d in graph.nodes(data=True) if "runtime" in d] == []
+    assert [e for *e, d in graph.edges(data=True) if d.get("origin") == "container"] == []
+    assert list(tmp_path.rglob("drupal-divergence.json")) == []
+
+
+@_needs_artifact
+def test_p3_the_collected_artifact_is_valid_and_carries_no_machine_path():
     import json
 
-    from graphify.drupal import discovery
-    from graphify.drupal.container import collect, validate, write_artifact
+    from graphify.drupal.container import validate
 
-    with _restored_discovery_state(), discovery.using_out_dir(tmp_path):
-        data = collect(CORPUS)
-    validate(data)
-    write_artifact(data, tmp_path / "drupal-container.json")
-
-    assert len(data["services"]) > 1000
-    assert len(data["routes"]) > 500
-    assert data["hooks"]
+    text = Path(_ARTIFACT).read_text(encoding="utf-8")
+    data = validate(json.loads(text))
+    assert len(data["services"]) > 1000 and len(data["routes"]) > 500 and data["hooks"]
     files = [s["file"] for s in data["services"]]
     files += [e["file"] for entries in data["hooks"].values() for e in entries]
     files += [p["file"] for entries in data["plugins"].values() for p in entries]
     files += [s["file"] for entries in data["subscribers"].values() for s in entries]
     files += [e["path"] for e in data["extensions"]]
     assert [f for f in files if f is not None and (f.startswith("/") or ":" in f[:3])] == []
-    assert str(CORPUS) not in json.dumps(data)
+    assert str(CORPUS) not in text and "/var/www/html" not in text
+    # The one collector error on the corpus is contrib's: ckeditor5_plugin_pack_font
+    # declares `plugin.manager.font_colors` with a class it does not ship.
+    assert [(e["source"], "font_colors" in e["message"]) for e in data["errors"]] \
+        == [("plugins", True)]
+
+
+@_needs_artifact
+def test_p3_the_overlay_on_the_corpus(tmp_path):
+    built = _p3_build(tmp_path, _ARTIFACT)
+    graph, container = built["graph"], built["container"]
+    assert container["status"] in ("fresh", "stale")
+
+    overlay_edges = [d for *_e, d in graph.edges(data=True) if d.get("origin") == "container"]
+    confirmed = [d for *_e, d in graph.edges(data=True) if d.get("confirmed_by") == "container"]
+    assert overlay_edges and confirmed
+    assert container["edges"]["container_only"] == len(overlay_edges)
+    # Container-only knowledge the static graph cannot have: derivative plugins.
+    derivatives = [n for n, d in graph.nodes(data=True)
+                   if d.get("derivative") is True and d.get("origin") == "container"]
+    assert derivatives
+    # Custom route subscribers inherit their listener from core's
+    # RouteSubscriberBase; they are still custom subscribers.
+    assert container["counts"]["subscribers"]["applied"] >= 2
+    # A links-family plugin is P1's link node, never a second plugin node.
+    assert [n for n, d in graph.nodes(data=True)
+            if d.get("type") == "drupal_plugin" and str(d.get("plugin_type", "")).startswith("menu.")] == []
+    # Every node of a runtime type is marked, except a theme's hook implementations.
+    from graphify.drupal.container_overlay import RUNTIME_TYPES
+
+    unmarked = [n for n, d in graph.nodes(data=True)
+                if d.get("type") in RUNTIME_TYPES and "runtime" not in d]
+    assert all(graph.nodes[n]["type"] == "drupal_hook_impl" for n in unmarked)
+    assert len(list(tmp_path.rglob("drupal-divergence.json"))) == 1
+
+    # Applied again on the built graph: the same result, well under a second.
+    assert built["again"] is not None and built["again"].edges == container["edges"]
+    assert built["elapsed"] < 1.0
