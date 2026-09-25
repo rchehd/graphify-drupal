@@ -719,7 +719,8 @@ def _root_relative(path: str, root: Path) -> str:
 
 
 def _patch_cli(cli: ModuleType) -> None:
-    """Stop core's zero-node heal re-queuing shadowed configuration copies (P2b §6.1).
+    """Stop core's zero-node heal re-queuing shadowed configuration copies (P2b §6.1),
+    and route `graphify drupal …` to the Drupal commands (P3 §10).
 
     `_zero_node_stamped_code_sources` re-queues every stamped code file that
     owns no node in graph.json. A configuration copy P1b's collapse gave to
@@ -728,11 +729,12 @@ def _patch_cli(cli: ModuleType) -> None:
     was extracted, so the stamp is honest -- as long as another copy in that
     list still exists. `watch` never calls the heal.
     """
-    if not callable(getattr(cli, "_zero_node_stamped_code_sources", None)):
-        raise DrupalSeamError(
-            "graphify.cli._zero_node_stamped_code_sources is missing — graphify core "
-            "changed shape; graphify/drupal/register.py must be updated"
-        )
+    for attr in ("_zero_node_stamped_code_sources", "dispatch_command"):
+        if not callable(getattr(cli, attr, None)):
+            raise DrupalSeamError(
+                f"graphify.cli.{attr} is missing — graphify core "
+                "changed shape; graphify/drupal/register.py must be updated"
+            )
 
     def _heal(original):
         # `cli` calls it by bare name, so the module attribute is what it gets.
@@ -757,6 +759,28 @@ def _patch_cli(cli: ModuleType) -> None:
         return _zero_node_stamped_code_sources
 
     _wrap(cli, "_zero_node_stamped_code_sources", _heal)
+    # `__main__` binds `dispatch_command` by `from graphify.cli import`, which
+    # runs after this patch (the loader patches the module as it finishes
+    # executing), so the name it binds is the wrapper.
+    _wrap(cli, "dispatch_command", _dispatch_wrapper)
+
+
+def _dispatch_wrapper(original):
+    """`graphify drupal container …` goes to `container.main`; `graphify
+    drupal <anything else>` is a usage error (exit 2); every other command
+    goes to core unchanged (P3 spec S10)."""
+    def dispatch_command(cmd):
+        if cmd != "drupal":
+            return original(cmd)
+        if len(sys.argv) > 2 and sys.argv[2] == "container":
+            from graphify.drupal import container
+
+            sys.exit(container.main(sys.argv[2:]))
+        from graphify.drupal.container import _USAGE
+
+        print(_USAGE, file=sys.stderr)
+        sys.exit(2)
+    return dispatch_command
 
 
 def _patch_dedup(dedup: ModuleType) -> None:

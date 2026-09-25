@@ -857,3 +857,31 @@ def test_p2b_every_drupal_node_survives_the_build(p2b):
     assert sorted(drupal - set(graph.nodes)) == []
     assert graph.nodes["drupal_extension_toolbar"]["type"] == "drupal_extension"
     assert graph.nodes["drupal_hook_toolbar"]["type"] == "drupal_hook"
+
+
+@pytest.mark.skipif(os.environ.get("DRUPAL_CONTAINER_LIVE") != "1",
+                    reason="needs the corpus site running (DRUPAL_CONTAINER_LIVE=1)")
+def test_p3_collect_the_live_container(tmp_path):
+    """The collector through the corpus's own runner. Nothing is written into
+    the corpus: the registry `collect` may build goes under `tmp_path`, and
+    the artifact is written there too."""
+    import json
+
+    from graphify.drupal import discovery
+    from graphify.drupal.container import collect, validate, write_artifact
+
+    with _restored_discovery_state(), discovery.using_out_dir(tmp_path):
+        data = collect(CORPUS)
+    validate(data)
+    write_artifact(data, tmp_path / "drupal-container.json")
+
+    assert len(data["services"]) > 1000
+    assert len(data["routes"]) > 500
+    assert data["hooks"]
+    files = [s["file"] for s in data["services"]]
+    files += [e["file"] for entries in data["hooks"].values() for e in entries]
+    files += [p["file"] for entries in data["plugins"].values() for p in entries]
+    files += [s["file"] for entries in data["subscribers"].values() for s in entries]
+    files += [e["path"] for e in data["extensions"]]
+    assert [f for f in files if f is not None and (f.startswith("/") or ":" in f[:3])] == []
+    assert str(CORPUS) not in json.dumps(data)

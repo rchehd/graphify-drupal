@@ -1,7 +1,8 @@
 """The container artifact: its path, its shape, and its staleness (spec S6).
 
-This is the Python model of the artifact `container_collect.php` will write
-(a later task): the path resolution rule, the JSON shape `validate` enforces,
+This is the Python model of the artifact `container_collect.php` produces
+(`collect`, written by `main`, the `graphify drupal container` command): the
+path resolution rule, the JSON shape `validate` enforces,
 and the host-computable half of the stamp (`compute_host_stamp`) a build uses
 to decide whether a committed artifact is still `fresh` for the working tree
 it is laid over.
@@ -34,6 +35,7 @@ from graphify.drupal.boundary import install_map, realm_of
 from graphify.drupal.hooks import is_procedural_file
 from graphify.drupal.paths import is_drupal_info_yaml
 from graphify.drupal.rc import read_rc_value
+from graphify.drupal.runners import detect_runner, run_php
 
 SCHEMA_VERSION = 1
 SOURCES = ("services", "aliases", "routes", "extensions", "hooks", "plugins", "subscribers")
@@ -317,3 +319,221 @@ def staleness(artifact: Artifact, root: Path) -> tuple[str, list[str]]:
         reasons.append(f"{len(changed)} container source files changed: {names}")
 
     return ("stale" if reasons else "fresh", reasons)
+
+
+# -- the collector and the command (spec S5, S10) ------------------------------
+
+_COLLECTOR = Path(__file__).with_name("container_collect.php")
+_OPEN_TAG = "<?php"
+
+#: Fields holding a path, per source (spec S5.1: made relative to the composer
+#: root, or `None` outside it).
+_PATH_FIELDS = {"services": "file", "extensions": "path"}
+_NESTED_PATH_SOURCES = ("hooks", "plugins", "subscribers")
+
+_USAGE = ("usage: graphify drupal container [PATH] [--out FILE] [--print-script] "
+          "[--runner-command CMD]")
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def collector_code(hook_names: list[str] | None = None) -> str:
+    """The collector's PHP as `php:eval` takes it: no opening tag, with a
+    header line `$GRAPHIFY_HOOKS = [...];` (the pre-11.1 hook fallback's list)."""
+    text = _COLLECTOR.read_text(encoding="utf-8")
+    if text.startswith(_OPEN_TAG):
+        text = text[len(_OPEN_TAG):].lstrip("\n")
+    header = "$GRAPHIFY_HOOKS = " + json.dumps(list(hook_names or []), separators=(",", ":")) + ";"
+    return header + "\n" + text
+
+
+def _parse_stdout(stdout: str) -> dict:
+    """The collector's JSON object. drush or PHP can print notices before it,
+    so the object is looked for from the first line that opens one."""
+    text = (stdout or "").strip()
+    candidates = [text]
+    for i, line in enumerate(text.splitlines()):
+        if i and line.lstrip().startswith("{"):
+            candidates.append("\n".join(text.splitlines()[i:]))
+            break
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            return data
+        raise ArtifactError(f"the collector printed a JSON {type(data).__name__}, not an object")
+    head = text[:200] or "(nothing)"
+    raise ArtifactError(f"the collector's output is not JSON: {head}")
+
+
+def _relativizer(composer_root: str | None):
+    prefix = composer_root.rstrip("/") + "/" if composer_root else None
+
+    def rel(path):
+        if not isinstance(path, str) or prefix is None:
+            return None
+        if path.startswith(prefix):
+            return path[len(prefix):] or None
+        return None
+    return rel
+
+
+def _strip_roots(data: dict, composer_root: str | None) -> None:
+    """Every path made relative to the composer root, in place (spec S5.1)."""
+    rel = _relativizer(composer_root)
+    for source, key in _PATH_FIELDS.items():
+        for entry in data.get(source) or []:
+            if isinstance(entry, dict) and key in entry:
+                entry[key] = rel(entry[key])
+    for source in _NESTED_PATH_SOURCES:
+        value = data.get(source)
+        for entries in value.values() if isinstance(value, dict) else []:
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, dict) and "file" in entry:
+                    entry["file"] = rel(entry["file"])
+    # An error message can quote a path; it never carries the machine's root.
+    for error in data.get("errors") or []:
+        if isinstance(error, dict) and composer_root and isinstance(error.get("message"), str):
+            error["message"] = error["message"].replace(composer_root.rstrip("/") + "/", "")
+
+
+def _stable(data: dict) -> dict:
+    """A stable order for every list whose order carries no meaning. Hook
+    lists (execution order) and subscriber lists (priority order) are kept."""
+    def key(*fields):
+        return lambda e: tuple(str(e.get(f) or "") for f in fields) if isinstance(e, dict) else ("",)
+
+    data["services"] = sorted(data["services"], key=key("id"))
+    data["routes"] = sorted(data["routes"], key=key("name"))
+    data["extensions"] = sorted(data["extensions"], key=key("type", "name"))
+    data["plugins"] = {t: sorted(v, key=key("id")) if isinstance(v, list) else v
+                       for t, v in data["plugins"].items()}
+    data["errors"] = sorted(data["errors"], key=key("source", "message"))
+    return data
+
+
+def _registry_hook_names(root: Path) -> list[str]:
+    """The static registry's hook names, building the registry when this
+    process has none (`prepare_run` writes only under the out dir)."""
+    from graphify.drupal import discovery
+
+    registry = discovery.current_registry()
+    if registry is None:
+        registry = discovery.prepare_run(root)
+    return sorted(registry.hooks) if registry is not None else []
+
+
+def collect(root: Path, runner_override: str | None = None) -> dict:
+    """Run the collector for the site at `root` and return the artifact:
+    paths relative to the composer root, validated, with the stamp merged.
+    Raises `RunnerError` (no runner, drush failed) or `ArtifactError` (the
+    output is not a valid collector object)."""
+    root = Path(root)
+    runner = detect_runner(root, runner_override)
+    code = collector_code(_registry_hook_names(root))
+    data = _parse_stdout(run_php(runner, code))
+
+    site = data.pop("site", None)
+    site = site if isinstance(site, dict) else {}
+    _strip_roots(data, site.get("composer_root") or site.get("drupal_root"))
+
+    data["stamp"] = {
+        "created_at": _now(),
+        "runner": runner.name,
+        "drupal_version": site.get("drupal_version"),
+        "enabled_extensions_sha": site.get("enabled_extensions_sha"),
+        **compute_host_stamp(root),
+    }
+    validate(data)
+    return _stable(data)
+
+
+def write_artifact(data: dict, path: Path) -> None:
+    """Write `data` to `path` atomically: sorted keys, one-space indent, a
+    temp file beside it, then `os.replace`."""
+    import tempfile
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, sort_keys=True, indent=1, ensure_ascii=False) + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _summary(data: dict, path: Path) -> str:
+    lines = []
+    for source in SOURCES:
+        value = data.get(source)
+        if isinstance(value, dict) and source in _NESTED_PATH_SOURCES:
+            total = sum(len(v) for v in value.values() if isinstance(v, list))
+            lines.append(f"  {source}: {len(value)} ({total} entries)")
+        else:
+            lines.append(f"  {source}: {len(value) if value is not None else 0}")
+    errors = data.get("errors") or []
+    lines.append(f"  errors: {len(errors)}")
+    for error in errors:
+        lines.append(f"    {error.get('source')}: {error.get('class')}: {error.get('message')}")
+    lines.append(f"wrote {path}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str]) -> int:
+    """`container [PATH] [--out FILE] [--print-script] [--runner-command CMD]`.
+
+    Returns 0 on success, 1 when drush or the artifact fails (message on
+    stderr, no traceback, an existing artifact untouched), 2 on bad usage."""
+    import argparse
+    import contextlib
+    import sys
+
+    from graphify.drupal.runners import RunnerError
+
+    if not argv or argv[0] != "container":
+        print(_USAGE, file=sys.stderr)
+        return 2
+
+    parser = argparse.ArgumentParser(prog="graphify drupal container", add_help=False)
+    parser.add_argument("path", nargs="?", default=".")
+    parser.add_argument("--out")
+    parser.add_argument("--print-script", action="store_true")
+    parser.add_argument("--runner-command")
+    try:
+        args = parser.parse_args(argv[1:])
+    except SystemExit:
+        print(_USAGE, file=sys.stderr)
+        return 2
+
+    if args.print_script:
+        print(_OPEN_TAG + "\n" + collector_code(), end="")
+        return 0
+
+    from graphify.drupal import discovery
+
+    root = Path(args.path).resolve()
+    out = Path(args.out).resolve() if args.out else artifact_path(root)
+    scope = discovery.using_out_dir(out.parent) if args.out else contextlib.nullcontext()
+    try:
+        with scope:
+            data = collect(root, args.runner_command)
+        write_artifact(data, out)
+    except (RunnerError, ArtifactError, OSError) as exc:
+        print(f"graphify drupal container: {exc}", file=sys.stderr)
+        return 1
+
+    print(_summary(data, out))
+    return 0

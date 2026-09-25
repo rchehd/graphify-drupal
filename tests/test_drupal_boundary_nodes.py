@@ -312,6 +312,7 @@ def _fake_cli(result: list[str]):
 
     module = ModuleType("fake_cli")
     module._zero_node_stamped_code_sources = lambda graph_path, scan_root, unchanged: list(result)
+    module.dispatch_command = lambda cmd: None  # the seam asserts it too (P3)
     _patch_cli(module)
     return module._zero_node_stamped_code_sources
 
