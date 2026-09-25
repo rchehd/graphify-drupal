@@ -870,7 +870,8 @@ def _sorted_types(types: list[PluginType]) -> list[PluginType]:
 
 
 def affected_files(previous: Registry | None, current: Registry | None,
-                   boundary_changed: bool = False) -> set[str]:
+                   boundary_changed: bool = False, *,
+                   graph_path: Path | None = None, root: Path | None = None) -> set[str]:
     """Absolute paths whose extraction depends on what changed between two registries.
 
     For every `yaml_name` whose type was added, removed or changed in any field,
@@ -879,8 +880,13 @@ def affected_files(previous: Registry | None, current: Registry | None,
     file (it carries the type nodes). When the boundary moved
     (`boundary_changed`, see `prepare_run`), every in-graph file the registry
     walk knows that points at extensions, services or hooks
-    (`_boundary_dependent_files`). Empty when there is no previous registry:
-    a first run extracts everything anyway.
+    (`_boundary_dependent_files`), plus every in-graph file that is the
+    `source_file` of an `invokes_hook` edge in `graph_path`'s previous
+    graph.json (`_invokes_hook_files`, spec §11.1): the registry never learns
+    of such a file (it names no extension, service or hook of its own), so
+    without this it would keep edges to a stub whose boundary status just
+    changed. Empty when there is no previous registry: a first run extracts
+    everything anyway.
     """
     if previous is None:
         return set()
@@ -888,6 +894,7 @@ def affected_files(previous: Registry | None, current: Registry | None,
     result: set[str] = set()
     if boundary_changed:
         result |= _boundary_dependent_files(previous) | _boundary_dependent_files(current)
+        result |= _invokes_hook_files(graph_path, root)
 
     old_families, new_families = previous.by_yaml_name(), current.by_yaml_name()
     suffixes = tuple(
@@ -956,6 +963,55 @@ def _boundary_dependent_files(registry: Registry) -> set[str]:
 
     out.update(t.class_file for t in registry.types.values() if kept(t.class_file))
     out.update(d.file for d in registry.hooks.values() if kept(d.file))
+    return out
+
+
+_GRAPH_FILENAME = "graph.json"
+
+
+def _invokes_hook_files(graph_path: Path | None, root: Path | None) -> set[str]:
+    """Absolute, existing paths that are the `source_file` of an `invokes_hook`
+    edge in `graph_path` (P2b's carried I3 gap, spec §11.1): a plain PHP file
+    whose only Drupal fact is such a call site names no extension, service or
+    hook of its own, so `_boundary_dependent_files` (built entirely from what
+    the registry walk knows) never reaches it -- yet its edge points at a hook
+    whose boundary/stub status a moved boundary can change.
+
+    `source_file` is root-relative POSIX, as graph.json stores it; an
+    already-absolute one is accepted as-is. Anything that is not an
+    `invokes_hook` edge (a node, a P3 container-overlay item) is ignored.
+    Missing `graph_path`/`root`, an unreadable or malformed graph.json, or a
+    path that no longer exists on disk each add nothing.
+    """
+    if graph_path is None or root is None:
+        return set()
+    try:
+        data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    links = data.get("links")
+    if not isinstance(links, list):
+        links = data.get("edges")
+    if not isinstance(links, list):
+        return set()
+    root = Path(root)
+    out: set[str] = set()
+    for item in links:
+        if not isinstance(item, dict) or item.get("relation") != "invokes_hook":
+            continue
+        source_file = item.get("source_file")
+        if not source_file or not isinstance(source_file, str):
+            continue
+        path = Path(source_file)
+        if not path.is_absolute():
+            path = root / path
+        try:
+            if path.is_file():
+                out.add(path.resolve().as_posix())
+        except OSError:
+            continue
     return out
 
 
@@ -1166,7 +1222,8 @@ def prepare_run(
     # changing any file that points at them (final review I3).
     digest = boundary_digest(root, registry.web_root)
     forced = frozenset(
-        affected_files(previous, registry, boundary_changed=previous_digest != digest) | carried)
+        affected_files(previous, registry, boundary_changed=previous_digest != digest,
+                       graph_path=target.parent / _GRAPH_FILENAME, root=root) | carried)
 
     payload = json.dumps({**registry.to_json(), _FORCE_MISS_KEY: sorted(forced),
                           _BOUNDARY_DIGEST_KEY: digest},

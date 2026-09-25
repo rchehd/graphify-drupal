@@ -320,3 +320,65 @@ def test_an_incremental_run_with_out_uses_the_out_dir(tmp_path):
     assert _plugins_from(second, FOO_BAR_FILE) == {}
     assert set(_plugins_from(second, FOO_BAZ_FILE)) == {plugin_id("bar", "three")}
     assert _nodes(second)[type_id("bar")]["yaml_name"] == "baz"
+
+
+# -- carried fix (P2b spec §10.5 I3 / P3 spec §11.1): an invokes_hook-only file --
+
+INVOKER_PHP = """<?php
+
+namespace Drupal\\foo;
+
+class Invoker {
+
+  protected $moduleHandler;
+
+  public function run() {
+    $this->moduleHandler->invokeAll('widget_info');
+  }
+
+}
+"""
+
+TOKEN_API_PHP = "<?php\n\nfunction hook_widget_info() {\n}\n"
+
+
+def _invoker_site(root: Path) -> Path:
+    """A custom class whose only Drupal edge is `invokes_hook` to a hook
+    declared solely in a contrib module's `*.api.php` -- the registry never
+    learns of this file (it names no extension, service or hook of its own)."""
+    return _site(root, {
+        "web/modules/contrib/token/token.info.yml": "name: Token\ntype: module\n",
+        "web/modules/contrib/token/token.api.php": TOKEN_API_PHP,
+        **_module("foo", "services: {}\n", {"src/Invoker.php": INVOKER_PHP}),
+    })
+
+
+def test_a_moved_boundary_forces_an_invokes_hook_only_file(tmp_path, _isolated_discovery_state):
+    """Task 7 (carried fix): toggling `drupal.include = contrib` must force
+    re-extraction of a plain PHP class whose only cross-boundary edge is
+    `invokes_hook` -- `_boundary_dependent_files` (built entirely from what
+    the registry walk records: extensions, services, hooks) never reaches it,
+    so before the fix it keeps whatever edges/attributes it had when the
+    hook's target was still (or was not yet) a boundary stub."""
+    root = _invoker_site(tmp_path / "site")
+    out = tmp_path / "out"
+    invoker = (root / "web/modules/custom/foo/src/Invoker.php").resolve().as_posix()
+
+    first = _run_cli_out(root, out)
+    edges = first.get("links") or first.get("edges") or []
+    assert any(e.get("relation") == "invokes_hook" and e.get("source_file") == "web/modules/custom/foo/src/Invoker.php"
+               for e in edges), edges
+
+    (root / ".graphifyrc").write_text("drupal.include = contrib\n", encoding="utf-8")
+
+    from graphify.drupal import discovery
+    from graphify.drupal.boundary import clear_caches as clear_boundary_caches
+    from graphify.drupal.register import install
+
+    install()
+    clear_boundary_caches()
+    registry = discovery.prepare_run(root, cache_root=out)
+    assert registry is not None
+    forced = discovery.force_miss()
+
+    assert invoker in forced, sorted(forced)
