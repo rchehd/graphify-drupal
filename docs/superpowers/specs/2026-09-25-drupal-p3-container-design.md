@@ -221,7 +221,7 @@ the other readers call `build_from_json` without a run and are untouched.
 Before applying, the overlay removes what a previous overlay left in `G`
 (graph.json carries it into `update` and `watch`):
 
-- edges with `_origin: container`;
+- edges with `origin: container`;
 - nodes with `_overlay: true` (created only by the overlay);
 - on every other node and edge, the attributes listed in its `_overlay_attrs`,
   and then `_overlay_attrs` itself.
@@ -253,7 +253,7 @@ The vocabulary's relations, nothing new:
 | service provider module | `declares_service` |
 | route | `declares_route`, `routes_to` (→ method, else class), `routes_to_form`, `requires_permission`, `access_checked_by` |
 | extension | `depends_on_module` |
-| hook implementation | `implements_hook` (function or method → hook), `order` (index in the list) on the edge |
+| hook implementation | P2b's shape: `drupal_hook_impl` node (`make_id("drupal", "hook_impl", module, hook)`, `module`, `hook_name`, `function` or `class_name`+`method`), `implements_hook` (extension → hook), `hook_implemented_by` (impl → function or method node); `order` (index in the list) on the impl node |
 | plugin | `provides_plugin`, `plugin_of_type`, `plugin_implemented_by`, `derives_plugins` |
 | subscriber | `subscribes_to_event` (class → event), `priority` on the edge |
 
@@ -266,8 +266,16 @@ class and file. P4's static ones will meet them through `confirmed_by`.
 - **Static has the same edge** (same pair, same relation): the edge gets
   `confirmed_by: container`. The graph collapses parallel edges, so confirmation
   is an attribute, never a second edge.
-- **Container only**: a new edge, `_origin: container`, `confidence:
+- **Container only**: a new edge, `origin: container`, `confidence:
   EXTRACTED`, `confidence_score: 1.0`, `source_file: drupal-container.json`.
+
+`origin` (no underscore) is the overlay's marker, and `_origin` is left to
+core. `extract()` stamps `_origin: "ast"` on every node and edge it returns
+(`extract.py:8202`), and `watch` scopes eviction by it (`_origin == "ast"`),
+so a `_origin: container` would change how core's incremental paths treat
+the edge. Overlay edges and nodes carry `_origin: "ast"` like everything
+else the Drupal producers emit. The vocabulary's `_origin: container`
+(§1.2) is realised as `origin: container`.
 - **Conflict**: static says one target, the container another, for a relation
   that has one target per source (`service_implemented_by`,
   `plugin_implemented_by`, `routes_to`, `routes_to_form`, `decorates`).
@@ -352,6 +360,10 @@ GRAPH_REPORT's "Drupal coverage" section gains a "Container" block:
   (counts per source, errors, path written). On any failure the exit code is
   non-zero and an existing artifact is left untouched.
 
+The collector ships as package data: `pyproject.toml`'s
+`[tool.setuptools.package-data]` gains `"graphify.drupal" =
+["container_collect.php"]`.
+
 `register.py` gains two wrappers, each asserting the shape it relies on and
 raising `DrupalSeamError` otherwise:
 
@@ -382,7 +394,7 @@ On the fixtures:
 
 - overlay idempotence: apply twice gives a byte-identical graph.json to apply
   once; apply then undo gives the static graph;
-- no artifact: no `runtime`, no `_origin: container`, report says
+- no artifact: no `runtime`, no `origin: container`, report says
   `unavailable`, no divergence file;
 - an invalid artifact (bad JSON, wrong `schema_version`) gives `invalid`, and
   the build succeeds;
@@ -391,8 +403,11 @@ On the fixtures:
 - each of the four divergence kinds appears on a fixture built for it;
 - runner detection per marker, the `.graphifyrc` override, and each named error,
   with `subprocess` mocked;
-- the collector's output contract: a trimmed FormsRemote artifact kept under
-  `tests/fixtures/drupal_container/` validates against the schema;
+- the collector's output contract: synthetic artifacts are built inside the
+  tests (the allow-list admits only `tests/test_drupal_*.py`, so there is no
+  fixture directory); a corpus test, skipped without the corpus and a
+  running ddev, collects from FormsRemote into `tmp_path` and validates the
+  schema;
 - seam: removing either wrapped symbol raises `DrupalSeamError`;
 - §11's two tests.
 
