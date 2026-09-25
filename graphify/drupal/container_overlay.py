@@ -21,8 +21,9 @@ only as the direct target of a custom fact's edge.
 Undo markers: `_overlay: True` on nodes the overlay created, and
 `_overlay_attrs: [keys]` on every node and edge it touched.
 
-This task maps `services`, `aliases`, `routes` and `extensions`; hooks,
-plugins and subscribers come next.
+It maps `services`, `aliases`, `routes`, `extensions`, `hooks` (P2b's
+implementation shape, plus each implementation's `order`), `plugins` and
+`subscribers`.
 """
 from __future__ import annotations
 
@@ -36,14 +37,18 @@ import networkx as nx
 
 from graphify.drupal.boundary import included_realms, install_map, realm_of
 from graphify.drupal.container import Artifact
+from graphify.drupal.discovery import type_id
+from graphify.drupal.hooks import hook_id, hook_impl_id
 from graphify.drupal.yaml_common import (
     parameter_id,
     permission_id,
+    plugin_id,
     route_id,
     service_id,
     tag_id,
 )
 from graphify.drupal.yaml_extract import extension_id
+from graphify.ids import make_id
 
 ORIGIN = "container"
 
@@ -66,6 +71,9 @@ _EDGE_RESERVED = frozenset({
     "source", "target", "relation", "origin", "_origin", "confidence", "confidence_score",
     "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _OWN_FILE,
 })
+
+#: Drupal 11.1+'s stand-in class for a procedural hook implementation.
+_PROCEDURAL_CALL = "Drupal\\Core\\Extension\\ProceduralCall"
 
 _PERMISSION_SPLIT = re.compile(r"[+,]")
 _PSR4 = re.compile(r"^Drupal\\([A-Za-z0-9_]+)\\(.+)$")
@@ -234,6 +242,21 @@ class _Binder:
                 return mid
         return None
 
+    def function_under(self, directory: str | Path | None, name: str) -> str | None:
+        """The one function node labelled `name()` in any file under
+        `directory` (relative to the composer root, or absolute): a hook
+        implementation whose file the collector could not name (an include
+        not loaded at collection time)."""
+        if not directory or not name:
+            return None
+        path = Path(str(directory).replace("\\", "/"))
+        if not path.is_absolute():
+            path = self.composer_root / path
+        prefix = self._norm(os.path.normpath(path)).rstrip("/") + "/"
+        found = [nid for file, labels in self._by_file.items() if file.startswith(prefix)
+                 for nid in labels.get(f"{name}()", ())]
+        return found[0] if len(found) == 1 else None
+
 
 # -- the pass -------------------------------------------------------------------
 
@@ -268,6 +291,7 @@ class _Overlay:
         self.extension_paths = {e["name"]: e.get("path") for e in self.data.get("extensions") or []}
         self._confirmed: set[tuple[str, str]] = set()
         self._conflicted: set[tuple[str, str, str]] = set()
+        self._ordered: set[str] = set()
 
     # -- realms --
 
@@ -357,21 +381,36 @@ class _Overlay:
             return
         self.attr(nid, self.G.nodes[nid], key, value)
 
-    def ensure(self, nid: str, *, type: str, layer: str, label: str, realm: str | None) -> str:
-        """`nid`, created when absent: a boundary stub unless its realm is custom."""
+    def ensure(self, nid: str, *, type: str, layer: str, label: str, realm: str | None,
+               source_file: str | None = None, **extra: Any) -> str:
+        """`nid`, created when absent: a boundary stub unless its realm is
+        custom. `extra` attributes (None values left out) go only on a node
+        this call creates."""
         if nid in self.G:
             return nid
         realm = realm or "unknown"
-        attrs: dict[str, Any] = {
+        source_file = source_file or self.artifact_file
+        attrs: dict[str, Any] = {k: v for k, v in extra.items() if v is not None}
+        attrs.update({
             "label": label, "file_type": "concept", "type": type, "layer": layer,
-            "realm": realm, "source_file": self.artifact_file, "source_location": "L1",
-            "_origin": "ast", "origin": ORIGIN, _OVERLAY: True, _OWN_FILE: self.artifact_file,
-        }
+            "realm": realm, "source_file": source_file, "source_location": "L1",
+            "_origin": "ast", "origin": ORIGIN, _OVERLAY: True, _OWN_FILE: source_file,
+        })
         if not self.custom(realm):
             attrs["boundary"] = True
             attrs["external"] = True
         self.G.add_node(nid, **attrs)
         return nid
+
+    def scan_path(self, file: str | None) -> str | None:
+        """An artifact `file` (relative to the composer root) as `G`'s
+        `source_file`s are written: relative to the scan root."""
+        if not file:
+            return None
+        try:
+            return (self.composer_root / file).relative_to(self.root).as_posix()
+        except ValueError:
+            return None
 
     def _static_targets(self, u: str, relation: str) -> list[str]:
         G = self.G
@@ -608,6 +647,187 @@ class _Overlay:
                                      label=dep, realm=self.extension_realm(dep))
                 self.edge(nid, target, "depends_on_module", target_name=dep)
 
+    # -- hooks --
+
+    def extension_dir(self, name: str) -> str | None:
+        directory = self.extension_paths.get(name)
+        if not directory and self.registry is not None:
+            directory = self.registry.extensions.get(name)
+        return str(directory) if directory else None
+
+    def hook_target(self, name: str) -> str:
+        decl = self.registry.hooks.get(name) if self.registry is not None else None
+        realm = realm_of(Path(decl.file)) if decl is not None and decl.file else None
+        return self.ensure(hook_id(name), type="drupal_hook", layer="hook", label=name,
+                           realm=realm, hook_name=name)
+
+    def impl_order(self, nid: str, order: int) -> None:
+        """`order` on an impl node: its index in the hook's list, once per
+        apply (a module with two listeners for one hook keeps the first). A
+        static `order` is the `#[Hook(order: ...)]` argument text; it is
+        kept, and is not a conflict with an index."""
+        if nid in self._ordered or nid not in self.G:
+            return
+        self._ordered.add(nid)
+        if isinstance(self.G.nodes[nid].get("order"), str):
+            return
+        self.node_attr(nid, "order", order)
+
+    @staticmethod
+    def _listener(value: str) -> tuple[str, str, str]:
+        """(function, class, method) of a hook listener identifier."""
+        value = value.strip().lstrip("\\")
+        if "::" not in value:
+            return value, "", ""
+        cls, method = value.split("::", 1)
+        if cls.lstrip("\\") == _PROCEDURAL_CALL:
+            return method, "", ""
+        return "", cls, method
+
+    def bind_listener(self, module: str, file: str | None, function: str, cls: str,
+                      method: str) -> str | None:
+        if function:
+            found = self.binder.php_node(file, function)
+            return found if found is not None else self.binder.function_under(
+                self.extension_dir(module), function)
+        return self.binder.php_node(file or self.class_file(cls), f"{_short(cls)}::{method}")
+
+    def hooks_pass(self, phase: str) -> None:
+        for hook, entries in (self.data.get("hooks") or {}).items():
+            if not isinstance(entries, list):
+                continue
+            for order, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                module, listener = entry.get("module"), entry.get("callable")
+                if not module or not isinstance(listener, str) or not listener:
+                    continue
+                nid = hook_impl_id(module, hook)
+                file = entry.get("file")
+                realm = self.extension_realm(module) or self._file_realm(file)
+                custom = self.custom(realm)
+                if phase == "custom":
+                    self.count("hooks", custom)
+                    self.result.seen["drupal_hook_impl"].add(nid)
+                if not custom:
+                    if phase == "boundary" and nid in self.G:
+                        self.impl_order(nid, order)
+                        self.applied("hooks")
+                    continue
+                if phase != "custom":
+                    continue
+                function, cls, method = self._listener(listener)
+                if not function and not (cls and method):
+                    continue
+                if function and "::" in listener:
+                    file = None                # ProceduralCall.php is not where the function is
+                target = self.bind_listener(module, file, function, cls, method)
+                source_file = self.scan_path(file)
+                if source_file is None and target is not None:
+                    source_file = self.G.nodes[target].get("source_file")
+                self.ensure(nid, type="drupal_hook_impl", layer="hook", label=f"{module}:{hook}",
+                            realm=realm, source_file=source_file, module=module,
+                            hook_name=hook, function=function or None,
+                            class_name=_short(cls) if cls else None, method=method or None)
+                self.applied("hooks")
+                self.impl_order(nid, order)
+                decl = self.registry.hooks.get(hook) if self.registry is not None else None
+                if decl is None or decl.provider != module:
+                    # P2b's rule: an extension declaring the hook already has
+                    # `declares_hook` to it, one relation per pair.
+                    ext = self.ensure(extension_id(module), type="drupal_extension",
+                                      layer="extension", label=module, realm=realm)
+                    self.edge(ext, self.hook_target(hook), "implements_hook", target_name=hook)
+                if target is not None:
+                    self.edge(nid, target, "hook_implemented_by")
+
+    # -- plugins --
+
+    def plugin_type_target(self, plugin_type: str) -> str:
+        t = self.registry.types.get(plugin_type) if self.registry is not None else None
+        realm = realm_of(Path(t.class_file)) if t is not None and t.class_file else None
+        return self.ensure(type_id(plugin_type), type="drupal_plugin_type", layer="plugin",
+                           label=plugin_type, realm=realm, plugin_type=plugin_type)
+
+    def plugins_pass(self, phase: str) -> None:
+        for plugin_type, entries in (self.data.get("plugins") or {}).items():
+            if not isinstance(entries, list):
+                continue
+            for p in entries:
+                if not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"]:
+                    continue
+                name = p["id"]
+                nid = plugin_id(plugin_type, name)
+                file, provider = p.get("file"), p.get("provider")
+                file_realm, provider_realm = self._file_realm(file), self.extension_realm(provider)
+                custom = self.custom(file_realm) or self.custom(provider_realm)
+                if phase == "custom":
+                    self.count("plugins", custom)
+                    self.result.seen["drupal_plugin"].add(nid)
+                cls = (p.get("class") or "").lstrip("\\") or None
+                if not custom:
+                    if phase == "boundary" and nid in self.G:
+                        self.node_attr(nid, "class_name", cls)
+                        self.applied("plugins")
+                    continue
+                if phase != "custom":
+                    continue
+                deriver = (p.get("deriver") or "").lstrip("\\") or None
+                base = p.get("base_plugin_id") or None
+                derivative = True if base and base != name else None
+                realm = file_realm if self.custom(file_realm) else provider_realm
+                self.ensure(nid, type="drupal_plugin", layer="plugin", label=name, realm=realm,
+                            plugin_id=name, plugin_type=plugin_type, provider=provider)
+                self.applied("plugins")
+                for key, value in (("class_name", cls), ("deriver", deriver),
+                                   ("base_plugin_id", base), ("derivative", derivative)):
+                    self.node_attr(nid, key, value)
+                self.edge(nid, self.plugin_type_target(plugin_type), "plugin_of_type",
+                          target_name=plugin_type)
+                if provider:
+                    ext = self.ensure(extension_id(provider), type="drupal_extension",
+                                      layer="extension", label=provider, realm=provider_realm)
+                    self.edge(ext, nid, "provides_plugin")
+                if cls:
+                    impl = self.binder.php_node(file or self.class_file(cls), cls)
+                    if impl is not None:
+                        self.edge(nid, impl, "plugin_implemented_by")
+                if deriver:
+                    found = self.binder.php_node(self.class_file(deriver), deriver)
+                    if found is not None:
+                        self.edge(nid, found, "derives_plugins")
+
+    # -- subscribers --
+
+    def subscribers_pass(self) -> None:
+        """`subscribes_to_event` from each custom subscriber class bound in
+        `G`. The event node is made by its first custom subscriber, in that
+        subscriber's realm: an event is where custom code listens, never a
+        boundary stub."""
+        for event, entries in (self.data.get("subscribers") or {}).items():
+            if not isinstance(entries, list):
+                continue
+            for s in entries:
+                listener = s.get("callable") if isinstance(s, dict) else None
+                if not isinstance(listener, str) or "::" not in listener:
+                    continue
+                cls = listener.lstrip("\\").split("::", 1)[0]
+                file = s.get("file") or self.class_file(cls)
+                realm = self._file_realm(file)
+                custom = self.custom(realm)
+                self.count("subscribers", custom)
+                if not custom:
+                    continue
+                source = self.binder.php_node(file, cls)
+                if source is None:
+                    continue
+                eid = self.ensure(make_id("drupal", "event", event), type="drupal_event", layer="di",
+                                  label=event, realm=realm)
+                self.applied("subscribers")
+                priority = s.get("priority")
+                self.edge(source, eid, "subscribes_to_event",
+                          **({"priority": priority} if priority is not None else {}))
+
     # -- runtime --
 
     def runtime(self) -> None:
@@ -626,6 +846,9 @@ class _Overlay:
             self.services_pass(phase)
             self.routes_pass(phase)
             self.extensions_pass(phase)
+            self.hooks_pass(phase)
+            self.plugins_pass(phase)
+        self.subscribers_pass()
         self.aliases_pass()
         self.runtime()
 
