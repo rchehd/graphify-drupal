@@ -550,7 +550,9 @@ try {
       $callable = $class . '::' . $listener[1];
       $__g['subscribers'][$event][] = [
         'callable' => $callable,
-        'file' => $__g_callable_file($callable),
+        // The subscriber is the class: an inherited listener's method lives
+        // in its base class's file (RouteSubscriberBase), the class does not.
+        'file' => $__g_class_file($class),
         'priority' => $dispatcher->getListenerPriority($event, $listener),
       ];
     }

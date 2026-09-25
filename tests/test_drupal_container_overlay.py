@@ -303,6 +303,17 @@ def test_routes_to_targets_the_method_node(tmp_path):
         assert _edge(G, route_id("foo.page"), permission_id(perm))["relation"] == "requires_permission"
 
 
+def test_a_route_path_without_its_leading_slash_is_no_conflict(tmp_path):
+    """FormsRemote's `path: 'admin/system/settings'`: Symfony's `Route`
+    prepends the slash, so the container's `/admin/system/settings` is the
+    same path, not a divergence. The static value is kept."""
+    G = _graph(tmp_path)
+    G.nodes[route_id("foo.page")]["route_path"] = "foo"
+    result = apply(G, _artifact(tmp_path), tmp_path)
+    assert [c for c in result.conflicts if c["relation"] == "attribute:route_path"] == []
+    assert G.nodes[route_id("foo.page")]["route_path"] == "foo"
+
+
 def test_route_form_and_custom_access(tmp_path):
     data = _artifact_data()
     data["routes"].append({

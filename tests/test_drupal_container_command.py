@@ -122,9 +122,15 @@ _STUB = r"""<?php
 namespace Drupal\Component\Plugin {
   interface PluginManagerInterface { public function getDefinitions(); }
 }
+namespace {
+require getenv('STUB_BASE');
+}
 namespace Drupal\foo {
   class Bar { public function page() {} }
   class Sub { public function onRequest() {} }
+  // Its listener is inherited from a class in another file, like a custom
+  // `RouteSubscriberBase` subclass.
+  class RouteSub extends \GStubBaseSubscriber {}
 }
 namespace {
 define('DRUPAL_ROOT', getenv('STUB_ROOT') . '/web');
@@ -181,7 +187,10 @@ Drupal::$s['plugin.manager.block'] = new class implements \Drupal\Component\Plug
   }
 };
 Drupal::$s['event_dispatcher'] = new class {
-  public function getListeners() { return ['kernel.request' => [[new \Drupal\foo\Sub(), 'onRequest'], function () {}]]; }
+  public function getListeners() {
+    return ['kernel.request' => [[new \Drupal\foo\Sub(), 'onRequest'], function () {}],
+            'routing.route_alter' => [[new \Drupal\foo\RouteSub(), 'onAlterRoutes']]];
+  }
   public function getListenerPriority($event, $listener) { return 5; }
 };
 Drupal::$s['module_handler'] = new class {
@@ -216,9 +225,12 @@ def _run_stub(tmp_path: Path, d10: bool = False) -> tuple[dict, str]:
     (root / "web").mkdir(parents=True)
     (root / "composer.json").write_text("{}", encoding="utf-8")
     script = tmp_path / "stub.php"
+    base = tmp_path / "base.php"
+    base.write_text("<?php\nclass GStubBaseSubscriber { public function onAlterRoutes() {} }\n",
+                    encoding="utf-8")
     # The collector goes in the global namespace block, after the stubs.
     script.write_text(_STUB.rstrip()[:-1] + collector_code(["cron"]) + "\n}\n", encoding="utf-8")
-    env = {**os.environ, "STUB_ROOT": str(root), **({"STUB_D10": "1"} if d10 else {})}
+    env = {**os.environ, "STUB_ROOT": str(root), "STUB_BASE": str(base), **({"STUB_D10": "1"} if d10 else {})}
     result = subprocess.run(["php", str(script)], capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     return json.loads(result.stdout), str(script)
@@ -245,8 +257,12 @@ def test_the_collector_reads_a_stub_drupal(tmp_path):
     assert block["foo_block:x"]["deriver"] == "Drupal\\foo\\Sub"
     assert block["foo_block"]["base_plugin_id"] is None and block["foo_block"]["file"] == script
 
-    assert data["subscribers"] == {"kernel.request": [
-        {"callable": "Drupal\\foo\\Sub::onRequest", "file": script, "priority": 5}]}
+    # A listener's file is its object's class file, not the file declaring
+    # an inherited method: the subscriber is the class.
+    assert data["subscribers"] == {
+        "kernel.request": [{"callable": "Drupal\\foo\\Sub::onRequest", "file": script, "priority": 5}],
+        "routing.route_alter": [{"callable": "Drupal\\foo\\RouteSub::onAlterRoutes", "file": script,
+                                 "priority": 5}]}
     assert data["closures"] == {"kernel.request": 1}
 
     (route,) = data["routes"]

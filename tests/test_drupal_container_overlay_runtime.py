@@ -155,6 +155,33 @@ def test_a_static_impl_gets_its_runtime_order_and_its_implementation_is_confirme
     assert result.counts["hooks"]["custom"] == 2
 
 
+def test_a_theme_hook_impl_gets_no_runtime_mark(tmp_path):
+    """FormsRemote's `govuk_forms_theme()`: the collector reads module hook
+    lists (`hook_data`), and a theme's implementations are not in them (the
+    theme registry calls them). The container does not know either way, so
+    the node gets no `runtime` and no `static_only` record."""
+    from graphify.drupal.divergence import compute
+
+    theme_file = "web/themes/custom/bartheme/bartheme.theme"
+    impl = hook_impl_id("bartheme", "theme_suggestions_alter")
+    extraction = _runtime_extraction()
+    extraction["nodes"].append(_n(impl, "bartheme:theme_suggestions_alter", theme_file,
+                                  type="drupal_hook_impl", layer="hook", realm="custom",
+                                  module="bartheme", hook_name="theme_suggestions_alter",
+                                  function="bartheme_theme_suggestions_alter", via="procedural",
+                                  _origin="static_yaml"))
+    data = _runtime_data()
+    data["extensions"].append({"name": "bartheme", "type": "theme", "path": "web/themes/custom/bartheme",
+                               "status": 1, "weight": 0, "dependencies": []})
+    G = build_from_json(extraction)
+    artifact = _artifact(tmp_path, data)
+    result = apply(G, artifact, tmp_path)
+    assert "runtime" not in G.nodes[impl]
+    assert G.nodes[FORM_ALTER_IMPL]["runtime"] == "present"
+    assert "drupal_hook_impl" not in result.runtime_absent
+    assert [r for r in compute(G, result, artifact, tmp_path) if r["subject"] == impl] == []
+
+
 def test_a_container_only_class_method_impl_is_created_with_both_edges(tmp_path):
     G = _graph()
     apply(G, _artifact(tmp_path), tmp_path)
@@ -332,6 +359,19 @@ def test_a_custom_subscriber_creates_the_event_and_the_edge_with_priority(tmp_pa
     assert result.counts["subscribers"] == {"total": 2, "custom": 1, "applied": 1}
 
 
+def test_a_subscriber_with_an_inherited_listener_binds_by_its_own_class(tmp_path):
+    """FormsRemote's live artifact: a custom `RouteSubscriberBase` subclass is
+    listed with the file that declares `onAlterRoutes` (core's base class).
+    The edge's subject is the class, so its own file decides realm and node."""
+    data = _runtime_data()
+    data["subscribers"]["kernel.request"][1]["file"] = \
+        "web/core/lib/Drupal/Core/Routing/RouteSubscriberBase.php"
+    G = _graph()
+    result = apply(G, _artifact(tmp_path, data), tmp_path)
+    assert _edge(G, SUBSCRIBER_CLASS, REQUEST_EVENT)["relation"] == "subscribes_to_event"
+    assert result.counts["subscribers"] == {"total": 2, "custom": 1, "applied": 1}
+
+
 def test_an_event_only_core_subscribes_to_creates_nothing(tmp_path):
     data = _runtime_data()
     del data["subscribers"]["kernel.request"][1]
@@ -452,3 +492,48 @@ def test_registry_realms_for_stubs_and_a_self_declared_hook(tmp_path):
     assert hook_id("foo_info") not in G
     assert not G.has_edge(extension_id("foo"), hook_id("foo_info"))
     assert _edge(G, hook_impl_id("foo", "foo_info"), TOOLBAR)["relation"] == "hook_implemented_by"
+
+
+def test_a_links_yaml_plugin_binds_to_p1s_link_node(tmp_path):
+    """FormsRemote's 82 `menu.*` plugins: a plugin type read from a P1 links
+    family (`yaml_name: links.action`) is P1's `drupal_local_action` node, not
+    a second `drupal_plugin` node beside it. A derivative only the container
+    knows is made with P1's type and id."""
+    from graphify.drupal import discovery
+    from graphify.drupal.yaml_common import link_id
+
+    core = tmp_path / "web/core"
+    registry = discovery.Registry(web_root=str(tmp_path / "web"))
+    registry.extensions = {"foo": str(tmp_path / FOO)}
+    registry.types = {"menu.local_action": discovery.PluginType(
+        plugin_type="menu.local_action", manager_class="Drupal\\Core\\Menu\\LocalActionManager",
+        class_file=str(core / "lib/Drupal/Core/Menu/LocalActionManager.php"), line=1, owner="core",
+        registered=True, manager_service="plugin.manager.menu.local_action", discovery="yaml",
+        yaml_name="links.action")}
+    discovery.set_current(registry, None)
+
+    actions_file = f"{FOO}/foo.links.action.yml"
+    static = link_id("local_action", "foo.add")
+    extraction = _runtime_extraction()
+    extraction["nodes"].append(_n(static, "Add foo", actions_file, type="drupal_local_action",
+                                  layer="routing", realm="custom", _origin="static_yaml"))
+    data = _runtime_data()
+    data["plugins"]["menu.local_action"] = [
+        {"id": "foo.add", "class": "Drupal\\Core\\Menu\\LocalActionDefault", "file": None,
+         "provider": "foo", "deriver": None, "base_plugin_id": None},
+        {"id": "foo.derived:x", "class": "Drupal\\Core\\Menu\\LocalActionDefault", "file": None,
+         "provider": "foo", "deriver": "Drupal\\foo\\Plugin\\Derivative\\FooDeriver",
+         "base_plugin_id": "foo.derived"},
+    ]
+    G = build_from_json(extraction)
+    apply(G, _artifact(tmp_path, data), tmp_path)
+
+    assert plugin_id("menu.local_action", "foo.add") not in G
+    assert plugin_id("menu.local_action", "foo.derived:x") not in G
+    assert G.nodes[static]["type"] == "drupal_local_action"
+    assert "_overlay" not in G.nodes[static]
+    derived = G.nodes[link_id("local_action", "foo.derived:x")]
+    assert derived["type"] == "drupal_local_action" and derived["_overlay"] is True
+    assert derived["derivative"] is True
+    assert _edge(G, link_id("local_action", "foo.derived:x"), DERIVER_CLASS)["relation"] \
+        == "derives_plugins"

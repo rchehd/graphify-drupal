@@ -53,6 +53,7 @@ from graphify.drupal.container import Artifact, ArtifactError, load_artifact, st
 from graphify.drupal.discovery import type_id
 from graphify.drupal.hooks import hook_id, hook_impl_id
 from graphify.drupal.yaml_common import (
+    link_id,
     parameter_id,
     permission_id,
     plugin_id,
@@ -91,6 +92,14 @@ _EDGE_RESERVED = frozenset({
 
 #: Drupal 11.1+'s stand-in class for a procedural hook implementation.
 _PROCEDURAL_CALL = "Drupal\\Core\\Extension\\ProceduralCall"
+
+#: P1's links families (`yaml_links`): `yaml_name` -> (link kind, node type).
+_LINK_FAMILIES = {
+    "links.menu": ("menu_link", "drupal_menu_link"),
+    "links.task": ("local_task", "drupal_local_task"),
+    "links.action": ("local_action", "drupal_local_action"),
+    "links.contextual": ("contextual_link", "drupal_contextual_link"),
+}
 
 _PERMISSION_SPLIT = re.compile(r"[+,]")
 _PSR4 = re.compile(r"^Drupal\\([A-Za-z0-9_]+)\\(.+)$")
@@ -320,6 +329,16 @@ def _artifact_source_file(artifact: Path, root: Path, out_base: Path | None = No
 
 
 
+def _same_text(key: str, static: str, container: str) -> bool:
+    """One value written two ways: a class with or without its leading
+    backslash, and a route path with or without its leading slash (Symfony's
+    `Route::setPath` prepends it, so a routing.yml `path: 'admin/x'` is the
+    container's `/admin/x`)."""
+    if key == "route_path":
+        return "/" + static.strip().lstrip("/") == "/" + container.strip().lstrip("/")
+    return static.lstrip("\\") == container.lstrip("\\")
+
+
 class _Overlay:
     def __init__(self, G: nx.Graph, artifact: Artifact, root: Path, result: OverlayResult) -> None:
         from graphify.drupal.discovery import current_registry, current_run
@@ -350,14 +369,23 @@ class _Overlay:
         self._confirmed: set[tuple[str, str]] = set()
         self._conflicted: set[tuple[str, str, str]] = set()
         self._ordered: set[str] = set()
+        #: `realm_of` per path: each pass asks once per fact and phase, and
+        #: FormsRemote's artifact names ~4,000 files (26k calls, 1.3 s uncached).
+        self._realms: dict[str, str | None] = {}
 
     # -- realms --
+
+    def realm(self, path: Path | str) -> str | None:
+        key = str(path)
+        if key not in self._realms:
+            self._realms[key] = realm_of(Path(path))
+        return self._realms[key]
 
     def custom(self, realm: str | None) -> bool:
         return realm == "custom" or (realm is not None and realm in self.included)
 
     def _file_realm(self, file: str | None) -> str | None:
-        return realm_of(self.composer_root / file) if file else None
+        return self.realm(self.composer_root / file) if file else None
 
     def extension_realm(self, name: str | None) -> str | None:
         if not name:
@@ -366,7 +394,7 @@ class _Overlay:
             info = self.registry.extension_info.get(name)
             directory = info[1] if info else self.registry.extensions.get(name)
             if directory:
-                return realm_of(Path(directory))
+                return self.realm(directory)
         return self._file_realm(self.extension_paths.get(name))
 
     def service_realm(self, sid: str) -> str | None:
@@ -428,7 +456,7 @@ class _Overlay:
         existing = data[key]
         same = existing == value or (
             isinstance(existing, str) and isinstance(value, str)
-            and existing.lstrip("\\") == value.lstrip("\\"))
+            and _same_text(key, existing, value))
         if not same:
             self.result.conflicts.append({
                 "relation": f"attribute:{key}", "source": nid,
@@ -716,7 +744,7 @@ class _Overlay:
 
     def hook_target(self, name: str) -> str:
         decl = self.registry.hooks.get(name) if self.registry is not None else None
-        realm = realm_of(Path(decl.file)) if decl is not None and decl.file else None
+        realm = self.realm(decl.file) if decl is not None and decl.file else None
         return self.ensure(hook_id(name), type="drupal_hook", layer="hook", label=name,
                            realm=realm, hook_name=name)
 
@@ -805,9 +833,20 @@ class _Overlay:
 
     def plugin_type_target(self, plugin_type: str) -> str:
         t = self.registry.types.get(plugin_type) if self.registry is not None else None
-        realm = realm_of(Path(t.class_file)) if t is not None and t.class_file else None
+        realm = self.realm(t.class_file) if t is not None and t.class_file else None
         return self.ensure(type_id(plugin_type), type="drupal_plugin_type", layer="plugin",
                            label=plugin_type, realm=realm, plugin_type=plugin_type)
+
+    def plugin_node(self, plugin_type: str, name: str) -> tuple[str, str, str]:
+        """`(id, type, layer)` of a plugin's node. A type read from a P1 links
+        family (`menu.link` from `*.links.menu.yml`, ...) is P1's link node,
+        so a static link is confirmed rather than doubled."""
+        t = self.registry.types.get(plugin_type) if self.registry is not None else None
+        link = _LINK_FAMILIES.get(t.yaml_name) if t is not None else None
+        if link is not None:
+            kind, node_type = link
+            return link_id(kind, name), node_type, "routing"
+        return plugin_id(plugin_type, name), "drupal_plugin", "plugin"
 
     def plugins_pass(self, phase: str) -> None:
         for plugin_type, entries in (self.data.get("plugins") or {}).items():
@@ -817,7 +856,7 @@ class _Overlay:
                 if not isinstance(p, dict) or not isinstance(p.get("id"), str) or not p["id"]:
                     continue
                 name = p["id"]
-                nid = plugin_id(plugin_type, name)
+                nid, node_type, layer = self.plugin_node(plugin_type, name)
                 file, provider = p.get("file"), p.get("provider")
                 file_realm, provider_realm = self._file_realm(file), self.extension_realm(provider)
                 custom = self.custom(file_realm) or self.custom(provider_realm)
@@ -836,7 +875,7 @@ class _Overlay:
                 base = p.get("base_plugin_id") or None
                 derivative = True if base and base != name else None
                 realm = file_realm if self.custom(file_realm) else provider_realm
-                self.ensure(nid, type="drupal_plugin", layer="plugin", label=name, realm=realm,
+                self.ensure(nid, type=node_type, layer=layer, label=name, realm=realm,
                             plugin_id=name, plugin_type=plugin_type, provider=provider)
                 self.applied("plugins")
                 for key, value in (("class_name", cls), ("deriver", deriver),
@@ -874,7 +913,11 @@ class _Overlay:
                 if not isinstance(listener, str) or "::" not in listener:
                     continue
                 cls = listener.lstrip("\\").split("::", 1)[0]
-                file = s.get("file") or self.class_file(cls)
+                # The edge's subject is the class, so its own file wins: an
+                # inherited listener (`RouteSubscriberBase::onAlterRoutes`) is
+                # declared in a core file, which would make every custom route
+                # subscriber look like core.
+                file = self.class_file(cls) or s.get("file")
                 realm = self._file_realm(file)
                 custom = self.custom(realm)
                 self.count("subscribers", custom)
@@ -893,9 +936,16 @@ class _Overlay:
     # -- runtime --
 
     def runtime(self) -> None:
+        # The collector reads module hook lists (`hook_data`, `invokeAllWith`);
+        # a theme's implementations are called by the theme registry and are
+        # in neither, so the container cannot say whether one runs.
+        themes = {e.get("name") for e in self.data.get("extensions") or []
+                  if isinstance(e, dict) and e.get("type") == "theme"}
         for nid, data in self.G.nodes(data=True):
             node_type = data.get("type")
             if node_type not in RUNTIME_TYPES:
+                continue
+            if node_type == "drupal_hook_impl" and data.get("module") in themes:
                 continue
             state = "present" if nid in self.result.seen[node_type] else "absent"
             self.attr(nid, data, "runtime", state)
