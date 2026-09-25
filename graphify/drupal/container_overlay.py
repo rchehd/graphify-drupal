@@ -19,11 +19,18 @@ only adds attributes to a node already in the graph. A boundary stub is made
 only as the direct target of a custom fact's edge.
 
 Undo markers: `_overlay: True` on nodes the overlay created, and
-`_overlay_attrs: [keys]` on every node and edge it touched.
+`_overlay_attrs: [keys]` on every node and edge it touched. The container
+never overwrites a value, but the boundary facts (`apply_boundary_facts`,
+spec S7.8) replace a stale one; the value they replaced is kept in
+`_overlay_prev: {key: value}`, which `undo` puts back.
 
 It maps `services`, `aliases`, `routes`, `extensions`, `hooks` (P2b's
 implementation shape, plus each implementation's `runtime_order`), `plugins`
 and `subscribers`.
+
+`run_for_build` is what the build seam calls on every graph core builds while
+a Drupal run is current (spec S7.1): artifact, staleness, `apply`, the
+boundary facts, the divergence log and the report's inventory block.
 
 A `drupal_hook_impl` node the overlay makes has its implementation's PHP file
 as `source_file` on purpose, as P2b's would: when core re-extracts that file it
@@ -31,6 +38,7 @@ evicts the node, and the overlay rebuilds it in the same build.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -40,7 +48,7 @@ from typing import Any
 import networkx as nx
 
 from graphify.drupal.boundary import included_realms, install_map, realm_of
-from graphify.drupal.container import Artifact
+from graphify.drupal.container import Artifact, ArtifactError, load_artifact, staleness
 from graphify.drupal.discovery import type_id
 from graphify.drupal.hooks import hook_id, hook_impl_id
 from graphify.drupal.yaml_common import (
@@ -58,6 +66,8 @@ ORIGIN = "container"
 
 _OVERLAY = "_overlay"
 _ATTRS = "_overlay_attrs"
+#: `{key: value}` a replaced attribute had before the overlay; `undo` restores it.
+_PREV = "_overlay_prev"
 #: The `source_file` an overlay item was created with; see `_owned`.
 _OWN_FILE = "_overlay_file"
 
@@ -73,7 +83,7 @@ _SINGLE_TARGET = frozenset({
 #: Keys an edge's own bookkeeping owns; a tag attribute never overwrites them.
 _EDGE_RESERVED = frozenset({
     "source", "target", "relation", "origin", "_origin", "confidence", "confidence_score",
-    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _OWN_FILE,
+    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _PREV, _OWN_FILE,
 })
 
 #: Drupal 11.1+'s stand-in class for a procedural hook implementation.
@@ -93,14 +103,19 @@ class OverlayResult:
     runtime_absent: dict[str, int] = field(default_factory=dict)
     conflicts: list[dict] = field(default_factory=list)
     seen: dict[str, set[str]] = field(default_factory=lambda: {t: set() for t in RUNTIME_TYPES})
+    #: The node ids `G` had before the facts were applied (after `undo`).
+    static_ids: set[str] = field(default_factory=set)
 
 
 # -- undo -----------------------------------------------------------------------
 
 
 def _strip(data: dict) -> None:
+    previous = data.pop(_PREV, None)
     for key in data.pop(_ATTRS, None) or ():
         data.pop(key, None)
+    if isinstance(previous, dict):
+        data.update(previous)
 
 
 def _owned(data: dict) -> bool:
@@ -280,10 +295,14 @@ class _Overlay:
         self.binder = _Binder(G, self.root, self.composer_root)
         self.included = included_realms(self.root)
         self.registry = current_registry()
+        # The `source_file` of what the overlay adds. An artifact outside the
+        # scan root (`GRAPHIFY_DRUPAL_CONTAINER`) keeps its absolute path: a
+        # root-relative name no file answers to is what core's incremental
+        # `extract` prunes as a stale source, after the build the overlay ran in.
         try:
             self.artifact_file = Path(artifact.path).absolute().relative_to(self.root).as_posix()
         except ValueError:
-            self.artifact_file = Path(artifact.path).name
+            self.artifact_file = Path(artifact.path).absolute().as_posix()
 
         self.services: dict[str, dict] = {}
         self.class_files: dict[str, str] = {}
@@ -862,19 +881,184 @@ class _Overlay:
 
 
 def apply(G: nx.Graph, artifact: Artifact | None, root: Path, *, status: str = "fresh",
-          reasons: list[str] | None = None) -> OverlayResult:
+          reasons: list[str] | None = None, boundary_facts: bool = False) -> OverlayResult:
     """Lay `artifact` over `G` in place (spec S7). Undoes a previous overlay
     first; with no artifact, adds nothing (`unavailable`, or the `status`
     the caller already decided, such as `invalid`). Never raises: an internal
-    error undoes what it did and becomes status `error`."""
+    error undoes what it did and becomes status `error`.
+
+    With `boundary_facts`, the registry's facts (`apply_boundary_facts`) are
+    re-applied right after the undo, before any container fact, with or
+    without an artifact: a container fact about a boundary stub is then
+    compared with what the registry says now, not with what it said when the
+    stub was materialised (a registry-only change is no conflict)."""
     undo(G)
-    if artifact is None:
-        return OverlayResult(status="unavailable" if status == "fresh" else status,
-                             reasons=list(reasons or []))
-    result = OverlayResult(status=status, reasons=list(reasons or []))
     try:
+        if boundary_facts:
+            apply_boundary_facts(G, Path(root))
+        if artifact is None:
+            return OverlayResult(status="unavailable" if status == "fresh" else status,
+                                 reasons=list(reasons or []))
+        result = OverlayResult(status=status, reasons=list(reasons or []),
+                               static_ids=set(G.nodes))
         _Overlay(G, artifact, Path(root), result).run()
     except Exception as exc:  # noqa: BLE001 -- the overlay never breaks a build
         undo(G)
         return OverlayResult(status="error", reasons=[f"{type(exc).__name__}: {exc}"])
+    return result
+
+
+# -- the boundary facts (spec S7.8) ------------------------------------------------
+
+
+def _replace(data: dict, key: str, value: Any) -> None:
+    """Set `key` to `value`, recorded so `undo` gives the node back as it was:
+    the key in `_overlay_attrs`, and a value it replaces in `_overlay_prev`
+    (unless the overlay itself set that value this build)."""
+    touched = data.setdefault(_ATTRS, [])
+    if key not in touched:
+        if key in data:
+            data.setdefault(_PREV, {})[key] = data[key]
+        touched.append(key)
+    data[key] = value
+
+
+def apply_boundary_facts(G: nx.Graph, root: Path) -> None:
+    """Re-apply the current registry's facts to every boundary stub in `G`
+    (P2b's `boundary: true`), whether or not an artifact is applied.
+
+    The facts are the resolver's own (`resolvers._BoundaryIndex.facts`, the
+    ones a stub gets when it is materialised). A stub carried over from
+    graph.json keeps what the registry said when its referencing file was
+    last extracted; a registry-only change (a core service's class) reaches
+    it here, on the next build, without re-extracting anything. A key is
+    written only where the registry's value differs from the node's or the
+    node lacks it."""
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.resolvers import _BoundaryIndex, scanning
+
+    registry = current_registry()
+    if registry is None:
+        return
+    index = _BoundaryIndex(registry)
+    # Paths in the facts are relative to the scan root, as the resolver writes them.
+    with scanning(Path(root)):
+        for nid, data in G.nodes(data=True):
+            if not data.get("boundary"):
+                continue
+            for key, value in index.facts({**data, "id": nid}).items():
+                if value is None or (key in data and data[key] == value):
+                    continue
+                _replace(data, key, value)
+
+
+# -- the build seam (spec S7.1) ------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+_logged_errors: set[str] = set()
+
+#: The vocabulary's S7 list: what a graph without the container cannot know.
+NOT_STATIC = (
+    ("plugin derivatives", "definitions are generated by code at runtime"),
+    ("container changes from `*ServiceProvider` and compiler passes",
+     "the container is assembled programmatically"),
+    ("routes added by `RouteSubscriber`", "same"),
+    ("actual hook execution order", "depends on weights and alters"),
+    ("`$config[…]` overrides in `settings.php`", "PHP assignment, not declaration"),
+)
+
+_MAX_REPORTED_RECORDS = 10
+_STAMP_KEYS = ("git_commit", "created_at", "runner", "drupal_version")
+
+
+def _summary(result: OverlayResult, artifact: Artifact | None, records: list[dict]) -> dict:
+    divergence: dict[str, int] = {}
+    for record in records:
+        divergence[record["kind"]] = divergence.get(record["kind"], 0) + 1
+    stamp = artifact.stamp if artifact is not None else {}
+    errors = artifact.data.get("errors") if artifact is not None else []
+    return {
+        "status": result.status,
+        "reasons": list(result.reasons),
+        "stamp": {k: stamp.get(k) for k in _STAMP_KEYS if stamp.get(k) is not None},
+        "counts": result.counts,
+        "edges": result.edges,
+        "runtime_absent": result.runtime_absent,
+        "divergence": divergence,
+        "records": records[:_MAX_REPORTED_RECORDS],
+        "errors": errors if isinstance(errors, list) else [],
+    }
+
+
+def _report(summary: dict, out: Path) -> None:
+    """`summary` as the inventory's `container` block, in process and on disk."""
+    from graphify.drupal.inventory import current_inventory, write_inventory
+
+    inventory = current_inventory()
+    if inventory is None:
+        return
+    inventory["container"] = summary
+    try:
+        write_inventory(inventory, out)
+    except OSError:
+        pass
+
+
+def _log_once(message: str) -> None:
+    if message not in _logged_errors:
+        _logged_errors.add(message)
+        _log.warning("graphify-drupal: the container overlay failed: %s", message)
+
+
+def run_for_build(G: nx.Graph) -> OverlayResult | None:
+    """The overlay for one build (spec S7.1): `None`, touching nothing, when no
+    Drupal run is current (`query`, `path` and the other readers). Otherwise
+    load the artifact, decide its staleness, `apply` it with the boundary
+    facts (re-applied first, see `apply`), write (or remove) the divergence
+    log and put the report block in the inventory. Never raises: a broken artifact is `invalid` (boundary
+    facts still applied), any other failure undoes the overlay and is
+    `error`."""
+    from graphify.drupal import divergence
+    from graphify.drupal.discovery import current_run
+
+    run = current_run()
+    if run is None:
+        return None
+    root, out = run
+    artifact: Artifact | None = None
+    records: list[dict] = []
+    try:
+        try:
+            artifact = load_artifact(root)
+        except ArtifactError as exc:
+            result = apply(G, None, root, status="invalid", reasons=[str(exc)],
+                           boundary_facts=True)
+        else:
+            if artifact is None:
+                result = apply(G, None, root, boundary_facts=True)
+            else:
+                status, reasons = staleness(artifact, root)
+                result = apply(G, artifact, root, status=status, reasons=reasons,
+                               boundary_facts=True)
+        if result.status == "error":
+            _log_once("; ".join(result.reasons))
+            artifact = None
+        if artifact is not None:
+            records = divergence.compute(G, result, artifact, root)
+            divergence.write(records, out)
+        else:
+            divergence.remove(out)
+    except Exception as exc:  # noqa: BLE001 -- the overlay never breaks a build
+        message = f"{type(exc).__name__}: {exc}"
+        _log_once(message)
+        try:
+            undo(G)
+        except Exception:  # noqa: BLE001
+            pass
+        result, artifact, records = OverlayResult(status="error", reasons=[message]), None, []
+        divergence.remove(out)
+    try:
+        _report(_summary(result, artifact, records), out)
+    except Exception as exc:  # noqa: BLE001
+        _log_once(f"{type(exc).__name__}: {exc}")
     return result

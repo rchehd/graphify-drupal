@@ -796,6 +796,16 @@ _warned_unwritable = False
 #: The out dir a caller fixed for the duration of a call (`using_out_dir`).
 _out_override: Path | None = None
 
+#: (resolved scan root, out dir) of the Drupal run `prepare_run` last set up.
+_current_run: tuple[Path, Path] | None = None
+
+
+def current_run() -> tuple[Path, Path] | None:
+    """The (resolved root, out dir) of this process's current Drupal run: set by
+    `prepare_run` for a Drupal tree, cleared by `set_current(None)`. The build
+    seam lays the container overlay only while one is current (P3 spec S7.1)."""
+    return _current_run
+
 
 @contextmanager
 def using_out_dir(path: Path) -> Iterator[None]:
@@ -841,11 +851,12 @@ def set_current(
 ) -> None:
     """Set this process's in-memory registry (and the prior run's, if any),
     with the files this run must re-extract because the registry changed."""
-    global _current, _previous, _force_miss
+    global _current, _previous, _force_miss, _current_run
     _current = registry
     _previous = previous
     _force_miss = frozenset(forced) if registry is not None else frozenset()
     if registry is None:
+        _current_run = None
         # A non-Drupal run in the same process must not report a previous
         # site's inventory (spec §5.7); deferred import avoids a cycle with
         # inventory.py, which imports Registry/current_registry from here.
@@ -1108,7 +1119,10 @@ def prepare_run(
     plus any set a previous run left unconsumed, become this run's
     `force_miss()` set, kept in process and in the file until
     `clear_force_miss()` is called after a completed extraction.
+
+    A Drupal tree also becomes the `current_run()` (root, out dir).
     """
+    global _current_run
     try:
         # As `detect()` does: a symlinked checkout is scanned at its real path.
         root = Path(root).resolve()
@@ -1166,6 +1180,7 @@ def prepare_run(
         _write_temp_registry(payload)
 
     set_current(registry, previous, forced)
+    _current_run = (root, target.parent)
     return registry
 
 

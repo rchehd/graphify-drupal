@@ -1,7 +1,7 @@
 """The single point where graphify.drupal touches graphify core.
 
 Nothing in core is edited. `install()` places a finder on `sys.meta_path` that
-wraps the loader for `graphify.cache`, `graphify.cli`, `graphify.dedup`, `graphify.detect`,
+wraps the loader for `graphify.build`, `graphify.cache`, `graphify.cli`, `graphify.dedup`, `graphify.detect`,
 `graphify.extract`, `graphify.report` and `graphify.watch`, applying the patch
 immediately after each module finishes executing — and patches any of them
 directly if it is already in `sys.modules`.
@@ -667,18 +667,35 @@ def _patch_watch(watch: ModuleType) -> None:
         )
     watched.update(PROCEDURAL_SUFFIXES)
 
+    def _is_artifact(path) -> bool:
+        # The container artifact (P3 spec S6.1) of the current run's root: a
+        # changed artifact is a rebuild (the overlay needs no LLM), whatever
+        # its suffix. Before a first rebuild made a run current it is unknown.
+        from graphify.drupal.container import artifact_path
+        from graphify.drupal.discovery import current_run
+
+        run = current_run()
+        if run is None:
+            return False
+        try:
+            return Path(path).absolute() == artifact_path(run[0]).absolute()
+        except (OSError, TypeError, ValueError):
+            return False
+
     def _triggers(original):
         def _batch_triggers_rebuild(batch):
             return original(batch) or any(
-                p.exists() and is_drupal_file(p) for p in batch
+                (p.exists() and is_drupal_file(p)) or _is_artifact(p) for p in batch
             )
         return _batch_triggers_rebuild
 
     def _non_code(original):
         def _has_non_code(changed_paths):
-            # Drupal-recognised files are excluded before core's check: a
-            # batch of only Drupal YAML must not still raise the LLM flag.
-            return original([p for p in changed_paths if not is_drupal_file(p)])
+            # Drupal-recognised files (and the container artifact) are excluded
+            # before core's check: a batch of only Drupal YAML must not still
+            # raise the LLM flag.
+            return original([p for p in changed_paths
+                             if not is_drupal_file(p) and not _is_artifact(p)])
         return _has_non_code
 
     _wrap(watch, "_batch_triggers_rebuild", _triggers)
@@ -841,7 +858,50 @@ def _patch_dedup(dedup: ModuleType) -> None:
     _wrap(dedup, "_defines_id", _declared_defines)
 
 
+def _patch_build(build: ModuleType) -> None:
+    """Lay the container artifact over every graph core builds (P3 spec S7.1).
+
+    `build_from_json` is where every build ends -- `build`, `build_merge`
+    (`extract`, incremental `extract`) and `watch`/`update`'s rebuild -- and
+    each calls it by bare name, so the module attribute is what they get.
+    The overlay runs only while a Drupal run is current
+    (`discovery.current_run()`, set by the `detect()` a build starts with):
+    `query`, `path` and the other readers load graph.json through the same
+    function in a process that ran no `detect()`, and are untouched. A
+    re-entry guard keeps a build inside the overlay from overlaying twice.
+    """
+    if not callable(getattr(build, "build_from_json", None)):
+        raise DrupalSeamError(
+            "graphify.build.build_from_json is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _overlaid(original):
+        def build_from_json(*args, **kwargs):
+            G = original(*args, **kwargs)
+            if _overlaying:
+                return G
+            from graphify.drupal.container_overlay import run_for_build
+
+            _overlaying.append(True)
+            try:
+                run_for_build(G)
+            finally:
+                _overlaying.pop()
+            return G
+        build_from_json.__name__ = build_from_json.__qualname__ = "build_from_json"
+        build_from_json.__doc__ = original.__doc__
+        return build_from_json
+
+    _wrap(build, "build_from_json", _overlaid)
+
+
+#: Non-empty while `run_for_build` runs (the build seam's re-entry guard).
+_overlaying: list[bool] = []
+
+
 _PATCHERS = {
+    "graphify.build": _patch_build,
     "graphify.cache": _patch_cache,
     "graphify.cli": _patch_cli,
     "graphify.dedup": _patch_dedup,

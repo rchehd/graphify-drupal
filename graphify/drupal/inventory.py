@@ -419,4 +419,58 @@ def render_section(inventory: dict) -> str:
     else:
         lines.append("- none")
 
+    container = inventory.get("container")
+    if isinstance(container, dict):
+        lines += ["", *_render_container(container)]
+
     return "\n".join(lines)
+
+
+_CONTAINER_SOURCES = ("services", "aliases", "routes", "extensions", "hooks", "plugins",
+                      "subscribers")
+_EDGE_OUTCOMES = ("confirmed", "container_only", "conflict")
+
+
+def container_status(container: dict) -> str:
+    """`fresh`, `unavailable`, or `stale|invalid|error (reasons)` (P3 spec S9)."""
+    status = str(container.get("status") or "unavailable")
+    reasons = [str(r) for r in container.get("reasons") or []]
+    return f"{status} ({'; '.join(reasons)})" if reasons else status
+
+
+def _render_container(container: dict) -> list[str]:
+    """The "Container" block (P3 spec S9): what the artifact laid over the
+    graph, or, without one, what a static-only graph cannot know."""
+    from graphify.drupal.container_overlay import NOT_STATIC
+
+    lines = ["### Container", "", f"- status: {container_status(container)}"]
+    if container.get("status") in ("unavailable", "invalid", "error"):
+        lines += ["", "Not statically knowable without the container "
+                      "(`graphify drupal container`):"]
+        lines += [f"- {what}: {why}" for what, why in NOT_STATIC]
+        return lines
+
+    stamp = container.get("stamp") or {}
+    lines.append("- stamp: " + ", ".join(
+        f"{key}: {stamp[key]}" for key in ("git_commit", "created_at", "runner", "drupal_version")
+        if stamp.get(key) is not None) if stamp else "- stamp: none")
+    counts = container.get("counts") or {}
+    lines += ["", "| source | in artifact | custom | applied |", "| --- | --- | --- | --- |"]
+    for source in _CONTAINER_SOURCES:
+        c = counts.get(source) or {}
+        lines.append(f"| {source} | {c.get('total', 0)} | {c.get('custom', 0)} | "
+                     f"{c.get('applied', 0)} |")
+    edges = container.get("edges") or {}
+    lines += ["", "- edges: " + ", ".join(f"{k} {edges.get(k, 0)}" for k in _EDGE_OUTCOMES)]
+    lines.append(f"- runtime: absent: {_counts(container.get('runtime_absent'))}")
+    lines.append(f"- divergences: {_counts(container.get('divergence'))}")
+    for record in container.get("records") or []:
+        stale = " (possibly stale)" if record.get("possibly_stale") else ""
+        lines.append(f"  - {record.get('kind')}: `{record.get('subject')}`{stale}")
+    errors = container.get("errors") or []
+    lines.append(f"- collector errors: {len(errors)}")
+    for error in errors:
+        if isinstance(error, dict):
+            lines.append(f"  - {error.get('source')}: {error.get('class')}: "
+                         f"{error.get('message')}")
+    return lines
