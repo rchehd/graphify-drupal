@@ -166,6 +166,22 @@ def _sha(keys: set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(keys)).encode("utf-8")).hexdigest()
 
 
+def _extension_realm(name: str, artifact_paths: dict[str, str], root: Path) -> str | None:
+    """An extension's realm: from the artifact's `path` (relative to the
+    composer root, as the overlay reads it), else from the registry."""
+    from graphify.drupal.boundary import install_map, realm_of
+    from graphify.drupal.discovery import current_registry
+
+    path = artifact_paths.get(name)
+    if path:
+        imap = install_map(Path(root))
+        composer_root = Path(imap.project_root) if imap is not None else Path(root)
+        return realm_of(composer_root / path)
+    registry = current_registry()
+    directory = registry.extensions.get(name) if registry is not None else None
+    return realm_of(Path(directory)) if directory else None
+
+
 def _extension_state(G: nx.Graph, artifact: Artifact, root: Path, scope: _Scope) -> list[dict]:
     from graphify.drupal.yaml_extract import extension_id
 
@@ -174,17 +190,27 @@ def _extension_state(G: nx.Graph, artifact: Artifact, root: Path, scope: _Scope)
     if static is None:
         return []
     container: dict[str, str] = {}
+    artifact_paths: dict[str, str] = {}
     for e in artifact.data.get("extensions") or []:
-        if isinstance(e, dict) and isinstance(e.get("name"), str) and e.get("status") == 1:
+        if not isinstance(e, dict) or not isinstance(e.get("name"), str):
+            continue
+        if isinstance(e.get("path"), str):
+            artifact_paths[e["name"]] = e["path"]
+        if e.get("status") == 1:
             container[e["name"]] = str(e.get("type") or "module")
-    # The collector's stamp: equal means the same set, nothing to compare.
+    # The collector's stamp (`container_collect.php`: sorted `type:name`
+    # joined with "\n"): equal means the same set, nothing to compare.
     if artifact.stamp.get("enabled_extensions_sha") == _sha(
             {f"{t}:{n}" for n, t in static.items()}):
         return []
     records = []
     for name in sorted(static.keys() ^ container.keys()):
         nid = extension_id(name)
-        if nid in G and not scope.logged(nid):
+        # Custom subjects, plus boundary subjects already in the graph (S8).
+        if nid in G:
+            if not scope.logged(nid):
+                continue
+        elif not scope.custom(_extension_realm(name, artifact_paths, root)):
             continue
         in_static = name in static
         records.append(_record("extension_state", nid, "drupal_extension",

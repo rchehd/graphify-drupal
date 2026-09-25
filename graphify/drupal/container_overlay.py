@@ -22,7 +22,8 @@ Undo markers: `_overlay: True` on nodes the overlay created, and
 `_overlay_attrs: [keys]` on every node and edge it touched. The container
 never overwrites a value, but the boundary facts (`apply_boundary_facts`,
 spec S7.8) replace a stale one; the value they replaced is kept in
-`_overlay_prev: {key: value}`, which `undo` puts back.
+`_overlay_prev: {key: value}`, which `undo` puts back -- unless the key no
+longer holds what they wrote (`_overlay_set`): a static producer then owns it.
 
 It maps `services`, `aliases`, `routes`, `extensions`, `hooks` (P2b's
 implementation shape, plus each implementation's `runtime_order`), `plugins`
@@ -68,6 +69,8 @@ _OVERLAY = "_overlay"
 _ATTRS = "_overlay_attrs"
 #: `{key: value}` a replaced attribute had before the overlay; `undo` restores it.
 _PREV = "_overlay_prev"
+#: `{key: value}` the boundary facts wrote; a different value at undo is a static producer's.
+_SET = "_overlay_set"
 #: The `source_file` an overlay item was created with; see `_owned`.
 _OWN_FILE = "_overlay_file"
 
@@ -83,7 +86,7 @@ _SINGLE_TARGET = frozenset({
 #: Keys an edge's own bookkeeping owns; a tag attribute never overwrites them.
 _EDGE_RESERVED = frozenset({
     "source", "target", "relation", "origin", "_origin", "confidence", "confidence_score",
-    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _PREV, _OWN_FILE,
+    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _PREV, _SET, _OWN_FILE,
 })
 
 #: Drupal 11.1+'s stand-in class for a procedural hook implementation.
@@ -112,10 +115,18 @@ class OverlayResult:
 
 def _strip(data: dict) -> None:
     previous = data.pop(_PREV, None)
+    previous = dict(previous) if isinstance(previous, dict) else {}
+    written = data.pop(_SET, None)
+    written = written if isinstance(written, dict) else {}
     for key in data.pop(_ATTRS, None) or ():
+        if key in written and key in data and data[key] != written[key]:
+            # A static producer wrote this key since (a re-extracted stub
+            # merged over graph.json's copy in core's dedup): its value is
+            # current, and the value the overlay once replaced is stale.
+            previous.pop(key, None)
+            continue
         data.pop(key, None)
-    if isinstance(previous, dict):
-        data.update(previous)
+    data.update(previous)
 
 
 def _owned(data: dict) -> bool:
@@ -280,9 +291,38 @@ class _Binder:
 # -- the pass -------------------------------------------------------------------
 
 
+def _artifact_source_file(artifact: Path, root: Path, out_base: Path | None = None) -> str:
+    """The `source_file` of what the overlay adds: the artifact relative to
+    the scan root, `../`-relative when it lives outside it
+    (`GRAPHIFY_DRUPAL_CONTAINER`).
+
+    Core's incremental `extract` (`cli._stale_graph_sources`) prunes, after
+    the build the overlay ran in, every relative `source_file` that lands
+    inside the scan root under one of its anchors -- the root, and the
+    `--out` directory (`out_base`) when that differs -- and names no file
+    there. The bare name would be pruned; a `../` path leaving the root is
+    not, unless `--out` sits inside the root and the same path read from
+    there lands back in it: then, and only then, the absolute path."""
+    artifact, root = Path(artifact).absolute(), Path(root).absolute()
+    try:
+        return artifact.relative_to(root).as_posix()
+    except ValueError:
+        pass
+    rel = Path(os.path.relpath(artifact, root)).as_posix()
+    if out_base is not None:
+        out_base = Path(out_base).absolute()
+        if out_base != root:
+            landed = Path(os.path.normpath(out_base / rel))
+            if landed == root or root in landed.parents:
+                return artifact.as_posix()
+    return rel
+
+
+
+
 class _Overlay:
     def __init__(self, G: nx.Graph, artifact: Artifact, root: Path, result: OverlayResult) -> None:
-        from graphify.drupal.discovery import current_registry
+        from graphify.drupal.discovery import current_registry, current_run
 
         self.G = G
         self.data = artifact.data
@@ -295,14 +335,9 @@ class _Overlay:
         self.binder = _Binder(G, self.root, self.composer_root)
         self.included = included_realms(self.root)
         self.registry = current_registry()
-        # The `source_file` of what the overlay adds. An artifact outside the
-        # scan root (`GRAPHIFY_DRUPAL_CONTAINER`) keeps its absolute path: a
-        # root-relative name no file answers to is what core's incremental
-        # `extract` prunes as a stale source, after the build the overlay ran in.
-        try:
-            self.artifact_file = Path(artifact.path).absolute().relative_to(self.root).as_posix()
-        except ValueError:
-            self.artifact_file = Path(artifact.path).absolute().as_posix()
+        run = current_run()
+        self.artifact_file = _artifact_source_file(
+            Path(artifact.path), self.root, run[1].parent if run is not None else None)
 
         self.services: dict[str, dict] = {}
         self.class_files: dict[str, str] = {}
@@ -921,6 +956,7 @@ def _replace(data: dict, key: str, value: Any) -> None:
             data.setdefault(_PREV, {})[key] = data[key]
         touched.append(key)
     data[key] = value
+    data.setdefault(_SET, {})[key] = value
 
 
 def apply_boundary_facts(G: nx.Graph, root: Path) -> None:

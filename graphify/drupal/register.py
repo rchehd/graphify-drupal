@@ -40,6 +40,40 @@ def _wrap(module: ModuleType, name: str, make_wrapper) -> None:
     setattr(module, name, wrapper)
 
 
+#: [(run, env value), artifact path] for `_is_container_artifact`.
+_artifact_for_run: list = []
+
+
+def _is_container_artifact(path) -> bool:
+    """`path` is the container artifact (P3 spec S6.1) of the current Drupal
+    run's root. False while no run is current: outside a Drupal build the
+    artifact's location is unknown (and nothing about it matters)."""
+    import os
+
+    from graphify.drupal.container import ENV_ARTIFACT, artifact_path
+    from graphify.drupal.discovery import current_run
+
+    run = current_run()
+    if run is None:
+        return False
+    try:
+        # Resolved once per run (`prepare_run` makes a new tuple) and env value:
+        # `artifact_path` reads `.graphifyrc`.
+        key = (run, os.environ.get(ENV_ARTIFACT))
+        if _artifact_for_run and _artifact_for_run[0][0] is run and _artifact_for_run[0][1] == key[1]:
+            artifact = _artifact_for_run[1]
+        else:
+            artifact = artifact_path(run[0])
+            _artifact_for_run[:] = [key, artifact]
+        path = Path(path)
+        # The name first: this runs for every file `detect()` classifies.
+        if path.name != artifact.name:
+            return False
+        return path.absolute() == artifact.absolute() or path.resolve() == artifact.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _patch_detect(detect: ModuleType) -> None:
     from graphify.drupal.boundary import boundary_dir
     from graphify.drupal.discovery import current_registry, walking_registry
@@ -81,6 +115,14 @@ def _patch_detect(detect: ModuleType) -> None:
         def classify_file(path: Path):
             if is_drupal_file(path):
                 return detect.FileType.CODE
+            # The container artifact is `.json`, which core extracts as code
+            # (`json_config`): above 1 MiB that fails and is re-extracted on
+            # every build, below it an artifact-only change is a re-extracted
+            # file. It is the overlay's input, never graph content. The wrapped
+            # `detect()` runs `prepare_run` (which sets `current_run()`)
+            # before core classifies a single file.
+            if _is_container_artifact(path):
+                return None
             # A `.module` that is no extension's procedural file (a library's)
             # stays what it was before the suffix joined CODE_EXTENSIONS:
             # unclassified. `.inc` was core's already (a Pascal include), so a
@@ -667,25 +709,10 @@ def _patch_watch(watch: ModuleType) -> None:
         )
     watched.update(PROCEDURAL_SUFFIXES)
 
-    def _is_artifact(path) -> bool:
-        # The container artifact (P3 spec S6.1) of the current run's root: a
-        # changed artifact is a rebuild (the overlay needs no LLM), whatever
-        # its suffix. Before a first rebuild made a run current it is unknown.
-        from graphify.drupal.container import artifact_path
-        from graphify.drupal.discovery import current_run
-
-        run = current_run()
-        if run is None:
-            return False
-        try:
-            return Path(path).absolute() == artifact_path(run[0]).absolute()
-        except (OSError, TypeError, ValueError):
-            return False
-
     def _triggers(original):
         def _batch_triggers_rebuild(batch):
             return original(batch) or any(
-                (p.exists() and is_drupal_file(p)) or _is_artifact(p) for p in batch
+                (p.exists() and is_drupal_file(p)) or _is_container_artifact(p) for p in batch
             )
         return _batch_triggers_rebuild
 
@@ -695,7 +722,7 @@ def _patch_watch(watch: ModuleType) -> None:
             # before core's check: a batch of only Drupal YAML must not still
             # raise the LLM flag.
             return original([p for p in changed_paths
-                             if not is_drupal_file(p) and not _is_artifact(p)])
+                             if not is_drupal_file(p) and not _is_container_artifact(p)])
         return _has_non_code
 
     _wrap(watch, "_batch_triggers_rebuild", _triggers)

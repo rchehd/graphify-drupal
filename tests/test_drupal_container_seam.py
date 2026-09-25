@@ -81,6 +81,11 @@ def _artifact_data(root: Path, stamp_scratch: Path, *, extra_services=()) -> dic
          "dependencies": []},
         {"name": "system", "type": "module", "path": "web/core/modules/system", "status": 1,
          "weight": 0, "dependencies": []},
+        # Enabled in the container only: custom (logged), core and not in the graph (not).
+        {"name": "foo_extra", "type": "module", "path": "web/modules/custom/foo_extra",
+         "status": 1, "weight": 0, "dependencies": []},
+        {"name": "big_pipe", "type": "module", "path": "web/core/modules/big_pipe",
+         "status": 1, "weight": 0, "dependencies": []},
     ]
     data = {
         "schema_version": 1,
@@ -158,6 +163,17 @@ def _nodes(graph: dict) -> dict[str, dict]:
     return {n["id"]: n for n in graph["nodes"]}
 
 
+def _overlay_files(graph: dict) -> set[str]:
+    items = [*graph["nodes"], *_links(graph)]
+    return {str(i.get("source_file")) for i in items if i.get("origin") == "container"}
+
+
+def _assert_overlay_paths_relative(graph: dict) -> None:
+    files = _overlay_files(graph)
+    assert files
+    assert not [f for f in files if Path(f).is_absolute()], files
+
+
 def _container_block(report: str) -> str:
     assert "### Container" in report, report
     return report.split("### Container", 1)[1]
@@ -196,10 +212,13 @@ def test_a_build_lays_the_artifact_writes_the_divergences_and_reports(tmp_path):
     assert service_id("foo.gone") in by_kind["static_only"]
     assert service_id("foo.dynamic") in by_kind["container_only"]
     assert service_id("foo.decorator") in by_kind["conflict"]
-    assert extension_id("node") in by_kind["extension_state"]
-    assert extension_id("foo") not in by_kind["extension_state"]
+    # node: enabled in core.extension.yml only, a boundary stub in the graph;
+    # foo_extra: custom, enabled in the container only; big_pipe: core, not
+    # in the graph, so not a logged subject (spec S8).
+    assert by_kind["extension_state"] == {extension_id("node"), extension_id("foo_extra")}
     assert records == sorted(records, key=lambda r: (r["kind"], r["subject"]))
     assert not any(r["possibly_stale"] for r in records)
+    _assert_overlay_paths_relative(graph)
 
     inventory = json.loads((out / "graphify-out" / "drupal-inventory.json").read_text(encoding="utf-8"))
     assert inventory["container"]["status"] == "fresh"
@@ -238,6 +257,8 @@ def test_changing_only_the_artifact_re_extracts_nothing_and_reaches_the_graph(tm
 
     assert rerun == 0
     assert service_id("foo.later") in _nodes(graph)
+    _assert_overlay_paths_relative(graph)
+    assert _overlay_files(graph) == {"../artifact/drupal-container.json"}
 
 
 def test_update_lays_a_changed_artifact_over_the_graph(tmp_path):
@@ -347,6 +368,45 @@ def test_a_container_fact_meets_the_current_registry_not_the_old_stub(tmp_path):
     assert not [r for r in records if r["kind"] == "conflict" and r["subject"] == etm]
 
 
+def test_an_in_root_artifact_is_never_extracted_as_code(tmp_path):
+    """The default location, `<root>/drupal-container.json`, is `.json`: core
+    would extract it (and, above 1 MiB, fail and re-extract it every build)."""
+    root = _container_site(tmp_path / "site")
+    out = tmp_path / "out"
+    data = _artifact_data(root, tmp_path / "stamp")
+    data["_padding"] = "x" * (1024 * 1024 + 4096)
+    _write(root / "drupal-container.json", data)
+    assert (root / "drupal-container.json").stat().st_size > 1024 * 1024
+
+    first, _, _ = _extract(root, out, None)
+    second, rerun, _ = _extract(root, out, None)
+
+    assert rerun == 0
+    for graph in (first, second):
+        assert any(e.get("origin") == "container" for e in _links(graph))
+        from_json = [n["id"] for n in graph["nodes"]
+                     if n.get("source_file") == "drupal-container.json"
+                     and n.get("origin") != "container"]
+        assert from_json == []
+        assert _overlay_files(graph) == {"drupal-container.json"}
+
+
+def test_an_out_dir_inside_the_root_keeps_the_overlay_on_a_rerun(tmp_path):
+    """With `--out` inside the scan root, core also reads a relative
+    `source_file` from the out dir: `../artifact/...` would land back in the
+    root and be pruned, so the overlay falls back to the absolute path."""
+    root = _container_site(tmp_path / "site")
+    out = root / "o"
+    artifact = _write(tmp_path / "artifact" / "drupal-container.json",
+                      _artifact_data(root, tmp_path / "stamp"))
+
+    _extract(root, out, artifact)
+    graph, rerun, _ = _extract(root, out, artifact)
+
+    assert rerun == 0
+    assert _overlay_files(graph) == {artifact.absolute().as_posix()}
+
+
 # -- in process -----------------------------------------------------------------
 
 
@@ -416,3 +476,65 @@ def test_a_changed_artifact_triggers_a_watch_rebuild(tmp_path, monkeypatch):
     discovery.prepare_run(root, tmp_path / "scratch")
     assert w._batch_triggers_rebuild([artifact]) is True
     assert w._has_non_code([artifact]) is False
+
+
+def test_an_internal_error_undoes_the_overlay_and_reports_error(tmp_path, monkeypatch):
+    install()
+    import graphify.build as build
+    import graphify.detect as detect
+    from graphify.drupal import container_overlay
+    from graphify.drupal.inventory import current_inventory, render_section
+
+    root = _container_site(tmp_path / "site")
+    artifact = _write(tmp_path / "artifact" / "drupal-container.json",
+                      _artifact_data(root, tmp_path / "stamp"))
+    monkeypatch.setenv(ENV_ARTIFACT, str(artifact))
+    scratch = tmp_path / "scratch"
+    detect.detect(root, cache_root=scratch)
+    out = discovery.current_run()[1]
+    (out / DIVERGENCE_FILENAME).write_text("[]", encoding="utf-8")
+
+    def boom(self):
+        # Half-way through: a node and an edge laid, then a failure.
+        half = self.ensure("half_done", type="drupal_service", layer="di", label="half",
+                           realm="custom")
+        self.edge(service_id("foo.bar"), half, "injects_service")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(container_overlay._Overlay, "run", boom)
+    G = build.build_from_json(_tiny_extraction())
+
+    assert not any(d.get("origin") == "container" for *_, d in G.edges(data=True))
+    assert "half_done" not in G
+    assert not any("runtime" in d for _, d in G.nodes(data=True))
+    assert not (out / DIVERGENCE_FILENAME).exists()
+    container = current_inventory()["container"]
+    assert container["status"] == "error"
+    assert "status: error (RuntimeError: boom)" in render_section(current_inventory())
+    on_disk = json.loads((out / "drupal-inventory.json").read_text(encoding="utf-8"))
+    assert on_disk["container"]["status"] == "error"
+
+
+def test_undo_keeps_a_key_a_static_producer_wrote_since(tmp_path):
+    """A boundary fact replaced a value (kept in `_overlay_prev`); a fresh
+    static stub then wrote the key again (core's dedup merges graph.json's
+    copy, markers included, into it). Undo keeps the static value and drops
+    the stale previous one."""
+    import networkx as nx
+
+    from graphify.drupal.container_overlay import _replace, undo
+
+    G = nx.Graph()
+    G.add_node("stub", type="drupal_service", boundary=True, class_name="Old")
+    _replace(G.nodes["stub"], "class_name", "New")
+    assert G.nodes["stub"]["_overlay_prev"] == {"class_name": "Old"}
+
+    undo(G)
+    assert G.nodes["stub"]["class_name"] == "Old"
+    assert not any(k.startswith("_overlay") for k in G.nodes["stub"])
+
+    _replace(G.nodes["stub"], "class_name", "New")
+    G.nodes["stub"]["class_name"] = "Fresh"          # a static producer's write
+    undo(G)
+    assert G.nodes["stub"]["class_name"] == "Fresh"
+    assert not any(k.startswith("_overlay") for k in G.nodes["stub"])
