@@ -26,6 +26,7 @@ plugins and subscribers come next.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,7 @@ from typing import Any
 
 import networkx as nx
 
-from graphify.drupal.boundary import included_realms, realm_of
+from graphify.drupal.boundary import included_realms, install_map, realm_of
 from graphify.drupal.container import Artifact
 from graphify.drupal.yaml_common import (
     parameter_id,
@@ -48,6 +49,8 @@ ORIGIN = "container"
 
 _OVERLAY = "_overlay"
 _ATTRS = "_overlay_attrs"
+#: The `source_file` an overlay item was created with; see `_owned`.
+_OWN_FILE = "_overlay_file"
 
 #: Node types that get `runtime` when an artifact is applied (spec S7.7).
 RUNTIME_TYPES = ("drupal_service", "drupal_route", "drupal_extension", "drupal_plugin",
@@ -61,7 +64,7 @@ _SINGLE_TARGET = frozenset({
 #: Keys an edge's own bookkeeping owns; a tag attribute never overwrites them.
 _EDGE_RESERVED = frozenset({
     "source", "target", "relation", "origin", "_origin", "confidence", "confidence_score",
-    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS,
+    "source_file", "source_location", "_src", "_tgt", "confirmed_by", _ATTRS, _OWN_FILE,
 })
 
 _PERMISSION_SPLIT = re.compile(r"[+,]")
@@ -88,23 +91,69 @@ def _strip(data: dict) -> None:
         data.pop(key, None)
 
 
+def _owned(data: dict) -> bool:
+    """The item is still the overlay's own: its `source_file` is the one it was
+    created with. A static producer that later emits the same edge pair takes
+    it over through `build_from_json`'s `add_edge`, which writes the static
+    `source_file` over the overlay's."""
+    return data.get("source_file") == data.get(_OWN_FILE)
+
+
+def _hand_over(data: dict) -> None:
+    """A static producer now owns this item: drop the overlay's markers and keep it."""
+    for key in ("origin", _OVERLAY, _OWN_FILE):
+        data.pop(key, None)
+
+
 def undo(G: nx.Graph) -> None:
-    """Remove everything an overlay left in `G` (spec S7.2): edges with
-    `origin: container`, nodes with `_overlay`, and on everything else the
-    attributes named by `_overlay_attrs`, then that list itself."""
-    for _nid, data in G.nodes(data=True):
+    """Remove everything an overlay left in `G` (spec S7.2): the edges and
+    nodes it created, and on everything else the attributes named by
+    `_overlay_attrs`, then that list itself.
+
+    An item a static producer has since taken over is kept, without the
+    overlay's markers (a `graphify update` merges the fresh static
+    extraction into the graph.json the overlay was written into):
+
+    - an edge is the overlay's while its `source_file` is still the one it
+      was created with; a static re-emission of the pair overwrites it;
+    - a node is the overlay's while its `source_file` is still its own and
+      every edge on it is the overlay's. `source_file` alone cannot tell:
+      core's dedup keeps one record per id by a rank that compares the
+      basenames of the two `source_file`s, so the overlay's record often
+      survives and the static one is dropped. The static edge that named
+      the node (every static producer names a node through an edge) is
+      what survives, so a node carrying one is handed over and re-homed to
+      that edge's file.
+    """
+    multi = G.is_multigraph()
+    edges = list(G.edges(keys=True, data=True)) if multi else [
+        (u, v, None, d) for u, v, d in G.edges(data=True)]
+    removed: set = set()
+    static_files: dict[str, list[tuple[str, str]]] = {}
+    for u, v, k, data in edges:
+        if data.get("origin") == ORIGIN and _owned(data):
+            removed.add((u, v, k))
+            continue
+        if data.get("origin") == ORIGIN:
+            _hand_over(data)
         _strip(data)
-    if G.is_multigraph():
-        edges = list(G.edges(keys=True, data=True))
-        for *_ends, data in edges:
-            _strip(data)
-        G.remove_edges_from([(u, v, k) for u, v, k, d in edges if d.get("origin") == ORIGIN])
-    else:
-        edges = list(G.edges(data=True))
-        for *_ends, data in edges:
-            _strip(data)
-        G.remove_edges_from([(u, v) for u, v, d in edges if d.get("origin") == ORIGIN])
-    G.remove_nodes_from([n for n, d in G.nodes(data=True) if d.get(_OVERLAY)])
+        where = (str(data.get("source_file") or ""), str(data.get("source_location") or "L1"))
+        static_files.setdefault(u, []).append(where)
+        static_files.setdefault(v, []).append(where)
+    G.remove_edges_from([(u, v, k) if multi else (u, v) for u, v, k in removed])
+
+    drop = []
+    for nid, data in G.nodes(data=True):
+        _strip(data)
+        if not data.get(_OVERLAY):
+            continue
+        if _owned(data) and nid not in static_files:
+            drop.append(nid)
+            continue
+        if _owned(data):
+            data["source_file"], data["source_location"] = min(static_files[nid])
+        _hand_over(data)
+    G.remove_nodes_from(drop)
 
 
 # -- binding --------------------------------------------------------------------
@@ -115,12 +164,17 @@ def _short(name: str) -> str:
 
 
 class _Binder:
-    """PHP nodes in `G` by (root-relative source file, label). Built once per apply."""
+    """PHP nodes in `G` by (scan-root-relative source file, label). Built once per apply.
 
-    def __init__(self, G: nx.Graph, root: Path) -> None:
+    `G`'s `source_file`s are relative to the scan `root` (or absolute); a
+    fact's `file` is relative to the composer root (spec S5.1), which is
+    `root` itself or an ancestor of it (a scan of `web/`)."""
+
+    def __init__(self, G: nx.Graph, root: Path, composer_root: Path | None = None) -> None:
         self.G = G
         self.root = Path(root).absolute()
         self._resolved_root = self.root.resolve()
+        self.composer_root = Path(composer_root).absolute() if composer_root is not None else self.root
         self._by_file: dict[str, dict[str, list[str]]] = {}
         for nid, data in G.nodes(data=True):
             source_file, label = data.get("source_file"), data.get("label")
@@ -152,12 +206,16 @@ class _Binder:
         return None
 
     def php_node(self, file: str | None, name: str) -> str | None:
-        """The node whose `source_file` is `file` and whose label is `name`,
-        `.name()` or `name()`; for `Class::method`, the method node under
-        that class (joined to it by a `method` edge)."""
+        """The node whose `source_file` is `file` (relative to the composer
+        root, or absolute) and whose label is `name`, `.name()` or `name()`;
+        for `Class::method`, the method node under that class (joined to it
+        by a `method` edge)."""
         if not file or not name:
             return None
-        labels = self._by_file.get(self._norm(str(file)))
+        path = Path(str(file).replace("\\", "/"))
+        if not path.is_absolute():
+            path = self.composer_root / path
+        labels = self._by_file.get(self._norm(os.path.normpath(path)))
         if not labels:
             return None
         if "::" not in name:
@@ -183,8 +241,12 @@ class _Overlay:
         self.G = G
         self.data = artifact.data
         self.root = Path(root).absolute()
+        # Artifact paths are relative to the composer root (spec S5.1), which a
+        # scan of `web/` sits below.
+        imap = install_map(self.root)
+        self.composer_root = Path(imap.project_root) if imap is not None else self.root
         self.result = result
-        self.binder = _Binder(G, self.root)
+        self.binder = _Binder(G, self.root, self.composer_root)
         self.included = included_realms(self.root)
         self.registry = current_registry()
         try:
@@ -209,7 +271,7 @@ class _Overlay:
         return realm == "custom" or (realm is not None and realm in self.included)
 
     def _file_realm(self, file: str | None) -> str | None:
-        return realm_of(self.root / file) if file else None
+        return realm_of(self.composer_root / file) if file else None
 
     def extension_realm(self, name: str | None) -> str | None:
         if not name:
@@ -299,7 +361,7 @@ class _Overlay:
         attrs: dict[str, Any] = {
             "label": label, "file_type": "concept", "type": type, "layer": layer,
             "realm": realm, "source_file": self.artifact_file, "source_location": "L1",
-            "_origin": "ast", "origin": ORIGIN, _OVERLAY: True,
+            "_origin": "ast", "origin": ORIGIN, _OVERLAY: True, _OWN_FILE: self.artifact_file,
         }
         if not self.custom(realm):
             attrs["boundary"] = True
@@ -356,7 +418,11 @@ class _Overlay:
             "source_file": self.artifact_file, "source_location": "L1",
             # As build_from_json stores it: the edge's own direction, whatever the graph.
             "_src": u, "_tgt": v,
+            _OWN_FILE: self.artifact_file,
         })
+        # Keys a static producer never writes, stripped if one takes the edge over.
+        attrs[_ATTRS] = ["confidence_score",
+                         *(k for k in extra if k not in _EDGE_RESERVED and k != "target_name")]
         G.add_edge(u, v, **attrs)
         counts["container_only"] += 1
 

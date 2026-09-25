@@ -460,3 +460,115 @@ def test_a_directed_graph_keeps_the_given_direction(tmp_path):
     apply(G, _artifact(tmp_path), tmp_path)
     assert G.has_edge(service_id("foo.bar"), FOOBAR)
     assert not G.has_edge(FOOBAR, service_id("foo.bar"))
+
+
+# -- fix round 1: static take-over through core's merge, and the composer root --
+
+
+def _write_graph_json(G, root: Path) -> Path:
+    from graphify.export import to_json
+
+    path = root / "graphify-out" / "graph.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    to_json(G, {}, str(path), force=True)
+    return path
+
+
+def _services_chunk_injecting_current_user() -> dict:
+    """What re-extracting `foo.services.yml` gives once it injects `@current_user`
+    statically: its own nodes and edges, plus the resolver's stub."""
+    sf = f"{FOO}/foo.services.yml"
+    ext = _extraction()
+    nodes = [n for n in ext["nodes"] if n["source_file"] == sf]
+    nodes.append({"id": service_id("current_user"), "label": "current_user",
+                  "file_type": "concept", "type": "drupal_service", "layer": "di",
+                  "realm": "unknown", "external": True, "boundary": True,
+                  "_origin": "static_yaml", "source_file": sf, "source_location": "L7"})
+    edges = [e for e in ext["edges"] if e["source_file"] == sf]
+    edges.append(_e(service_id("foo.bar"), service_id("current_user"), "injects_service", sf,
+                    _origin="static_yaml", target_name="current_user"))
+    return {"nodes": nodes, "edges": edges}
+
+
+def test_a_static_edge_merged_over_an_overlay_edge_survives_undo(tmp_path):
+    from graphify.build import build_merge
+
+    G = _graph(tmp_path)
+    apply(G, _artifact(tmp_path), tmp_path)
+    graph_json = _write_graph_json(G, tmp_path)
+
+    M = build_merge([_services_chunk_injecting_current_user()], graph_path=graph_json, root=tmp_path)
+    undo(M)
+    u, v = service_id("foo.bar"), service_id("current_user")
+    assert v in M and M.has_edge(u, v)
+    data = M.edges[u, v]
+    assert data["relation"] == "injects_service"
+    assert "origin" not in data and "_overlay_file" not in data and "confidence_score" not in data
+    node = M.nodes[v]
+    assert "_overlay" not in node and "origin" not in node
+    assert node["source_file"] == f"{FOO}/foo.services.yml"
+
+    # Laid again, the now-static injection is confirmed, not container-only.
+    result = apply(M, _artifact(tmp_path), tmp_path)
+    assert M.edges[u, v]["confirmed_by"] == ORIGIN
+    assert "origin" not in M.edges[u, v]
+    assert result.edges["container_only"] >= 1
+    # And with no artifact the static facts stay.
+    apply(M, None, tmp_path)
+    assert v in M and M.has_edge(u, v)
+
+
+def test_an_overlay_route_later_declared_statically_survives_undo(tmp_path):
+    from graphify.build import build_merge
+
+    data = _artifact_data()
+    data["routes"].append({"name": "foo.dyn", "path": "/dyn", "defaults": {},
+                           "requirements": {}, "provider": "foo"})
+    G = _graph(tmp_path)
+    apply(G, _artifact(tmp_path, data), tmp_path)
+    assert G.nodes[route_id("foo.dyn")]["_overlay"] is True
+    graph_json = _write_graph_json(G, tmp_path)
+
+    rf = f"{FOO}/foo.routing.yml"
+    ext = _extraction()
+    nodes = [n for n in ext["nodes"] if n["source_file"] == rf]
+    nodes.append(_n(route_id("foo.dyn"), "foo.dyn", rf, type="drupal_route", layer="routing",
+                    realm="custom", route_path="/dyn", _origin="static_yaml"))
+    edges = [e for e in ext["edges"] if e["source_file"] == rf]
+    edges.append(_e(extension_id("foo"), route_id("foo.dyn"), "declares_route", rf,
+                    _origin="static_yaml"))
+    M = build_merge([{"nodes": nodes, "edges": edges}], graph_path=graph_json, root=tmp_path)
+    apply(M, None, tmp_path)
+    assert route_id("foo.dyn") in M
+    assert "_overlay" not in M.nodes[route_id("foo.dyn")]
+    assert M.has_edge(extension_id("foo"), route_id("foo.dyn"))
+
+
+def _composer_site(tmp_path: Path) -> Path:
+    (tmp_path / "composer.json").write_text(json.dumps({"extra": {"installer-paths": {
+        "web/core": ["type:drupal-core"],
+        "web/modules/contrib/{$name}": ["type:drupal-module"],
+    }}}), encoding="utf-8")
+    (tmp_path / "composer.lock").write_text(json.dumps({"packages": [
+        {"name": "drupal/core", "type": "drupal-core"},
+        {"name": "drupal/bar", "type": "drupal-module"},
+    ]}), encoding="utf-8")
+    web = tmp_path / "web"
+    web.mkdir()
+    boundary.clear_caches()
+    return web
+
+
+def test_a_scan_of_web_below_the_composer_root_still_binds(tmp_path):
+    web = _composer_site(tmp_path)
+    extraction = _extraction()
+    for item in (*extraction["nodes"], *extraction["edges"]):
+        item["source_file"] = item["source_file"].removeprefix("web/")
+    G = build_from_json(extraction)
+    result = apply(G, Artifact(data=_artifact_data(), path=web / "drupal-container.json"), web)
+    assert result.status == "fresh"
+    assert G.edges[service_id("foo.bar"), FOOBAR]["relation"] == "service_implemented_by"
+    assert G.edges[route_id("foo.page"), PAGE]["relation"] == "routes_to"
+    assert G.nodes[service_id("current_user")]["realm"] == "core"
+    assert result.counts["services"]["custom"] == 1
+    assert G.edges[service_id("foo.bar"), FOOBAR]["source_file"] == "drupal-container.json"

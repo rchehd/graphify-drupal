@@ -234,9 +234,12 @@ and the overlay applied then undone equals the static graph.
 Drupal ids are built with the producers' own `make_id` rules
 (`drupal:service:<id>`, `drupal:route:<name>`, `drupal:extension:<name>`,
 `drupal:plugin:<type>:<id>`, `drupal:hook:<name>`, `drupal:event:<name>`). A PHP class or
-method is found in `G` by `source_file` equal to the fact's `file` (relative to
-the scan root) and the node's short name equal to the class, method or function
-name. When there is no such node, no edge is made. The name goes on the Drupal
+method is found in `G` by `source_file` equal to the fact's `file` and the
+node's short name equal to the class, method or function name. The fact's
+`file` is relative to the composer root (§5.1) and a node's `source_file` to
+the scan root, which can sit below it (a scan of `web/`); both are resolved to
+the same absolute path before they are compared, and realms are read from the
+fact's path under the composer root. When there is no such node, no edge is made. The name goes on the Drupal
 node as `class_name` (or `callable`), as P2a and P2b already do.
 
 ### 7.4 Mapping
