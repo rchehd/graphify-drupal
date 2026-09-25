@@ -160,6 +160,22 @@ A site is needed by **one** participant, **once per change in module
 composition** — not by everyone on every build. The artifact is stamped with the
 repository commit, a `drush status` hash, and a timestamp.
 
+As built in P3: `graphify drupal container [PATH] [--out FILE] [--print-script]
+[--runner-command CMD]` writes `drupal-container.json` (schema version 1)
+atomically, with sorted keys and stable lists, beside `.graphifyrc` by
+default; `.graphifyrc` `drupal.container.artifact` moves it, and for a build
+`GRAPHIFY_DRUPAL_CONTAINER=<path>` wins over both. The stamp is not a
+`drush status` hash: it is `created_at`, the runner, `git_commit` and
+`git_dirty`, the Drupal version, `composer_lock_sha`,
+`enabled_extensions_sha` and `sources_sha` (the custom files that shape the
+container, recomputed by every build to call the artifact `fresh` or
+`stale`). The artifact holds no configuration value, scalar service
+argument, label, content, env or absolute path. "merge" is an overlay
+(`container_overlay.py`) that a gated wrapper on `build.build_from_json` runs
+on every build (`graphify .`, `update`, `watch`, `extract`) and never on a
+read (`query`, `path`); it is idempotent (undo first), so graph.json can
+carry it from build to build. A normal build never runs drush.
+
 This is the same discipline `docs/drupal-graphify.md` §6 already prescribes
 ("the repository commit and the database state are recorded alongside the
 graph"). The `platform_tests` incident recorded there — a module enabled between
@@ -183,11 +199,30 @@ will never fit a fixed table, and the design should not pretend otherwise.
 Side benefit: `.ddev/config.yaml` as a node closes roadmap item 6 in
 `docs/drupal-graphify.md` — `docroot` and `composer_root` are declared there.
 
+As built in P3 (`graphify/drupal/runners.py`), the markers are checked in
+this order and the first match wins: `.graphifyrc`
+`drupal.container.command` (split with `shlex`, used as given), `.ddev/config.yaml`
+(`ddev drush`), `.lando.yml` (`lando drush`), `docker-compose*.yml` /
+`compose.yaml` (`docker compose exec -T <service> drush`, the service named by
+`drupal.container.service` or the single one called `php`, `web`, `app`,
+`drupal`, `cli` or `php-fpm`), `drush/sites/*.site.yml` (`drush @<site>.<env>`,
+named by `drupal.container.alias` or the only one), `vendor/bin/drush`. The
+command is drush's `php:eval` with the collector passed as one argument and
+never written into the project: under ddev the checkout is mounted in the
+container, so a written script would land in it. The collector is 18.8 KiB
+(`graphify drupal container --print-script` prints it for running by hand).
+Named errors: `RunnerNotFound`, `AmbiguousComposeService`, `RunnerUnavailable`
+(with the start command), `BootstrapFailed` (drush's stderr, no traceback).
+
 ### 4.3 Degradation is loud
 
 With no runner and no artifact, the graph builds from static producers only,
 `graph.audit.json` records `container: unavailable`, and the coverage
-declaration says so. An agent holding a static-only graph must know it is
+declaration says so. (As built in P3 the record is GRAPH_REPORT's
+"Drupal coverage" → "### Container" block, `status: unavailable` followed by
+the vocabulary §7 list, since `graph.audit.json` is P7's; the same block
+reports `fresh`, `stale (reasons)`, `invalid (reason)` and `error (message)`.
+Differences between the two sources go to `<out>/drupal-divergence.json`.) An agent holding a static-only graph must know it is
 holding half. Silent degradation reproduces the exact failure this project
 exists to prevent.
 
@@ -205,7 +240,7 @@ working graph.
 | **P1b** | Configuration | config entities, **config_split**, domains, profiles, recipes, config `dependencies:`, `core.extension.yml` — 629 files |
 | **P2a** | Plugin discovery | plugin-type registry learned from the site's managers at the start of every `detect`, YAML-discovered plugins of learned types, `plugin_of_type` for P1's links and breakpoints, the unrecognised-family inventory and its `GRAPH_REPORT.md` section, `watch` rebuilds on Drupal YAML — see the P2a spec |
 | **P2b** | Hooks and the boundary | the boundary: `realm` from composer, core/contrib/vendor trees not walked (`drupal.include` opt-in), boundary nodes with registry facts; the hook registry from every `*.api.php`; `drupal_hook`, `drupal_hook_impl`, `declares_hook`, `implements_hook`, `hook_implemented_by`, `invokes_hook` (incl. `alter_hook`); `.module`/`.install`/`.theme`/`.profile`/`<ext>.<group>.inc` become PHP; P2a's two carried fixes — see the P2b spec |
-| **P3** | Container producer | runner detection, `drush ev`, the artifact, merge as a distinct step with a divergence log |
+| **P3** | Container producer | runner detection (§4.2, `.graphifyrc` override), the collector through drush `php:eval` (services, aliases, routes, extensions, hook lists, plugin definitions with derivatives, event listeners), the committable stamped artifact and `graphify drupal container`, an idempotent overlay on every build (`confirmed_by`, `origin: container`, `runtime`), the divergence log and GRAPH_REPORT's Container block; P2b's two carried gaps — see the P3 spec |
 | **P4** | PHP semantics | annotations and attributes, plugin instances against learned types, forms (and `form_FORM_ID_alter` binding), events, entity-type handlers (and `ENTITY_TYPE_*` hooks), `\Drupal::service()` |
 | **P5** | Presentation | theme hooks, templates, preprocess, override chain, SDC, library attachment |
 | **P6** | Heavy configuration | fields and bundles, `references_bundle`, displays, blocks, Views (trimmed), Layout Builder defaults, migrations |

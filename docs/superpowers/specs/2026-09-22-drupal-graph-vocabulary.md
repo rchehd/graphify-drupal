@@ -124,7 +124,7 @@ Every node carries:
 | `type` | the Drupal taxonomy, e.g. `drupal_service` |
 | `realm` | `custom` \| `contrib` \| `core` \| `vendor` \| `unknown` (§1.2) |
 | `layer` | see §1.1 |
-| `_origin` | `static_yaml` \| `static_php` \| `learned` \| `container` |
+| `_origin` | `static_yaml` \| `static_php` \| `learned` (core's own field; `container` is realised as `origin`, §2.2) |
 | `external` | `true` when the entity has no file in the repository |
 | `boundary` | `true` on a node materialised for something the site's code references but no scanned file declares (§2.1); absent otherwise |
 
@@ -172,6 +172,29 @@ The inventory's summary counts the pruned directories —
 `boundary: {core, contrib, vendor, files}` — and `boundary_reasons`
 (`composer`, `path_rule`, `vendor_dir`, `site_files`).
 
+### 2.2 What the container adds (P3)
+
+The container overlay (P3 spec §7) lays a collected `drupal-container.json` over
+every build. It marks what it adds with attributes, never with new relations
+(§4 is unchanged; one relation per ordered pair, §1.4):
+
+| Attribute | On | Meaning |
+|---|---|---|
+| `origin: container` | edges and nodes only the container knows | the overlay's marker. Not `_origin`: core's `extract()` stamps `_origin: "ast"` on everything it returns and `watch` scopes eviction by `_origin == "ast"`, so a `_origin: container` would change how core's incremental paths treat the item. Overlay items keep `_origin: "ast"`; they carry `confidence: EXTRACTED`, `confidence_score: 1.0` and `source_file` = the artifact's path relative to the scan root |
+| `confirmed_by: container` | a static edge the container also has (same pair, same relation) | confirmation is an attribute, never a second edge |
+| `runtime: present \| absent` | every `drupal_service`, `drupal_route`, `drupal_extension`, `drupal_plugin`, `drupal_hook_impl` | whether the container knows it; only when an artifact is applied — with none, no node carries `runtime` (absent means unknown, not gone). A theme's `drupal_hook_impl` gets none: the collector reads module hook lists, which never hold a theme's implementations |
+| `runtime_order` | `drupal_hook_impl` | the implementation's index in the container's execution order for its hook, beside P2b's `order` (the `#[Hook(order: …)]` text), which it leaves alone |
+| `derivative: true` | `drupal_plugin` | a derivative (`base_plugin_id` differs from the id), with `base_plugin_id` and `deriver` |
+| `class_name`, `route_path`, `aliases: [...]` | services, routes, service alias targets | added where absent; a different existing value is a divergence, never overwritten |
+
+A fact about a core, contrib or vendor subject only annotates a node already in
+the graph; a boundary stub is created only as the direct target of a custom
+fact (P2b's rule). Internal undo markers (`_overlay`, `_overlay_attrs`,
+`_overlay_prev`, `_overlay_set`, `_overlay_file`) make the overlay idempotent
+across graph.json round trips. What the two sources disagree on goes to
+`<out>/drupal-divergence.json` (kinds `static_only`, `container_only`,
+`conflict`, `extension_state`), never into the graph as a resolution.
+
 ---
 
 ## 3. Node types
@@ -208,7 +231,7 @@ about the same node.
 | `drupal_service` | `drupal:service:<id>` | `*.services.yml` |
 | `drupal_service_tag` | `drupal:tag:<tag>` | `tags:` in service definitions |
 | `drupal_parameter` | `drupal:parameter:<name>` | `parameters:` |
-| `drupal_event` | `drupal:event:<event_name>` | `getSubscribedEvents()` |
+| `drupal_event` | `drupal:event:<event_name>` | `getSubscribedEvents()`; **emitted from P3** from the container's event listeners, for events a custom subscriber listens to (label the event name, `realm` of that subscriber) |
 
 Service providers are not their own node type — the `*ServiceProvider` PHP class
 node from the AST layer carries an `alters_container` edge to its module.
@@ -282,6 +305,10 @@ from an in-graph `*.api.php` stub, else it is a boundary stub (§2.1).
 `drupal_hook_impl` carries `module`, `hook_name`, `via`
 (`attribute`/`procedural`), `function` or `class_name` + `method`, and
 `order` (the verbatim source text of `#[Hook(order: …)]`, never evaluated).
+From P3 the container adds `runtime_order` (the index in the real execution
+order) and `runtime` (§2.2), and creates the `drupal_hook_impl` nodes P2b
+leaves as candidates (variable-segment names such as `form_*_alter`,
+`preprocess_*`, `ENTITY_TYPE_presave`) with the same shape and edges.
 There is one `drupal_hook_impl` node per (module, hook), however many
 functions or methods implement it; each implementation has its own
 `hook_implemented_by` edge. `drupal_form` and `drupal_theme_hook` stay for
@@ -376,6 +403,14 @@ parallel taxonomy.
 | `alters_container` | PHP class → module | `*ServiceProvider` |
 | `subscribes_to_event` | PHP class → event | `getSubscribedEvents()`; `priority` attribute |
 
+From P3 the container overlay emits or confirms `declares_service`,
+`service_implemented_by`, `injects_service`, `injects_parameter`, `decorates`
+and `subscribes_to_event` (from the event dispatcher's listeners: the class of
+a custom listener object, bound by its own file, so a `RouteSubscriberBase`
+subclass is custom). `tagged_as` stays static-only: a live Drupal 11
+container's runtime dump (`OptimizedPhpArrayDumper`) carries no tags, and
+`decorates` comes only from the `<id>.inner` argument naming.
+
 ### 4.3 Routing and access
 
 | Relation | Source → target | Attributes |
@@ -413,6 +448,16 @@ breakpoint whose family is some learned type's `yaml_name`. The plugin's class
 and deriver are recorded as `class_name`/`deriver` attributes until PHP class
 nodes can be bound: `plugin_implemented_by` and `derives_plugins` come in P4
 (with PHP-discovered plugins), `configures_plugin` in P6.
+
+**From P3**, for every plugin the container knows (derivatives included),
+`provides_plugin`, `plugin_of_type`, `plugin_implemented_by` and
+`derives_plugins` are emitted now: the container gives the class and its
+file, so the class node is bound by `source_file` and short name. P4's static
+edges will meet them through `confirmed_by`. A plugin of a type read from a P1
+links family (`menu.link`, `menu.local_task`, `menu.local_action`,
+`menu.contextual_link`) is P1's link node (`drupal:menu_link:<id>`, …), never a
+second `drupal_plugin` node; its `provides_plugin` yields to P1's
+`declares_*` on the same pair.
 
 ### 4.5 Hooks
 
@@ -727,7 +772,12 @@ which renders in detail without aggregation.
 ## 7. What is not statically knowable
 
 This list is the graph's declared competence boundary and ships beside the
-artifact. Everything here requires the container producer.
+artifact. Everything here requires the container producer. GRAPH_REPORT's
+Container block prints it when no artifact is applied (`unavailable`,
+`invalid`, `error`); with one, P3 supplies derivatives, the services and
+routes the container adds, and the real hook order (`runtime_order`).
+`$config` overrides stay out (the collector never reads configuration
+values).
 
 | Not static | Why |
 |---|---|

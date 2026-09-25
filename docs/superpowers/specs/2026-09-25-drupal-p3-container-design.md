@@ -1,6 +1,6 @@
 # P3 — The container producer, the overlay, and P2b's carried fixes
 
-Status: approved in brainstorming, awaiting spec review
+Status: implemented (branch `drupal-graph`); measured and closed in §15
 Date: 2026-09-25
 Related: `2026-09-22-drupal-graphify-architecture-design.md` §4, §5;
 `2026-09-22-drupal-graph-vocabulary.md` §3.2, §4.2–4.5, §7;
@@ -134,7 +134,7 @@ Python strips them, so the artifact never carries a machine path.
 | `extensions` | `\Drupal::service('extension.list.module')`, `…theme`, `…profile`, `getList()` plus `getAllInstalledInfo()` | `name`, `type`, `path`, `status`, `weight`, `dependencies` |
 | `hooks` | 11.1+: `\Drupal::keyValue('hook_data')->get('hook_list')`. Otherwise `invokeAllWith($hook, fn(callable $l, string $m) => record)` for each hook name in the static registry, passed in the script's header | `{hook: [{module, callable, file}]}` in execution order; `callable` is `Class::method` or a function name |
 | `plugins` | every container service whose id starts with `plugin.manager.` and whose instance is a `PluginManagerInterface`, `getDefinitions()` | `{type_id: [{id, class, file, provider, deriver, base_plugin_id}]}`; `type_id` follows the vocabulary §3.4 rule (service id without `plugin.manager.`) |
-| `subscribers` | `\Drupal::service('event_dispatcher')->getListeners()` with `getListenerPriority()` | `{event: [{callable, file, priority}]}` for array callables on objects (closures are counted, not listed) |
+| `subscribers` | `\Drupal::service('event_dispatcher')->getListeners()` with `getListenerPriority()` | `{event: [{callable, file, priority}]}` for array callables on objects (closures are counted, not listed); `file` is the listener object's class file, not the file declaring an inherited method (§15.4) |
 | `site` | `\Drupal::VERSION`, the installed-extension list | `drupal_version`, `enabled_extensions_sha` (sha256 of the sorted `type:name` list), `composer_root`, `drupal_root` |
 | `errors` | — | `[{source, class, message}]` |
 
@@ -257,7 +257,7 @@ The vocabulary's relations, nothing new:
 | route | `declares_route`, `routes_to` (→ method, else class), `routes_to_form`, `requires_permission`, `access_checked_by` |
 | extension | `depends_on_module` |
 | hook implementation | P2b's shape: `drupal_hook_impl` node (`make_id("drupal", "hook_impl", module, hook)`, `module`, `hook_name`, `function` or `class_name`+`method`), `implements_hook` (extension → hook), `hook_implemented_by` (impl → function or method node); `runtime_order` (index in the list) on the impl node, beside P2b's own `order` (the `#[Hook(order: …)]` text), which it leaves alone |
-| plugin | `provides_plugin`, `plugin_of_type`, `plugin_implemented_by`, `derives_plugins` |
+| plugin | `provides_plugin`, `plugin_of_type`, `plugin_implemented_by`, `derives_plugins`; a plugin of a type whose `yaml_name` is a P1 links family (`links.menu`, `links.task`, `links.action`, `links.contextual`) is P1's link node (`drupal:menu_link:<id>`, …), never a `drupal_plugin` beside it (§15.4) |
 | subscriber | `subscribes_to_event` (class → event), `priority` on the edge |
 
 `plugin_implemented_by` and `derives_plugins` were scheduled for P4 (vocabulary
@@ -282,7 +282,11 @@ else the Drupal producers emit. The vocabulary's `_origin: container`
 - **Conflict**: static says one target, the container another, for a relation
   that has one target per source (`service_implemented_by`,
   `plugin_implemented_by`, `routes_to`, `routes_to_form`, `decorates`).
-  Both edges stay, and the pair goes to the divergence log.
+  Both edges stay, and the pair goes to the divergence log. An attribute the
+  overlay would add (`class_name`, `route_path`) that already holds another
+  value is a conflict too, recorded and never overwritten; a class with or
+  without its leading `\` and a route path with or without its leading `/`
+  (Symfony's `Route::setPath` prepends it) are the same value.
 
 ### 7.6 The boundary
 
@@ -301,6 +305,9 @@ When an artifact is applied, every node of type `drupal_service`,
 `drupal_route`, `drupal_extension`, `drupal_plugin` and `drupal_hook_impl`
 gets `runtime: present` if the container knows it, else `runtime: absent`.
 With no artifact, no node carries `runtime`: absent means unknown, not gone.
+A theme's `drupal_hook_impl` gets no `runtime` either: the collector reads
+module hook lists (`hook_data`, `invokeAllWith`), which never hold a theme's
+implementations, so the container cannot say (§15.4).
 
 ### 7.8 P2b's boundary facts ride the same step
 
@@ -440,7 +447,7 @@ On FormsRemote (§13):
    timings, and the nodes and edges against P2b's 4,808 / 10,327.
 5. Verify FormsRemote is untouched.
 
-The findings go in §14 of this document at close.
+The findings go in §15 of this document at close.
 
 ## 14. Risks
 
@@ -460,3 +467,186 @@ The findings go in §14 of this document at close.
   read never applies the overlay.
 - **The stamp misses database-only changes** (a module enabled in the UI without
   a config export). `extension_state` divergence is the net for exactly that.
+
+## 15. Measured and the closing real run
+
+2026-09-25, FormsRemote at `60b010db` (plus the untracked `docs/` the user
+keeps there), ddev project `forms` running, Drupal 11.4.7. The user approved
+one live collector run; everything after it reads that artifact.
+
+### 15.1 The collector
+
+`uv run --frozen graphify drupal container /home/user/Projects/FormsRemote
+--out <scratch>/drupal-container.json`: exit 0, **4.1 s** wall (2.3 s user),
+2.4 MB, runner `ddev`, stamp `git_commit 60b010db…`, `git_dirty: true` (the
+untracked `docs/`).
+
+| source | entries |
+|---|---|
+| services | 1,317 |
+| aliases | 363 |
+| routes | 1,479 |
+| extensions | 392 (modules 206 enabled / 170 not, themes 8 / 5, profiles 1 / 2) |
+| hooks | 652 names, 1,387 implementations (no `ProceduralCall` entries: 11.4's `hook_list` names functions) |
+| plugins | 109 types, 3,810 definitions (1,776 derivatives) |
+| subscribers | 46 events, 193 listeners, 0 closures |
+
+`errors[]` has one entry, explained: `plugins: Error: plugin.manager.font_colors:
+Class "Drupal\ckeditor5_font\FontColorsManager" not found` — contrib
+`ckeditor5_plugin_pack_font`'s services file declares a manager class the
+package does not ship. Every other source and plugin type was collected.
+
+Ledger deviations confirmed on the live container: every service's `tags` is
+`[]` (the runtime dump carries none; `tagged_as` stays static-only), and no
+service carries `decorates` (§15.5).
+
+### 15.2 The overlay (after §15.4's fixes)
+
+`GRAPHIFY_DRUPAL_CONTAINER=<scratch>/drupal-container.json uv run --frozen
+graphify extract /home/user/Projects/FormsRemote --code-only --out
+<scratch>/run`, twice, then once without the variable into `<scratch>/static`.
+Status `fresh`.
+
+| source | total | custom | applied |
+|---|---|---|---|
+| services | 1,317 | 73 | 116 |
+| aliases | 363 | 25 | 64 |
+| routes | 1,479 | 36 | 70 |
+| extensions | 392 | 23 | 215 |
+| hooks | 1,387 | 63 | 63 |
+| plugins | 3,810 | 122 | 127 |
+| subscribers | 193 | 2 | 2 |
+
+`applied` above `custom` is boundary facts annotating boundary nodes already
+in the graph (§7.6): extension stubs, core services custom code injects, core
+link stubs named as parents.
+
+- Edges: **confirmed 492** (`injects_service` 138, `plugin_of_type` 82 — P1's
+  links —, `depends_on_module` 66, `declares_service` 58,
+  `hook_implemented_by` 40, `implements_hook` 37, `declares_route` 36,
+  `requires_permission` 35); **container-only 329**
+  (`service_implemented_by` 73, `injects_service` 40, `plugin_of_type` 40,
+  `plugin_implemented_by` 38, `provides_plugin` 37, `routes_to_form` 25,
+  `hook_implemented_by` 23, `implements_hook` 23, `declares_service` 15,
+  `routes_to` 11, `subscribes_to_event` 2, `access_checked_by` 1,
+  `derives_plugins` 1); **conflict 0**; **pair_taken 86** (82 are
+  `provides_plugin` yielding to P1's `declares_*` on the same pair).
+- Nodes the overlay made: 121 — `drupal_plugin` 40 (4 derivatives: three
+  `rest` resources and `eca_event:…webform_submission_insert`),
+  `drupal_service` 24 (15 the `#[Hook]` classes Drupal registers as services,
+  9 boundary stubs they inject), `drupal_hook_impl` 23, `drupal_hook` 19,
+  `drupal_plugin_type` 14, `drupal_event` 1 (`routing.route_alter`, from
+  the two custom route subscribers).
+- `runtime: absent`: `drupal_service` 9, `drupal_extension` 2 (present:
+  extension 192, service 141, route 70, hook_impl 60, plugin 40).
+- Divergences: `container_only` 78 (plugin 40, hook_impl 23, service 15),
+  `static_only` 11, `conflict` 7, `extension_state` 0. Examples:
+  - `container_only`: `drupal_hook_impl_eca_custom_preprocess_node`,
+    `…_custom_forms_user_presave`, `…_eca_custom_node_access` — the
+    variable-segment implementations P2b leaves as candidates;
+    `drupal_service_drupal_eca_custom_hook_caseviewerhooks`;
+    `drupal_plugin_webform_handler_webform_integration`.
+  - `static_only`: the four decorator `*.inner` ids and the abstract parents
+    `logger.channel_base`, `default_plugin_manager` (§15.5);
+    `cache.backend.null`, `config.schema_checker`,
+    `logger.channel.config_schema` from `web/sites/development.services.yml`,
+    which this site does not load; the extensions `default` and
+    `development`, owners `web/sites/*.services.yml` imply (P2b §10.2).
+  - `conflict`: seven `route_path`s under `/admin/structure/webform/…` that
+    contrib webform's `WebformRouteSubscriber` moves to `/admin/webform/…`
+    (for example `drupal_route_webform_sync_settings`). Real divergences.
+- Nodes / edges: **4,946 / 10,724** with the artifact; **4,825 / 10,395**
+  static (P2b: 4,808 / 10,327). The overlay's +121 / +329 are exactly the
+  nodes above and the container-only edges. The static +17 / +68 over P2b
+  are all FormsRemote `9f933cdb` ("Change SharePoint from own API to Microsoft
+  Graph": `SharepointClient.php`, the new `SharepointGraphUploadTest.php`,
+  the deleted `SharepointCredentialsTest.php`, an `@http_client` argument),
+  diffed id by id against P2b's closing graph.json; no static node or edge
+  changed for another reason.
+- The static run: container `unavailable`, no node with `runtime`, no
+  `origin: container`, no `drupal-divergence.json`.
+- `graph.json` 7.6 MB (static 7.1 MB).
+
+Timings: full build with the artifact 10.8 s, unchanged rerun 8.5 s, static
+10.8 s (P2b measured 7.5 s / 6.9 s; the static build without an artifact
+takes as long as the one with it, so the difference is not the overlay). `run_for_build` on the built graph (artifact load, staleness,
+`apply`, divergence log, report block): **0.60 s** (0.31 s of it the staleness
+`sources_sha`), under §12's 1 s.
+
+Second run: `incremental summary: 1142 files cached/unchanged, 2
+re-extracted, 0 deleted` — core's two never-stamped re-queues, as in P2b
+§10.2 (`webform_integrations_logs.links.action.yml`, empty, and
+`docker/mssql/seed.sql`, no `tree_sitter_sql`). Same node and edge counts as
+the first run.
+
+FormsRemote untouched: `git status --porcelain` (`?? docs/`) identical
+before the collector and after every run and the corpus tests; the
+pre-existing `graphify-out/` (`cache/stat-index.json`) has the same mtimes
+and sizes, file for file; no file under the checkout outside `.git/` is newer
+than a marker touched before the collector (only `.git/`'s own mtime moved,
+from the `git status` checks); no `drupal-container.json` or
+`drupal-divergence.json` there.
+
+### 15.3 The first overlay, before the fixes
+
+The same artifact through the code of `469a579`: 5,027 / 10,886; confirmed
+410, container-only 491, pair_taken 4; subscribers custom 0 / applied 0;
+divergences `container_only` 160, `static_only` 13, `conflict` 10;
+`runtime: absent` service 9, extension 2, hook_impl 2; `run_for_build` 1.54 s.
+
+### 15.4 Defects found and fixed
+
+`fix(drupal): what the FormsRemote container showed the overlay got wrong`:
+
+1. **Custom route subscribers read as core.** A listener's `file` was the
+   file declaring its method, and a `RouteSubscriberBase` subclass inherits
+   `onAlterRoutes`, so both custom subscribers were filed under
+   `core/lib/Drupal/Core/Routing/RouteSubscriberBase.php` (subscribers custom
+   0). The collector now emits the listener object's class file; the overlay
+   prefers the class file (from the services' classes, else PSR-4), so an
+   artifact collected before the fix binds too.
+2. **82 duplicated link plugins.** `menu.link`, `menu.local_task`,
+   `menu.local_action` and `menu.contextual_link` definitions made
+   `drupal_plugin` nodes beside P1's `drupal_menu_link` / `local_task` /
+   `local_action` / `contextual_link` nodes, and 82 false `container_only`
+   records. A type whose `yaml_name` is a P1 links family now maps to P1's id
+   and type: the 82 static `plugin_of_type` edges are confirmed instead.
+3. **Route paths without a leading slash conflicted.** Three custom routes
+   (`entity.system.settings`, `entity.webform_integrations_token.settings`,
+   `webform_integrations_printable.print_pdf`) write `path: 'admin/…'` /
+   `'print/…'`; the container's paths start with `/`. They
+   are one value now; the static text is kept.
+4. **Theme hook implementations marked `absent`.** `govuk_forms_theme()` and
+   `govuk_forms_theme_suggestions_alter()` are not in any module hook list.
+   They get no `runtime` and no `static_only` record.
+5. **The overlay took 1.5 s.** 26,198 `realm_of` calls (two phases over
+   ~4,000 artifact files); memoised per overlay, 4,754 calls, 0.60 s.
+
+### 15.5 Found, not fixed (for review)
+
+- **`decorates` never comes from a live container.** Drupal's
+  `OptimizedPhpArrayDumper` gives every private service the id
+  `private__<hash>`, so the decorator's `<id>.inner` argument that §5.2's
+  heuristic looks for is never visible: all four custom decorators (webform_integrations' message manager
+  decorator, eca_custom's three filters) carry
+  `arguments: []`, `decorates: null`. The static `decorates` edges stand
+  unconfirmed. The decoration is still in the artifact as its result — the
+  decorated id is an alias of the decorator (`webform.message_manager →
+  webform_integrations.webform_message_manager_decorator`) — so a later
+  change could confirm a static `decorates` edge from the alias; it needs a
+  collector change and a second live run to verify, so it is left for review.
+  The four `*.inner` `static_only` records and `runtime: absent` marks follow
+  from the same hashing.
+- **Abstract parents** (`logger.channel_base`, `default_plugin_manager`) are
+  `absent`: the compiled container drops abstract definitions. Accurate, and
+  expected noise in `static_only`.
+- An artifact outside the scan root (the real run's scratch file) gives
+  overlay items a `source_file` that climbs out of the root
+  (`../../../../tmp/…/drupal-container.json`): the Task 6 ruling
+  (relative path) applied to an out-of-root file. Harmless to the
+  incremental runs (identical graph, 0 deleted); a committed artifact at the
+  root gives `drupal-container.json`.
+- Recorded rulings, as built: the runtime hook index is `runtime_order`
+  (P2b's `order` keeps the attribute text); boundary facts (§7.8) are applied
+  inside `apply`, after undo, with or without an artifact; `tags` are always
+  `[]` from a live D11 container.
