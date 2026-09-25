@@ -71,7 +71,7 @@ def _runtime_extraction() -> dict:
          "source_file": MODULE_FILE, "source_location": "L1"},
         _n("foohooks", "FooHooks.php", HOOKS_FILE),
         _n(HOOKS_CLASS, "FooHooks", HOOKS_FILE),
-        _n(TOOLBAR, ".toolbar()", HOOKS_FILE),
+        _n(TOOLBAR, ".toolbar()", HOOKS_FILE, source_location="L7"),
         _n("fooblock", "FooBlock.php", BLOCK_FILE),
         _n(BLOCK_CLASS, "FooBlock", BLOCK_FILE),
         _n("fooderiver", "FooDeriver.php", DERIVER_FILE),
@@ -138,12 +138,13 @@ def _artifact(root, data=None) -> Artifact:
 # -- hooks ----------------------------------------------------------------------
 
 
-def test_a_static_impl_gets_its_order_and_its_implementation_is_confirmed(tmp_path):
+def test_a_static_impl_gets_its_runtime_order_and_its_implementation_is_confirmed(tmp_path):
     G = _graph()
     result = apply(G, _artifact(tmp_path), tmp_path)
     impl = G.nodes[FORM_ALTER_IMPL]
-    assert impl["order"] == 1
-    assert "order" in impl["_overlay_attrs"]
+    assert impl["runtime_order"] == 1
+    assert "runtime_order" in impl["_overlay_attrs"]
+    assert "order" not in impl
     assert "_overlay" not in impl
     assert impl["runtime"] == "present"
     assert _edge(G, FORM_ALTER_IMPL, FORM_ALTER_FN)["confirmed_by"] == ORIGIN
@@ -167,7 +168,9 @@ def test_a_container_only_class_method_impl_is_created_with_both_edges(tmp_path)
     assert impl["realm"] == "custom"
     assert impl["source_file"] == HOOKS_FILE
     assert impl["_origin"] == "ast" and impl["origin"] == ORIGIN
-    assert impl["order"] == 0
+    assert impl["runtime_order"] == 0
+    # Its line is the method's, not a made-up L1.
+    assert impl["source_location"] == "L7"
     assert "boundary" not in impl
     by = _edge(G, TOOLBAR_IMPL, TOOLBAR)
     assert by["relation"] == "hook_implemented_by" and by["origin"] == ORIGIN
@@ -208,15 +211,23 @@ def test_a_procedural_call_identifier_is_the_function(tmp_path):
     assert _edge(G, hook_impl_id("foo", "menu_alter"), "foo_foo_menu_alter")["relation"] == "hook_implemented_by"
 
 
-def test_a_declared_order_argument_is_kept_and_is_no_conflict(tmp_path):
+def test_a_declared_order_and_the_runtime_order_coexist(tmp_path):
     extraction = _runtime_extraction()
     for node in extraction["nodes"]:
         if node["id"] == FORM_ALTER_IMPL:
             node["order"] = "Order::Last"
-    G = build_from_json(extraction)
+    static = build_from_json(extraction)
+    G = copy.deepcopy(static)
     result = apply(G, _artifact(tmp_path), tmp_path)
+    impl = G.nodes[FORM_ALTER_IMPL]
+    assert impl["order"] == "Order::Last"
+    assert impl["runtime_order"] == 1
+    assert "order" not in impl["_overlay_attrs"]
+    assert not [c for c in result.conflicts if "order" in c["relation"]]
+    undo(G)
     assert G.nodes[FORM_ALTER_IMPL]["order"] == "Order::Last"
-    assert not [c for c in result.conflicts if c["relation"] == "attribute:order"]
+    assert "runtime_order" not in G.nodes[FORM_ALTER_IMPL]
+    assert _dump(G) == _dump(static)
 
 
 def test_a_boundary_impl_only_annotates_an_existing_node(tmp_path):
@@ -229,7 +240,7 @@ def test_a_boundary_impl_only_annotates_an_existing_node(tmp_path):
     G = build_from_json(extraction)
     before = set(G.edges(system_impl))
     apply(G, _artifact(tmp_path), tmp_path)
-    assert G.nodes[system_impl]["order"] == 0
+    assert G.nodes[system_impl]["runtime_order"] == 0
     assert set(G.edges(system_impl)) == before
 
 
@@ -274,6 +285,16 @@ def test_a_core_block_plugin_creates_nothing(tmp_path):
     apply(G, _artifact(tmp_path), tmp_path)
     assert plugin_id("block", "system_branding_block") not in G
     assert extension_id("system") not in G
+
+
+def test_a_custom_file_plugin_of_a_core_provider_makes_no_provider_stub(tmp_path):
+    data = _runtime_data()
+    data["plugins"]["block"][0]["provider"] = "system"
+    G = _graph()
+    apply(G, _artifact(tmp_path, data), tmp_path)
+    assert DERIVATIVE in G
+    assert extension_id("system") not in G
+    assert _edge(G, DERIVATIVE, BLOCK_CLASS)["relation"] == "plugin_implemented_by"
 
 
 def test_a_static_plugin_node_is_confirmed_not_recreated(tmp_path):
@@ -390,7 +411,44 @@ def test_an_overlay_impl_later_extracted_statically_survives_undo(tmp_path):
     apply(M, None, tmp_path)
     assert TOOLBAR_IMPL in M
     impl = M.nodes[TOOLBAR_IMPL]
-    assert "_overlay" not in impl and "origin" not in impl and "order" not in impl
+    assert "_overlay" not in impl and "origin" not in impl and "runtime_order" not in impl
     assert impl["via"] == "attribute"
     assert M.has_edge(TOOLBAR_IMPL, TOOLBAR)
     assert "origin" not in M.edges[TOOLBAR_IMPL, TOOLBAR]
+
+
+# -- with a current registry ----------------------------------------------------
+
+
+def test_registry_realms_for_stubs_and_a_self_declared_hook(tmp_path):
+    from graphify.drupal import discovery
+    from graphify.drupal.hooks import HookDecl
+
+    core = tmp_path / "web/core"
+    registry = discovery.Registry(web_root=str(tmp_path / "web"))
+    registry.extensions = {"foo": str(tmp_path / FOO), "system": str(tmp_path / SYSTEM)}
+    registry.hooks = {
+        "toolbar": HookDecl("toolbar", "system", str(core / "modules/system/system.api.php"), 10),
+        # foo declares the hook it implements: P2b's one relation per pair.
+        "foo_info": HookDecl("foo_info", "foo", str(tmp_path / FOO / "foo.api.php"), 3),
+    }
+    registry.types = {"block": discovery.PluginType(
+        plugin_type="block", manager_class="Drupal\\Core\\Block\\BlockManager",
+        class_file=str(core / "lib/Drupal/Core/Block/BlockManager.php"), line=1, owner="core",
+        registered=True, manager_service="plugin.manager.block")}
+    discovery.set_current(registry, None)
+
+    data = _runtime_data()
+    data["hooks"]["foo_info"] = [{"module": "foo", "callable": "Drupal\\foo\\Hook\\FooHooks::toolbar",
+                                  "file": HOOKS_FILE}]
+    G = _graph()
+    apply(G, _artifact(tmp_path, data), tmp_path)
+
+    hook = G.nodes[hook_id("toolbar")]
+    assert hook["realm"] == "core" and hook["boundary"] is True
+    stub = G.nodes[type_id("block")]
+    assert stub["realm"] == "core" and stub["boundary"] is True
+    assert hook_impl_id("foo", "foo_info") in G
+    assert hook_id("foo_info") not in G
+    assert not G.has_edge(extension_id("foo"), hook_id("foo_info"))
+    assert _edge(G, hook_impl_id("foo", "foo_info"), TOOLBAR)["relation"] == "hook_implemented_by"

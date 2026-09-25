@@ -22,8 +22,12 @@ Undo markers: `_overlay: True` on nodes the overlay created, and
 `_overlay_attrs: [keys]` on every node and edge it touched.
 
 It maps `services`, `aliases`, `routes`, `extensions`, `hooks` (P2b's
-implementation shape, plus each implementation's `order`), `plugins` and
-`subscribers`.
+implementation shape, plus each implementation's `runtime_order`), `plugins`
+and `subscribers`.
+
+A `drupal_hook_impl` node the overlay makes has its implementation's PHP file
+as `source_file` on purpose, as P2b's would: when core re-extracts that file it
+evicts the node, and the overlay rebuilds it in the same build.
 """
 from __future__ import annotations
 
@@ -382,7 +386,8 @@ class _Overlay:
         self.attr(nid, self.G.nodes[nid], key, value)
 
     def ensure(self, nid: str, *, type: str, layer: str, label: str, realm: str | None,
-               source_file: str | None = None, **extra: Any) -> str:
+               source_file: str | None = None, source_location: str | None = None,
+               **extra: Any) -> str:
         """`nid`, created when absent: a boundary stub unless its realm is
         custom. `extra` attributes (None values left out) go only on a node
         this call creates."""
@@ -393,7 +398,7 @@ class _Overlay:
         attrs: dict[str, Any] = {k: v for k, v in extra.items() if v is not None}
         attrs.update({
             "label": label, "file_type": "concept", "type": type, "layer": layer,
-            "realm": realm, "source_file": source_file, "source_location": "L1",
+            "realm": realm, "source_file": source_file, "source_location": source_location or "L1",
             "_origin": "ast", "origin": ORIGIN, _OVERLAY: True, _OWN_FILE: source_file,
         })
         if not self.custom(realm):
@@ -662,16 +667,14 @@ class _Overlay:
                            realm=realm, hook_name=name)
 
     def impl_order(self, nid: str, order: int) -> None:
-        """`order` on an impl node: its index in the hook's list, once per
-        apply (a module with two listeners for one hook keeps the first). A
-        static `order` is the `#[Hook(order: ...)]` argument text; it is
-        kept, and is not a conflict with an index."""
+        """`runtime_order` on an impl node: its index in the hook's list, once
+        per apply (a module with two listeners for one hook keeps the first).
+        P2b's `order` (the `#[Hook(order: ...)]` argument text) is its own
+        key and is left alone."""
         if nid in self._ordered or nid not in self.G:
             return
         self._ordered.add(nid)
-        if isinstance(self.G.nodes[nid].get("order"), str):
-            return
-        self.node_attr(nid, "order", order)
+        self.node_attr(nid, "runtime_order", order)
 
     @staticmethod
     def _listener(value: str) -> tuple[str, str, str]:
@@ -680,7 +683,7 @@ class _Overlay:
         if "::" not in value:
             return value, "", ""
         cls, method = value.split("::", 1)
-        if cls.lstrip("\\") == _PROCEDURAL_CALL:
+        if cls == _PROCEDURAL_CALL:
             return method, "", ""
         return "", cls, method
 
@@ -722,11 +725,14 @@ class _Overlay:
                 if function and "::" in listener:
                     file = None                # ProceduralCall.php is not where the function is
                 target = self.bind_listener(module, file, function, cls, method)
-                source_file = self.scan_path(file)
-                if source_file is None and target is not None:
-                    source_file = self.G.nodes[target].get("source_file")
+                source_file, source_location = self.scan_path(file), None
+                if target is not None:
+                    bound = self.G.nodes[target]
+                    source_file = source_file or bound.get("source_file")
+                    source_location = bound.get("source_location")
                 self.ensure(nid, type="drupal_hook_impl", layer="hook", label=f"{module}:{hook}",
-                            realm=realm, source_file=source_file, module=module,
+                            realm=realm, source_file=source_file, source_location=source_location,
+                            module=module,
                             hook_name=hook, function=function or None,
                             class_name=_short(cls) if cls else None, method=method or None)
                 self.applied("hooks")
@@ -784,7 +790,9 @@ class _Overlay:
                     self.node_attr(nid, key, value)
                 self.edge(nid, self.plugin_type_target(plugin_type), "plugin_of_type",
                           target_name=plugin_type)
-                if provider:
+                if provider and self.custom(provider_realm):
+                    # A boundary stub is only ever a custom fact's target (S7.6),
+                    # never the source of one.
                     ext = self.ensure(extension_id(provider), type="drupal_extension",
                                       layer="extension", label=provider, realm=provider_realm)
                     self.edge(ext, nid, "provides_plugin")

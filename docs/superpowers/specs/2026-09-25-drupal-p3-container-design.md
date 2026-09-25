@@ -256,7 +256,7 @@ The vocabulary's relations, nothing new:
 | service provider module | `declares_service` |
 | route | `declares_route`, `routes_to` (→ method, else class), `routes_to_form`, `requires_permission`, `access_checked_by` |
 | extension | `depends_on_module` |
-| hook implementation | P2b's shape: `drupal_hook_impl` node (`make_id("drupal", "hook_impl", module, hook)`, `module`, `hook_name`, `function` or `class_name`+`method`), `implements_hook` (extension → hook), `hook_implemented_by` (impl → function or method node); `order` (index in the list) on the impl node |
+| hook implementation | P2b's shape: `drupal_hook_impl` node (`make_id("drupal", "hook_impl", module, hook)`, `module`, `hook_name`, `function` or `class_name`+`method`), `implements_hook` (extension → hook), `hook_implemented_by` (impl → function or method node); `runtime_order` (index in the list) on the impl node, beside P2b's own `order` (the `#[Hook(order: …)]` text), which it leaves alone |
 | plugin | `provides_plugin`, `plugin_of_type`, `plugin_implemented_by`, `derives_plugins` |
 | subscriber | `subscribes_to_event` (class → event), `priority` on the edge |
 
@@ -289,7 +289,7 @@ else the Drupal producers emit. The vocabulary's `_origin: container`
 The P2b rule holds. A fact whose subject is `custom` is applied in full. A fact
 about a boundary thing (core, contrib, vendor, by `realm_of` of its file or
 provider) is applied only to a node already in `G`. It adds facts such as
-`class_name`, a route's `path` and a hook's `order`, and marks it. A new
+`class_name`, a route's `path` and a hook implementation's `runtime_order`, and marks it. A new
 boundary node is created only as the direct target of a custom fact, for
 example a custom service injecting `entity_type.manager`. Such a node is a stub
 like P2b's (`boundary: true`, `realm`, `_overlay: true`). `drupal.include`
