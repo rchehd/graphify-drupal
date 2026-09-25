@@ -34,7 +34,7 @@
 | `graphify/drupal/container_collect.php` (new) | the collector (spec §5) |
 | `graphify/drupal/container_overlay.py` (new) | undo, binding, mapping, boundary rule, `runtime`, boundary-facts re-apply (spec §7) |
 | `graphify/drupal/divergence.py` (new) | divergence records, log file (spec §8) |
-| `graphify/drupal/discovery.py` | `current_run()` — the root and out dir `prepare_run` set; `affected_files` gains `invokes_hook` sources (Task 8) |
+| `graphify/drupal/discovery.py` | `current_run()` — the root and out dir `prepare_run` set; `affected_files` gains `invokes_hook` sources (Task 7) |
 | `graphify/drupal/inventory.py` | `render_section` renders the "Container" block from `inventory["container"]` |
 | `graphify/drupal/register.py` | wrappers `cli.dispatch_command`, `build.build_from_json`; watch triggers on the artifact |
 | `pyproject.toml` | package data `"graphify.drupal" = ["container_collect.php"]` |
