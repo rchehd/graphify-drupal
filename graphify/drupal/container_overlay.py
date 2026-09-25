@@ -96,7 +96,11 @@ def _owned(data: dict) -> bool:
     created with. A static producer that later emits the same edge pair takes
     it over through `build_from_json`'s `add_edge`, which writes the static
     `source_file` over the overlay's."""
-    return data.get("source_file") == data.get(_OWN_FILE)
+    own = data.get(_OWN_FILE)
+    if own is None:
+        # Laid before `_overlay_file` existed: the overlay's while it carries `origin`.
+        return data.get("origin") == ORIGIN
+    return data.get("source_file") == own
 
 
 def _hand_over(data: dict) -> None:

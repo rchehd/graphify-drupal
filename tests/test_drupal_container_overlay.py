@@ -572,3 +572,55 @@ def test_a_scan_of_web_below_the_composer_root_still_binds(tmp_path):
     assert G.nodes[service_id("current_user")]["realm"] == "core"
     assert result.counts["services"]["custom"] == 1
     assert G.edges[service_id("foo.bar"), FOOBAR]["source_file"] == "drupal-container.json"
+
+
+# -- fix round 2: the declared node wins core's dedup; pre-marker graphs clean up --
+
+
+def test_a_statically_declared_route_beats_the_overlay_record_in_dedup(tmp_path):
+    from graphify.build import build_merge
+    from graphify.drupal.register import install
+
+    install()
+    data = _artifact_data()
+    data["routes"].append({"name": "foo.dyn", "path": "/dyn", "defaults": {},
+                           "requirements": {}, "provider": "foo"})
+    G = _graph(tmp_path)
+    apply(G, _artifact(tmp_path, data), tmp_path)
+    graph_json = _write_graph_json(G, tmp_path)
+
+    rf = f"{FOO}/foo.routing.yml"
+    ext = _extraction()
+    nodes = [n for n in ext["nodes"] if n["source_file"] == rf]
+    nodes.append(_n(route_id("foo.dyn"), "foo.dyn", rf, type="drupal_route", layer="routing",
+                    realm="custom", route_path="/dyn-static", title="Dyn",
+                    _origin="static_yaml", source_location="L9"))
+    edges = [e for e in ext["edges"] if e["source_file"] == rf]
+    edges.append(_e(extension_id("foo"), route_id("foo.dyn"), "declares_route", rf,
+                    _origin="static_yaml"))
+    M = build_merge([{"nodes": nodes, "edges": edges}], graph_path=graph_json, root=tmp_path)
+
+    node = M.nodes[route_id("foo.dyn")]
+    assert node["source_file"] == rf and node["source_location"] == "L9"
+    assert node["route_path"] == "/dyn-static" and node["title"] == "Dyn"
+    assert "_overlay" not in node and "origin" not in node
+
+    result = apply(M, _artifact(tmp_path, data), tmp_path)
+    node = M.nodes[route_id("foo.dyn")]
+    assert node["route_path"] == "/dyn-static"          # the static value is kept
+    assert node["runtime"] == "present"
+    assert {"relation": "attribute:route_path", "source": route_id("foo.dyn"),
+            "static_target": "/dyn-static", "container_target": "/dyn"} in result.conflicts
+    assert M.edges[extension_id("foo"), route_id("foo.dyn")]["confirmed_by"] == ORIGIN
+
+
+def test_a_graph_overlaid_before_the_ownership_marker_still_undoes(tmp_path):
+    static = _graph(tmp_path)
+    G = copy.deepcopy(static)
+    apply(G, _artifact(tmp_path), tmp_path)
+    for _nid, data in G.nodes(data=True):
+        data.pop("_overlay_file", None)
+    for _u, _v, data in G.edges(data=True):
+        data.pop("_overlay_file", None)
+    undo(G)
+    assert _dump(G) == _dump(static)

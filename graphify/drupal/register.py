@@ -801,6 +801,14 @@ def _patch_dedup(dedup: ModuleType) -> None:
     a now-declaring file emits (`hook_new_hook` added to an in-graph
     `*.api.php` kept the stale `missing` stub). The declared node defines the
     id; a stub (`boundary: true`) only references it.
+
+    A node the container overlay created (`_overlay: true`, or its
+    `source_file` still the `_overlay_file` it was created with) is not a
+    declaration either (P3 spec S7.2): carried over from graph.json, it
+    would otherwise beat a `*.routing.yml` or `*.services.yml` that now
+    declares the same id on the basename tie-break (`drupal-container.json`
+    sorts first), and the static node's own attributes (`route_path`,
+    `source_file`) would be lost. The next overlay puts its facts back.
     """
     for attr in ("_is_code", "_defines_id"):
         if not callable(getattr(dedup, attr, None)):
@@ -812,6 +820,10 @@ def _patch_dedup(dedup: ModuleType) -> None:
     def _is_drupal(node) -> bool:
         return str(node.get("type", "")).startswith("drupal_")
 
+    def _overlay_made(node) -> bool:
+        own = node.get("_overlay_file")
+        return bool(node.get("_overlay")) or (bool(own) and node.get("source_file") == own)
+
     def _key_by_id(original):
         def _is_code(node):
             return original(node) or _is_drupal(node)
@@ -820,7 +832,8 @@ def _patch_dedup(dedup: ModuleType) -> None:
     def _declared_defines(original):
         def _defines_id(node):
             if _is_drupal(node):
-                return bool(node.get("source_file")) and not node.get("boundary")
+                return (bool(node.get("source_file")) and not node.get("boundary")
+                        and not _overlay_made(node))
             return original(node)
         return _defines_id
 
