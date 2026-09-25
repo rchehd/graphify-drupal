@@ -21,6 +21,7 @@ from graphify.drupal.container import (
     staleness,
     validate,
 )
+from tests.test_drupal_discovery_seam import _isolated_discovery_state  # noqa: F401
 
 _INSTALLER_PATHS = {
     "web/core": ["type:drupal-core"],
@@ -117,6 +118,55 @@ def test_container_sources_is_sorted(tmp_path):
     root = _site(tmp_path)
     sources = container_sources(root)
     assert sources == sorted(sources)
+
+
+def test_container_sources_uses_the_registry_for_files_no_glob_would_find(
+    tmp_path, _isolated_discovery_state,
+):
+    """A manager class and a plain service class sitting directly under
+    `src/` (not under `src/Plugin`, `src/Hook`, `src/EventSubscriber`, and
+    not a `*ServiceProvider.php`) match none of `container_sources`' glob
+    patterns -- the registry is what names them. A contrib service's class
+    file must still be excluded."""
+    root = _site(tmp_path)
+    foo_dir = root / "web/modules/custom/foo"
+    bar_dir = root / "web/modules/contrib/bar"
+
+    manager_file = _touch(root, "web/modules/custom/foo/src/FooManager.php",
+                          "<?php\nclass FooManager {}\n")
+    service_file = _touch(root, "web/modules/custom/foo/src/FooGenericService.php",
+                          "<?php\nclass FooGenericService {}\n")
+    contrib_service_file = _touch(root, "web/modules/contrib/bar/src/BarService.php",
+                                  "<?php\nclass BarService {}\n")
+
+    from graphify.drupal.discovery import PluginType, Registry, set_current
+
+    registry = Registry(
+        web_root=(root / "web").as_posix(),
+        types={
+            "foo_manager": PluginType(
+                plugin_type="foo_manager",
+                manager_class="Drupal\\foo\\FooManager",
+                class_file=manager_file.as_posix(),
+                line=1,
+                owner="foo",
+                registered=True,
+            ),
+        },
+        extensions={"foo": foo_dir.as_posix(), "bar": bar_dir.as_posix()},
+        services={
+            "foo.generic": ("Drupal\\foo\\FooGenericService", "foo"),
+            "bar.service": ("Drupal\\bar\\BarService", "bar"),
+        },
+    )
+    set_current(registry)
+
+    sources = container_sources(root)
+    rels = {p.relative_to(root).as_posix() for p in sources}
+
+    assert manager_file.relative_to(root).as_posix() in rels
+    assert service_file.relative_to(root).as_posix() in rels
+    assert contrib_service_file.relative_to(root).as_posix() not in rels
 
 
 # -- artifact_path -------------------------------------------------------------
