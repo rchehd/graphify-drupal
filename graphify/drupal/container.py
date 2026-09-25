@@ -33,6 +33,7 @@ from typing import Any
 from graphify.drupal.boundary import install_map, realm_of
 from graphify.drupal.hooks import is_procedural_file
 from graphify.drupal.paths import is_drupal_info_yaml
+from graphify.drupal.rc import read_rc_value
 
 SCHEMA_VERSION = 1
 SOURCES = ("services", "aliases", "routes", "extensions", "hooks", "plugins", "subscribers")
@@ -70,21 +71,9 @@ def artifact_path(root: Path) -> Path:
     if env:
         return Path(env)
 
-    rc_path = root / ".graphifyrc"
-    if rc_path.is_file():
-        try:
-            text = rc_path.read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, val = line.split("=", 1)
-            if key.strip() == RC_ARTIFACT:
-                rel = val.strip()
-                if rel:
-                    return root / rel
+    rel = read_rc_value(root, RC_ARTIFACT)
+    if rel:
+        return root / rel
 
     return root / _DEFAULT_ARTIFACT_NAME
 
