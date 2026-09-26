@@ -15,7 +15,6 @@ from graphify.drupal.container import Artifact
 from graphify.drupal.container_overlay import ORIGIN, _Binder, apply, undo
 from graphify.drupal.yaml_common import parameter_id, permission_id, route_id, service_id
 from graphify.drupal.yaml_extract import extension_id
-from tests.test_drupal_discovery import _site
 from tests.test_drupal_discovery_seam import _isolated_discovery_state  # noqa: F401
 
 FOO = "web/modules/custom/foo"
