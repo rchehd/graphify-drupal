@@ -23,7 +23,15 @@ from typing import Any, Callable, Iterator
 from graphify.drupal.boundary import boundary_digest
 from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_id, hook_pattern, read_hook_stubs
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
-from graphify.drupal.php_classes import Arg, PhpClass, read_php_class, resolve_name
+from graphify.drupal.php_classes import (
+    Arg,
+    ClassFacts,
+    PhpClass,
+    read_class_semantics,
+    read_drupal_shortcuts,
+    read_php_class,
+    resolve_name,
+)
 from graphify.drupal.yaml_common import load_drupal_yaml
 from graphify.ids import make_id
 
@@ -73,6 +81,16 @@ class Registry:
     services: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: extension name -> (type "module"|"theme"|"profile", dir), every `*.info.yml`.
     extension_info: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: `\Drupal::` method -> service id, from `<web_root>/core/lib/Drupal.php` (P4 §7.1).
+    shortcuts: dict[str, str] = field(default_factory=dict)
+    #: class FQCN -> `ClassFacts.to_dict()`, every class of a custom extension (P4 §7.2).
+    class_facts: dict[str, dict] = field(default_factory=dict)
+    #: entity type id -> (provider, class FQCN), custom and boundary (P4 §5.4).
+    entity_types: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: form id -> (provider, class FQCN), custom and boundary; base form ids too (P4 §6.1).
+    forms: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: "Fqcn::NAME" -> event name, the string constants of classes named `*Events` (P4 §8).
+    event_constants: dict[str, str] = field(default_factory=dict)
 
     def by_yaml_name(self) -> dict[str, PluginType]:
         """Non-deferred types that read `<ext>.<yaml_name>.yml` files."""
@@ -94,6 +112,11 @@ class Registry:
             "hooks": {k: asdict(v) for k, v in self.hooks.items()},
             "services": {k: list(v) for k, v in self.services.items()},
             "extension_info": {k: list(v) for k, v in self.extension_info.items()},
+            "shortcuts": dict(self.shortcuts),
+            "class_facts": {k: ClassFacts.from_dict(v).to_dict() for k, v in self.class_facts.items()},
+            "entity_types": {k: list(v) for k, v in self.entity_types.items()},
+            "forms": {k: list(v) for k, v in self.forms.items()},
+            "event_constants": dict(self.event_constants),
         }
 
     @classmethod
@@ -107,6 +130,12 @@ class Registry:
             hooks={k: HookDecl(**v) for k, v in (data.get("hooks") or {}).items()},
             services={k: tuple(v) for k, v in (data.get("services") or {}).items()},
             extension_info={k: tuple(v) for k, v in (data.get("extension_info") or {}).items()},
+            shortcuts=dict(data.get("shortcuts") or {}),
+            class_facts={k: ClassFacts.from_dict(v).to_dict()
+                         for k, v in (data.get("class_facts") or {}).items()},
+            entity_types={k: tuple(v) for k, v in (data.get("entity_types") or {}).items()},
+            forms={k: tuple(v) for k, v in (data.get("forms") or {}).items()},
+            event_constants=dict(data.get("event_constants") or {}),
         )
 
 
@@ -265,6 +294,8 @@ class _Walk:
     root_yaml: list[str] = field(default_factory=list)
     api_php: list[Path] = field(default_factory=list)
     extension_info: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: Every `.php` file but `*.api.php`, for the P4 maps (`_learn_php`).
+    php: list[Path] = field(default_factory=list)
 
 
 def _walk(base: Path, core_dir: Path | None,
@@ -313,6 +344,10 @@ def _walk(base: Path, core_dir: Path | None,
             elif name.endswith(_API_PHP_SUFFIX) and len(name) > len(_API_PHP_SUFFIX):
                 if kept(path):
                     found.api_php.append(path)
+            if name.endswith(".php") and not name.endswith(_API_PHP_SUFFIX):
+                # Not asked `kept` here: `_learn_php` asks only for the files
+                # its text precheck keeps (a per-file check costs seconds).
+                found.php.append(path)
             if name.startswith(".") or not name.endswith(".yml") or name in info:
                 continue
             if (any(name.startswith(f"{ext}.") for ext in exts)
@@ -744,6 +779,8 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
                 pattern=hook_pattern(name),
             )
 
+    php = _learn_php(builder, walk, is_ignored)
+
     return Registry(
         web_root=web_root.as_posix() if web_root is not None else None,
         types=builder.types,
@@ -753,7 +790,144 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
         hooks=builder.hooks,
         services=builder.services,
         extension_info=walk.extension_info,
+        shortcuts=read_drupal_shortcuts(web_root / "core" / "lib" / "Drupal.php")
+        if web_root is not None else {},
+        **php,
     )
+
+
+# -- P4: what the site's PHP says (spec §5.4, §6.1, §7.2, §8) -----------------
+
+#: Text prechecks: only a file one of them matches is parsed (`_learn_php`).
+_FORM_PRECHECK = re.compile(rb"function\s+get(?:Base)?FormId\s*\(")
+_ENTITY_TYPE_PRECHECK = re.compile(rb"(?:#\[|@)\\?(?:[\w\\]*\\)?(?:Content|Config)EntityType\s*\(")
+_EVENTS_PRECHECK = re.compile(rb"class\s+\w*Events\b")
+_CLASS_PRECHECK = re.compile(rb"\bclass\s+\w")
+
+#: The entity type attribute classes (resolved through `use`, as PHP does).
+_ENTITY_TYPE_ATTRIBUTES = frozenset({
+    "Drupal\\Core\\Entity\\Attribute\\ContentEntityType",
+    "Drupal\\Core\\Entity\\Attribute\\ConfigEntityType",
+})
+#: The entity type annotations, by short name: Drupal's annotation reader
+#: matches `@ContentEntityType` without a `use` (none of the corpus's 62
+#: annotated entity classes imports it).
+_ENTITY_TYPE_ANNOTATIONS = frozenset({"ContentEntityType", "ConfigEntityType"})
+
+
+def _learn_php(builder: _Builder, walk: _Walk,
+               is_ignored: Callable[[Path], bool] | None) -> dict[str, dict]:
+    """The P4 maps, from one read of each `.php` file the walk found.
+
+    A file is parsed only when a cheap text precheck matches: `getFormId`,
+    an entity type attribute or annotation, `class …Events`, or -- in a
+    custom extension -- any class (spec §7.2 records every custom class).
+    `is_ignored` is asked only about those files, after the precheck, so an
+    ignored file may be read but never contributes. A custom entry wins over
+    a boundary one with the same key, and a literal form id over a base form
+    id. Never raises."""
+    where = _DirectoryFacts(builder)
+    class_facts: dict[str, dict] = {}
+    entity_types: tuple[dict, dict] = ({}, {})     # (boundary, custom)
+    forms: tuple[dict, dict] = ({}, {})
+    base_forms: tuple[dict, dict] = ({}, {})
+    event_constants: dict[str, str] = {}
+
+    for path in walk.php:
+        try:
+            source = path.read_bytes()
+        except OSError:
+            continue
+        owner, custom = where.of(path)
+        # A substring test first: most files match none, and `in` is far
+        # cheaper than a regex search.
+        if not ((custom and _CLASS_PRECHECK.search(source))
+                or (b"FormId" in source and _FORM_PRECHECK.search(source))
+                or (b"EntityType" in source and _ENTITY_TYPE_PRECHECK.search(source))
+                or (b"Events" in source and _EVENTS_PRECHECK.search(source))):
+            continue
+        if is_ignored is not None and is_ignored(path):
+            continue
+        facts, annotations, attributed = read_class_semantics(path, source)
+        side = 1 if custom else 0
+        for f in facts:
+            if custom:
+                class_facts.setdefault(f.fqcn, f.to_dict())
+            if f.form_id:
+                forms[side].setdefault(f.form_id, (owner, f.fqcn))
+            if f.base_form_id:
+                base_forms[side].setdefault(f.base_form_id, (owner, f.fqcn))
+            if f.fqcn.rsplit("\\", 1)[-1].endswith("Events"):
+                for name, value in f.constants.items():
+                    event_constants.setdefault(f"{f.fqcn}::{name}", value)
+        for cls in attributed:
+            for attr in cls.attributes:
+                if attr.name not in _ENTITY_TYPE_ATTRIBUTES:
+                    continue
+                named = next((a.string for a in attr.args if a.name == "id"), None)
+                positional = next((a for a in attr.args if not a.name), None)
+                entity_id = named or (positional.string if positional is not None else None)
+                if entity_id:
+                    entity_types[side].setdefault(entity_id, (owner, cls.fqcn))
+        for fqcn, annotation in annotations:
+            if annotation.name.rsplit("\\", 1)[-1] not in _ENTITY_TYPE_ANNOTATIONS:
+                continue
+            entity_id = annotation.values.get("id")
+            if isinstance(entity_id, str) and entity_id:
+                entity_types[side].setdefault(entity_id, (owner, fqcn))
+
+    return {
+        "class_facts": class_facts,
+        "entity_types": {**entity_types[0], **entity_types[1]},
+        "forms": {**base_forms[0], **base_forms[1], **forms[0], **forms[1]},
+        "event_constants": event_constants,
+    }
+
+
+class _DirectoryFacts:
+    """`(owner extension, in the graph?)` per directory, for `_learn_php`.
+
+    The owner is `_owner`'s longest-match answer, found by walking up from
+    the directory to the nearest extension directory instead of scanning
+    every extension (~1,140 on the reference corpus) per file. "In the
+    graph" is `realm_of` custom, or a realm `drupal.include` opts in: the
+    owning extension's directory (else the file's own) is in no boundary
+    directory, decided once per directory as `hook_dependent_files` does."""
+
+    def __init__(self, builder: _Builder) -> None:
+        self._by_dir: dict[str, str] = {}
+        for ext, directory in builder.walk.extensions.items():
+            # `_owner` keeps the first extension of equal length.
+            self._by_dir.setdefault(directory, ext)
+        self._memo: dict[str, tuple[str, bool]] = {}
+        self._custom: dict[str, bool] = {}
+
+    def of(self, path: Path) -> tuple[str, bool]:
+        parent = path.parent.as_posix()
+        found = self._memo.get(parent)
+        if found is None:
+            owner, directory = "", parent
+            probe = parent
+            while probe:
+                if probe in self._by_dir:
+                    owner, directory = self._by_dir[probe], probe
+                    break
+                head, sep, _tail = probe.rpartition("/")
+                if not sep or head == probe:
+                    break
+                probe = head
+            found = self._memo[parent] = (owner, self._in_graph(directory))
+        return found
+
+    def _in_graph(self, directory: str) -> bool:
+        if directory not in self._custom:
+            from graphify.drupal.boundary import boundary_dir
+
+            try:
+                self._custom[directory] = boundary_dir(Path(directory)) is None
+            except Exception:
+                self._custom[directory] = False
+        return self._custom[directory]
 
 
 # -- the registry in the pipeline --------------------------------------------
@@ -929,7 +1103,37 @@ def affected_files(previous: Registry | None, current: Registry | None,
     # procedural file and `src/Hook/**/*.php` (spec §5.5).
     if _hook_names(old_hooks) != _hook_names(new_hooks):
         result |= hook_dependent_files(previous) | hook_dependent_files(current)
+
+    # A custom class whose constructor/`create()` facts changed (P4 §9): its
+    # file, and every in-graph subclass's -- they inherit what it injects.
+    result |= _class_facts_files(previous.class_facts, current.class_facts)
     return result
+
+
+def _class_facts_files(old: dict[str, dict], new: dict[str, dict]) -> set[str]:
+    """The files of every class whose facts differ between `old` and `new`
+    (added and removed included), and of their subclasses in either map."""
+    changed = [fqcn for fqcn in old.keys() | new.keys() if old.get(fqcn) != new.get(fqcn)]
+    out: set[str] = set()
+    if not changed:
+        return out
+    for facts in (old, new):
+        children: dict[str, list[str]] = {}
+        for fqcn, data in facts.items():
+            parent = data.get("extends") if isinstance(data, dict) else ""
+            if parent:
+                children.setdefault(parent, []).append(fqcn)
+        stack, seen = list(changed), set()
+        while stack:
+            fqcn = stack.pop()
+            if fqcn in seen:
+                continue
+            seen.add(fqcn)
+            data = facts.get(fqcn)
+            if isinstance(data, dict) and data.get("file"):
+                out.add(str(data["file"]))
+            stack.extend(children.get(fqcn, ()))
+    return out
 
 
 def _boundary_dependent_files(registry: Registry) -> set[str]:

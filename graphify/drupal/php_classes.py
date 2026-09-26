@@ -9,10 +9,18 @@ discovery objects they build, and what ``alterInfo()`` they register.
 on classes and methods (``#[Hook(...)]``, names resolved, argument source
 text kept verbatim) and a file's top-level functions (hook stubs, procedural
 hook implementations).
+
+P4 adds the facts the registry learns once per run: ``read_drupal_shortcuts``
+(core's ``\\Drupal::`` service shortcuts), ``read_class_annotations`` (Doctrine
+``@Name(key = value)`` docblocks, a handful of literal keys only) and
+``read_class_facts`` (constructor parameters, ``create()`` arguments, literal
+form ids and class constants). ``read_class_semantics`` gives all three
+per-class readers from one parse.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -237,14 +245,18 @@ class PhpFunction:
     doc: str             # the comment directly above the declaration, "" when none
 
 
-def _parse(path: Path) -> "tuple[bytes, tree_sitter.Node] | None":
+def _parse(path: Path, source: bytes | None = None) -> "tuple[bytes, tree_sitter.Node] | None":
     """`(source, root node)` of a PHP file, or None when it is missing,
-    unreadable, oversized or unparsable."""
-    try:
-        if not path.is_file() or path.stat().st_size > _MAX_SIZE:
+    unreadable, oversized or unparsable. A caller that already read the file
+    (the registry's text precheck) passes its bytes as `source`."""
+    if source is None:
+        try:
+            if not path.is_file() or path.stat().st_size > _MAX_SIZE:
+                return None
+            source = path.read_bytes()
+        except OSError:
             return None
-        source = path.read_bytes()
-    except OSError:
+    elif len(source) > _MAX_SIZE:
         return None
     try:
         tree = _parser().parse(source)
@@ -264,34 +276,41 @@ def read_php_attributes(path: Path) -> list[AttributedClass]:
         parsed = _parse(path)
         if parsed is None:
             return []
-        state: dict = {"namespace": "", "uses": {}, "found": []}
-        _find_class(parsed[1], state)
-        out: list[AttributedClass] = []
-        for class_node, namespace, uses in state["found"]:
-            if class_node.type != "class_declaration":
-                continue
-            name = _text(class_node.child_by_field_name("name"))
-            if not name:
-                continue
-            methods: list[PhpMethod] = []
-            body = class_node.child_by_field_name("body")
-            for member in body.named_children if body is not None else ():
-                if member.type != "method_declaration":
-                    continue
-                method_name = _text(member.child_by_field_name("name"))
-                if method_name:
-                    methods.append(PhpMethod(method_name, member.start_point[0] + 1,
-                                             _attributes(member, namespace, uses)))
-            out.append(AttributedClass(
-                name=name,
-                fqcn=resolve_name(name, namespace, uses),
-                line=class_node.start_point[0] + 1,
-                attributes=_attributes(class_node, namespace, uses),
-                methods=tuple(methods),
-            ))
-        return out
+        return [a for a in (_attributed_class(*found) for found in _classes(parsed[1])) if a is not None]
     except Exception:
         return []
+
+
+def _classes(root: "tree_sitter.Node") -> "list[tuple[tree_sitter.Node, str, dict[str, str]]]":
+    """Every top-level `class` declaration (never an interface) with the
+    namespace and `use` aliases in force where it appears."""
+    state: dict = {"namespace": "", "uses": {}, "found": []}
+    _find_class(root, state)
+    return [found for found in state["found"] if found[0].type == "class_declaration"]
+
+
+def _attributed_class(
+    class_node: "tree_sitter.Node", namespace: str, uses: dict[str, str],
+) -> AttributedClass | None:
+    name = _text(class_node.child_by_field_name("name"))
+    if not name:
+        return None
+    methods: list[PhpMethod] = []
+    body = class_node.child_by_field_name("body")
+    for member in body.named_children if body is not None else ():
+        if member.type != "method_declaration":
+            continue
+        method_name = _text(member.child_by_field_name("name"))
+        if method_name:
+            methods.append(PhpMethod(method_name, member.start_point[0] + 1,
+                                     _attributes(member, namespace, uses)))
+    return AttributedClass(
+        name=name,
+        fqcn=resolve_name(name, namespace, uses),
+        line=class_node.start_point[0] + 1,
+        attributes=_attributes(class_node, namespace, uses),
+        methods=tuple(methods),
+    )
 
 
 def _attributes(decl: "tree_sitter.Node", namespace: str, uses: dict[str, str]) -> tuple[PhpAttribute, ...]:
@@ -632,3 +651,571 @@ def _text(node: "tree_sitter.Node | None") -> str:
     if node is None:
         return ""
     return node.text.decode("utf-8", errors="replace")
+
+
+# -- P4: the registry's per-class facts ----------------------------------------
+
+
+def _walk_scope(node: "tree_sitter.Node"):
+    """`_walk`, but never into a nested function, closure, arrow function or
+    class body: what those contain is not the enclosing method's own code."""
+    yield node
+    for child in node.named_children:
+        if child.type in _NESTED_SCOPES:
+            continue
+        yield from _walk_scope(child)
+
+
+_NESTED_SCOPES = frozenset({
+    "anonymous_function", "anonymous_function_creation_expression", "arrow_function",
+    "function_definition", "class_declaration", "declaration_list",
+})
+
+
+def _statements(body: "tree_sitter.Node | None") -> "list[tree_sitter.Node]":
+    """A compound statement's statements, comments left out."""
+    if body is None:
+        return []
+    return [c for c in body.named_children if c.type != "comment"]
+
+
+def _sole_return(method: "tree_sitter.Node | None") -> "tree_sitter.Node | None":
+    """The returned expression when `method`'s body is exactly `return <expr>;`."""
+    if method is None:
+        return None
+    statements = _statements(method.child_by_field_name("body"))
+    if len(statements) != 1 or statements[0].type != "return_statement":
+        return None
+    values = statements[0].named_children
+    return values[0] if len(values) == 1 else None
+
+
+def _modifiers(method: "tree_sitter.Node") -> set[str]:
+    return {_text(c) for c in method.children
+            if c.type in ("visibility_modifier", "static_modifier", "abstract_modifier",
+                          "final_modifier")}
+
+
+# -- \Drupal:: shortcuts (spec §7.1) --
+
+#: The two receivers a shortcut's `->get('<id>')` may be called on, whitespace removed.
+_CONTAINER_RECEIVERS = frozenset({"static::getContainer()", "static::$container"})
+
+
+def read_drupal_shortcuts(path: Path) -> dict[str, str]:
+    """`method -> service id` for core's `core/lib/Drupal.php` (spec §7.1).
+
+    A shortcut is a public static method of class `Drupal` whose body is
+    exactly `return static::getContainer()->get('<literal>');` or `return
+    static::$container->get('<literal>');`. `service($id)` (non-literal) and
+    `request()` (a call chained onto the `get`) are not. Never raises."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return {}
+        out: dict[str, str] = {}
+        for class_node, _namespace, _uses in _classes(parsed[1]):
+            if _text(class_node.child_by_field_name("name")) != "Drupal":
+                continue
+            body = class_node.child_by_field_name("body")
+            for member in body.named_children if body is not None else ():
+                if member.type != "method_declaration":
+                    continue
+                modifiers = _modifiers(member)
+                if "static" not in modifiers or modifiers & {"protected", "private"}:
+                    continue
+                service = _container_get(_sole_return(member), _CONTAINER_RECEIVERS)
+                name = _text(member.child_by_field_name("name"))
+                if service and name:
+                    out.setdefault(name, service)
+        return out
+    except Exception:
+        return {}
+
+
+def _container_get(node: "tree_sitter.Node | None", receivers: frozenset[str]) -> str:
+    """`x` when `node` is `<receiver>->get('x', …)` for one of `receivers`
+    (compared with whitespace removed), else ""."""
+    if node is None or node.type != "member_call_expression":
+        return ""
+    if _text(node.child_by_field_name("name")) != "get":
+        return ""
+    receiver = "".join(_text(node.child_by_field_name("object")).split())
+    if receiver not in receivers:
+        return ""
+    args = node.child_by_field_name("arguments")
+    first = next((a for a in (args.named_children if args is not None else ()) if a.type == "argument"),
+                 None)
+    if first is None or first.child_by_field_name("name") is not None or not first.named_children:
+        return ""
+    return _literal_string(first.named_children[0]) or ""
+
+
+# -- Doctrine annotations (spec §5.1) --
+
+
+@dataclass(frozen=True)
+class Annotation:
+    name: str       # resolved FQCN of `@Name` through the file's `use` statements
+    line: int       # 1-based line of the `@Name(`
+    values: dict    # the literal top-level `_ANNOTATION_KEYS`: str | {"class": fqcn} | dict | list
+
+
+#: The only top-level keys an annotation keeps (spec §5.1, §5.3): the plugin
+#: id and deriver, and an entity type's handlers and literal attributes. Every
+#: other key (labels above all) is skipped, never evaluated.
+_ANNOTATION_KEYS = frozenset({
+    "id", "deriver", "handlers", "bundle_entity_type", "base_table", "admin_permission",
+})
+#: A top-level annotation: `@Name(` first on a docblock line.
+_ANNOTATION_START = re.compile(r"^[ \t]*@(\\?[A-Za-z_][\w\\]*)\(", re.MULTILINE)
+_TOKEN = re.compile(r"""\s*(?:
+    (?P<string>"(?:[^"]|"")*")
+  | (?P<name>\\?[A-Za-z_][\w\\]*(?:::[A-Za-z_]\w*)?)
+  | (?P<number>-?\d+(?:\.\d+)?)
+  | (?P<punct>[(){}=:,@])
+)""", re.VERBOSE)
+_MAX_ANNOTATION_DEPTH = 32
+#: A value parsed and dropped: a nested annotation (`@Translation(...)`), a
+#: constant, a number or a boolean.
+_SKIP = object()
+
+
+class _AnnotationError(Exception):
+    pass
+
+
+class _AnnotationParser:
+    """Recursive descent over one `@Name(...)`'s arguments, Doctrine style:
+    `key = value` or `key: value`, values that are `"strings"` (`""` escapes
+    a quote), `X::class`, `{...}` maps or lists, nested annotations, or bare
+    constants. Anything else raises `_AnnotationError`."""
+
+    def __init__(self, text: str, pos: int, namespace: str, uses: dict[str, str]) -> None:
+        self.text, self.pos, self.namespace, self.uses = text, pos, namespace, uses
+
+    def _peek(self) -> tuple[str, str]:
+        match = _TOKEN.match(self.text, self.pos)
+        if match is None:
+            raise _AnnotationError(self.pos)
+        kind = match.lastgroup or ""
+        return kind, match.group(kind)
+
+    def _next(self) -> tuple[str, str]:
+        match = _TOKEN.match(self.text, self.pos)
+        if match is None:
+            raise _AnnotationError(self.pos)
+        self.pos = match.end()
+        kind = match.lastgroup or ""
+        return kind, match.group(kind)
+
+    def _expect(self, punct: str) -> None:
+        if self._next() != ("punct", punct):
+            raise _AnnotationError(self.pos)
+
+    def _keyed(self) -> str | None:
+        """The key of a `key = value` / `key: value` item, consumed, or None
+        (nothing consumed) when the next item is a bare value."""
+        saved = self.pos
+        kind, token = self._peek()
+        if kind in ("name", "string"):
+            self._next()
+            if self._peek() in (("punct", "="), ("punct", ":")):
+                self._next()
+                return token if kind == "name" else token[1:-1].replace('""', '"')
+        self.pos = saved
+        return None
+
+    def arguments(self, depth: int) -> dict:
+        """After `(`: the keyed arguments up to and including `)`."""
+        values: dict = {}
+        while True:
+            if self._peek() == ("punct", ")"):
+                self._next()
+                return values
+            key = self._keyed()
+            value = self.value(depth)
+            if key is not None and value is not _SKIP:
+                values.setdefault(key, value)
+            kind, token = self._next()
+            if (kind, token) == ("punct", ")"):
+                return values
+            if (kind, token) != ("punct", ","):
+                raise _AnnotationError(self.pos)
+
+    def _collection(self, depth: int) -> dict | list:
+        """After `{`: a map when any item is keyed, else a list."""
+        keyed: dict = {}
+        items: list = []
+        while True:
+            if self._peek() == ("punct", "}"):
+                self._next()
+                return keyed if keyed or not items else items
+            key = self._keyed()
+            value = self.value(depth)
+            if value is not _SKIP:
+                if key is None:
+                    items.append(value)
+                else:
+                    keyed.setdefault(key, value)
+            kind, token = self._next()
+            if (kind, token) == ("punct", "}"):
+                return keyed if keyed or not items else items
+            if (kind, token) != ("punct", ","):
+                raise _AnnotationError(self.pos)
+
+    def value(self, depth: int):
+        if depth > _MAX_ANNOTATION_DEPTH:
+            raise _AnnotationError(self.pos)
+        kind, token = self._next()
+        if kind == "string":
+            return token[1:-1].replace('""', '"')
+        if kind == "number":
+            return _SKIP
+        if kind == "name":
+            if token.endswith("::class"):
+                return {"class": resolve_name(token[: -len("::class")], self.namespace, self.uses)}
+            return _SKIP
+        if token == "{":
+            return self._collection(depth + 1)
+        if token == "@":
+            name_kind, _name = self._next()
+            if name_kind != "name":
+                raise _AnnotationError(self.pos)
+            if self._peek() == ("punct", "("):
+                self._next()
+                self.arguments(depth + 1)
+            return _SKIP
+        raise _AnnotationError(self.pos)
+
+
+def _docblock_text(comment: str) -> str:
+    """A `/** ... */` comment's text, line for line, without the comment
+    markers and each line's leading `*`."""
+    body = comment[3:]
+    if body.endswith("*/"):
+        body = body[:-2]
+    lines = body.split("\n")
+    return "\n".join(re.sub(r"^\s*\*(?!/)", "", line) for line in lines)
+
+
+def _annotations(doc: str, first_line: int, namespace: str, uses: dict[str, str]) -> list[Annotation]:
+    text = _docblock_text(doc)
+    found: list[Annotation] = []
+    pos = 0
+    while True:
+        match = _ANNOTATION_START.search(text, pos)
+        if match is None:
+            return found
+        parser = _AnnotationParser(text, match.end(), namespace, uses)
+        try:
+            values = parser.arguments(0)
+        except (_AnnotationError, RecursionError):
+            # This annotation is skipped; the next line may start another.
+            pos = text.find("\n", match.end())
+            if pos < 0:
+                return found
+            continue
+        line = first_line + text.count("\n", 0, match.start(1))
+        kept = {k: v for k, v in values.items() if k in _ANNOTATION_KEYS}
+        found.append(Annotation(resolve_name(match.group(1), namespace, uses), line, kept))
+        pos = parser.pos
+
+
+def _class_docblock(class_node: "tree_sitter.Node") -> "tree_sitter.Node | None":
+    """The `/** */` comment directly above `class_node`: its previous sibling,
+    ending on the line just before the class (or its first attribute)."""
+    previous = class_node.prev_named_sibling
+    if previous is None or previous.type != "comment":
+        return None
+    if not _text(previous).startswith("/**") or previous.end_point[0] < class_node.start_point[0] - 1:
+        return None
+    return previous
+
+
+def _class_annotations(
+    class_node: "tree_sitter.Node", namespace: str, uses: dict[str, str],
+) -> list[tuple[str, Annotation]]:
+    name = _text(class_node.child_by_field_name("name"))
+    doc = _class_docblock(class_node)
+    if not name or doc is None:
+        return []
+    fqcn = resolve_name(name, namespace, uses)
+    return [(fqcn, a) for a in _annotations(_text(doc), doc.start_point[0] + 1, namespace, uses)]
+
+
+def read_class_annotations(path: Path) -> list[tuple[str, Annotation]]:
+    """`(class FQCN, annotation)` for every `@Name(...)` that starts a line
+    of the docblock directly above a top-level class (spec §5.1).
+
+    Only `_ANNOTATION_KEYS` survive, and only as strings, `{"class": fqcn}`
+    for `X::class`, or nested `{...}` maps (dict) and lists (list); nested
+    annotations, constants and numbers are dropped. An annotation the reader
+    cannot parse is skipped. Never raises."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return []
+        out: list[tuple[str, Annotation]] = []
+        for found in _classes(parsed[1]):
+            out.extend(_class_annotations(*found))
+        return out
+    except Exception:
+        return []
+
+
+# -- constructor, create(), forms and constants (spec §6.1, §7.2, §8) --
+
+
+@dataclass(frozen=True)
+class CtorParam:
+    name: str        # without the `$`
+    type: str        # the declared class/interface type, resolved FQCN; "" for none, a builtin or a union
+    promoted: bool   # a promoted constructor property (`protected Foo $foo`): `$this->name` is the parameter
+
+
+@dataclass(frozen=True)
+class ClassFacts:
+    fqcn: str
+    file: str                          # POSIX path the class was read from
+    extends: str                       # resolved parent class FQCN, "" when none
+    params: tuple[CtorParam, ...]      # `__construct` parameters, in order
+    assigns: dict[str, str]            # property -> parameter name, `$this->p = $param;` in `__construct`
+    parent_args: tuple[str, ...]       # per `parent::__construct(...)` position: a bare parameter's name, else ""
+    create_args: tuple[str, ...]       # per `new static|self|<C>(...)` position in `create()`:
+                                       # the service id of `$container->get('<literal>')`, else ""
+    form_id: str                       # `getFormId()`'s literal return, else ""
+    base_form_id: str                  # `getBaseFormId()`'s literal return, else ""
+    constants: dict[str, str]          # `const NAME = '<literal>'`
+
+    def to_dict(self) -> dict:
+        """A JSON-shaped copy: lists for tuples, `params` as dicts."""
+        return {
+            "fqcn": self.fqcn, "file": self.file, "extends": self.extends,
+            "params": [{"name": p.name, "type": p.type, "promoted": p.promoted} for p in self.params],
+            "assigns": dict(self.assigns), "parent_args": list(self.parent_args),
+            "create_args": list(self.create_args), "form_id": self.form_id,
+            "base_form_id": self.base_form_id, "constants": dict(self.constants),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ClassFacts:
+        return cls(
+            fqcn=str(data.get("fqcn") or ""),
+            file=str(data.get("file") or ""),
+            extends=str(data.get("extends") or ""),
+            params=tuple(CtorParam(str(p.get("name") or ""), str(p.get("type") or ""),
+                                   bool(p.get("promoted")))
+                         for p in data.get("params") or []),
+            assigns={str(k): str(v) for k, v in (data.get("assigns") or {}).items()},
+            parent_args=tuple(str(a) for a in data.get("parent_args") or []),
+            create_args=tuple(str(a) for a in data.get("create_args") or []),
+            form_id=str(data.get("form_id") or ""),
+            base_form_id=str(data.get("base_form_id") or ""),
+            constants={str(k): str(v) for k, v in (data.get("constants") or {}).items()},
+        )
+
+
+#: Declared types that name no class: a parameter typed with one has type "".
+_BUILTIN_TYPES = frozenset({
+    "array", "bool", "callable", "false", "float", "int", "iterable", "mixed", "never",
+    "null", "object", "parent", "self", "static", "string", "true", "void",
+})
+_PARAMETERS = ("simple_parameter", "property_promotion_parameter", "variadic_parameter")
+
+
+def _variable(node: "tree_sitter.Node | None") -> str:
+    """`x` for a bare `$x`, else ""."""
+    if node is None or node.type != "variable_name":
+        return ""
+    return _text(node)[1:]
+
+
+def _param_type(param: "tree_sitter.Node", namespace: str, uses: dict[str, str]) -> str:
+    declared = next((c for c in param.named_children
+                     if c.type in ("named_type", "optional_type", "union_type", "primitive_type",
+                                   "intersection_type", "disjunctive_normal_form_type")), None)
+    if declared is not None and declared.type == "optional_type":
+        declared = next((c for c in declared.named_children if c.type == "named_type"), None)
+    if declared is None or declared.type != "named_type":
+        return ""
+    name_node = next((c for c in declared.named_children if c.type in ("name", "qualified_name")), None)
+    name = _text(name_node)
+    if not name or name.lower() in _BUILTIN_TYPES:
+        return ""
+    return resolve_name(name, namespace, uses)
+
+
+def _params(method: "tree_sitter.Node | None", namespace: str, uses: dict[str, str]) -> tuple[CtorParam, ...]:
+    if method is None:
+        return ()
+    formal = method.child_by_field_name("parameters")
+    out: list[CtorParam] = []
+    for param in formal.named_children if formal is not None else ():
+        if param.type not in _PARAMETERS:
+            continue
+        name = _variable(next((c for c in param.named_children if c.type == "variable_name"), None))
+        if name:
+            out.append(CtorParam(name, _param_type(param, namespace, uses),
+                                 param.type == "property_promotion_parameter"))
+    return tuple(out)
+
+
+def _positional(args_node: "tree_sitter.Node | None") -> "list[tree_sitter.Node | None]":
+    """Each argument's value node, None for a named or spread argument (its
+    position says nothing)."""
+    out: list[tree_sitter.Node | None] = []
+    for arg in args_node.named_children if args_node is not None else ():
+        if arg.type == "variadic_unpacking":
+            out.append(None)
+            continue
+        if arg.type != "argument":
+            continue
+        if arg.child_by_field_name("name") is not None or not arg.named_children \
+                or arg.named_children[0].type == "variadic_unpacking":
+            out.append(None)
+            continue
+        out.append(arg.named_children[0])
+    return out
+
+
+def _assigns(ctor_body: "tree_sitter.Node", params: set[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for node in _walk_scope(ctor_body):
+        if node.type != "assignment_expression":
+            continue
+        left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+        if left is None or left.type != "member_access_expression":
+            continue
+        if _text(left.child_by_field_name("object")) != "$this":
+            continue
+        prop = left.child_by_field_name("name")
+        param = _variable(right)
+        if prop is not None and prop.type == "name" and param in params:
+            out.setdefault(_text(prop), param)
+    return out
+
+
+def _parent_args(ctor_body: "tree_sitter.Node") -> tuple[str, ...]:
+    for node in _walk_scope(ctor_body):
+        if node.type == "scoped_call_expression" \
+                and _text(node.child_by_field_name("scope")) == "parent" \
+                and _text(node.child_by_field_name("name")) == "__construct":
+            return tuple(_variable(v) for v in _positional(node.child_by_field_name("arguments")))
+    return ()
+
+
+def _create_args(create: "tree_sitter.Node | None", fqcn: str,
+                 namespace: str, uses: dict[str, str]) -> tuple[str, ...]:
+    """The service id per position of `create()`'s `new static|self|<C>(...)`,
+    where `<C>` is the class itself; "" for any argument that is not
+    `$container->get('<literal>')` on `create()`'s first parameter."""
+    if create is None:
+        return ()
+    params = _params(create, namespace, uses)
+    body = create.child_by_field_name("body")
+    if not params or body is None:
+        return ()
+    receivers = frozenset({f"${params[0].name}"})
+    for node in _walk_scope(body):
+        if node.type != "object_creation_expression":
+            continue
+        name_node = next((c for c in node.named_children if c.type in ("name", "qualified_name")), None)
+        name = _text(name_node)
+        if name not in ("static", "self") and resolve_name(name, namespace, uses) != fqcn:
+            continue
+        args = next((c for c in node.named_children if c.type == "arguments"), None)
+        return tuple(_container_get(v, receivers) for v in _positional(args))
+    return ()
+
+
+def _literal_return(method: "tree_sitter.Node | None") -> str:
+    return _literal_string(_sole_return(method)) or ""
+
+
+def _constants(body: "tree_sitter.Node") -> dict[str, str]:
+    out: dict[str, str] = {}
+    for member in body.named_children:
+        if member.type != "const_declaration":
+            continue
+        for element in member.named_children:
+            if element.type != "const_element" or len(element.named_children) < 2:
+                continue
+            name, value = element.named_children[0], element.named_children[-1]
+            literal = _literal_string(value)
+            if name.type == "name" and literal is not None:
+                out.setdefault(_text(name), literal)
+    return out
+
+
+def _class_facts(class_node: "tree_sitter.Node", namespace: str, uses: dict[str, str],
+                 file: str) -> ClassFacts | None:
+    name = _text(class_node.child_by_field_name("name"))
+    if not name:
+        return None
+    fqcn = resolve_name(name, namespace, uses)
+    base = next((c for c in class_node.named_children if c.type == "base_clause"), None)
+    parent = base.named_children[0] if base is not None and base.named_children else None
+    extends = resolve_name(_text(parent), namespace, uses) if parent is not None else ""
+    body = class_node.child_by_field_name("body")
+    if body is None:
+        return ClassFacts(fqcn, file, extends, (), {}, (), (), "", "", {})
+    ctor = _find_method(body, "__construct")
+    params = _params(ctor, namespace, uses)
+    ctor_body = ctor.child_by_field_name("body") if ctor is not None else None
+    assigns = _assigns(ctor_body, {p.name for p in params}) if ctor_body is not None else {}
+    parent_args = _parent_args(ctor_body) if ctor_body is not None else ()
+    return ClassFacts(
+        fqcn=fqcn, file=file, extends=extends, params=params, assigns=assigns,
+        parent_args=parent_args,
+        create_args=_create_args(_find_method(body, "create"), fqcn, namespace, uses),
+        form_id=_literal_return(_find_method(body, "getFormId")),
+        base_form_id=_literal_return(_find_method(body, "getBaseFormId")),
+        constants=_constants(body),
+    )
+
+
+def read_class_facts(path: Path) -> list[ClassFacts]:
+    """`ClassFacts` for every top-level class in `path`, in source order.
+    Never raises: bad input yields an empty list."""
+    try:
+        parsed = _parse(path)
+        if parsed is None:
+            return []
+        file = Path(path).as_posix()
+        return [f for f in (_class_facts(*found, file) for found in _classes(parsed[1])) if f is not None]
+    except Exception:
+        return []
+
+
+def read_class_semantics(
+    path: Path, source: bytes | None = None,
+) -> tuple[list[ClassFacts], list[tuple[str, Annotation]], list[AttributedClass]]:
+    """`read_class_facts`, `read_class_annotations` and `read_php_attributes`
+    from one parse -- the registry's walk reads hundreds of files. `source`
+    is the file's bytes when the caller already read them. A class whose
+    facts cannot be read drops out of all three; never raises."""
+    facts: list[ClassFacts] = []
+    annotations: list[tuple[str, Annotation]] = []
+    attributed: list[AttributedClass] = []
+    try:
+        parsed = _parse(path, source)
+        if parsed is None:
+            return facts, annotations, attributed
+        found = _classes(parsed[1])
+    except Exception:
+        return facts, annotations, attributed
+    file = Path(path).as_posix()
+    for class_node, namespace, uses in found:
+        try:
+            one_facts = _class_facts(class_node, namespace, uses, file)
+            one_annotations = _class_annotations(class_node, namespace, uses)
+            one_attributed = _attributed_class(class_node, namespace, uses)
+        except Exception:
+            continue
+        if one_facts is not None:
+            facts.append(one_facts)
+        annotations.extend(one_annotations)
+        if one_attributed is not None:
+            attributed.append(one_attributed)
+    return facts, annotations, attributed
