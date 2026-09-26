@@ -173,10 +173,15 @@ def _extension_source_files(ext_dir: Path) -> set[Path]:
     return files
 
 
-def _registry_extra_files(registry: Any, extensions: dict[str, Path]) -> set[Path]:
+def _registry_extra_files(registry: Any, extensions: dict[str, Path],
+                          custom_dirs: set[Path] | None = None) -> set[Path]:
     """Manager and service class files the four `src/` globs can miss: a
     manager or a plain service class sitting directly under `src/`, named by
-    the registry rather than by one of those directory conventions."""
+    the registry rather than by one of those directory conventions. With
+    `custom_dirs`, only services of an extension in it are looked at: a
+    core or contrib service's class file is never custom, and asking
+    `realm_of` for each of a site's thousand boundary services was most of
+    the staleness check's cost (P3 final review, finding 4)."""
     files: set[Path] = set()
     for plugin_type in registry.types.values():
         class_file = Path(plugin_type.class_file)
@@ -186,6 +191,8 @@ def _registry_extra_files(registry: Any, extensions: dict[str, Path]) -> set[Pat
     for _sid, (fqcn, provider) in registry.services.items():
         ext_dir = extensions.get(provider)
         if ext_dir is None or "\\" not in fqcn:
+            continue
+        if custom_dirs is not None and ext_dir not in custom_dirs:
             continue
         prefix = f"Drupal\\{provider}\\"
         if not fqcn.startswith(prefix):
@@ -219,7 +226,7 @@ def container_sources(root: Path) -> list[Path]:
     for ext_dir in ext_dirs:
         files.update(_extension_source_files(ext_dir))
     if registry is not None:
-        files.update(_registry_extra_files(registry, extensions))
+        files.update(_registry_extra_files(registry, extensions, ext_dirs))
 
     files = {p for p in files if realm_of(p) == "custom"}
     return sorted(files)
