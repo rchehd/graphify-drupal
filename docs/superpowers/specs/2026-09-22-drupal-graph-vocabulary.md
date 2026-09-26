@@ -231,7 +231,7 @@ about the same node.
 | `drupal_service` | `drupal:service:<id>` | `*.services.yml` |
 | `drupal_service_tag` | `drupal:tag:<tag>` | `tags:` in service definitions |
 | `drupal_parameter` | `drupal:parameter:<name>` | `parameters:` |
-| `drupal_event` | `drupal:event:<event_name>` | `getSubscribedEvents()`; **emitted from P3** from the container's event listeners, for events a custom subscriber listens to (label the event name, `realm` of that subscriber) |
+| `drupal_event` | `drupal:event:<event_name>` | `getSubscribedEvents()`; **emitted from P3** from the container's event listeners, for events a custom subscriber listens to (label the event name, `realm` of that subscriber); **from P4** also statically, as the target of a custom class's `getSubscribedEvents()` key (§4.2). It is never a boundary stub: an event has no declaring file, so the resolver materialises it as a plain node |
 
 Service providers are not their own node type — the `*ServiceProvider` PHP class
 node from the AST layer carries an `alters_container` edge to its module.
@@ -289,6 +289,24 @@ never reach the graph. P1's menu links, local tasks, local actions, contextual
 links and breakpoints are YAML-discovered plugins too; they keep their own node
 types and gain a `plugin_of_type` edge instead.
 
+**From P4** a `drupal_plugin` also comes from PHP (P4 spec §5.1): a class in
+`<ext>/src/<subdir>/**` of a custom extension carrying a learned type's
+attribute (`#[<attribute_class>(…)]`, resolved through `use`) or annotation (a
+docblock `@<Name>(…)` whose short name is the `annotation_class`'s; no `use`
+is required, as in Drupal's reader, but a `use` or leading `\` that fixes a
+different FQCN does not match). The node has the same attributes as a YAML
+plugin: `plugin_id` (the attribute's first positional string or `id:`, the
+annotation's `id = "…"` or its positional value), `plugin_type`, `provider`,
+`class_name`, and `deriver` (a FQCN) when literal. A class that matches
+several types gets one node per type: on the reference corpus `action` and
+`eca.action` both read `Plugin/Action` + `#[Action]`, and core's `mail` and
+mailsystem's replacement manager (`class:Drupal\mailsystem\MailsystemManager`)
+both read `Plugin/Mail`. A class carrying `ContentEntityType` or
+`ConfigEntityType` is a `drupal_entity_type` (§3.6), never a plugin. A
+plugin-looking attribute or annotation in `src/Plugin/**` that no learned type
+reads is an `unknown_plugin_type` candidate (§5.7): the `views.*` types, whose
+managers build `"Plugin/views/$type"` at runtime, have no `subdir` to match.
+
 ### 3.5 Hooks — `layer: hook`
 
 | Type | ID | Source |
@@ -311,8 +329,29 @@ leaves as candidates (variable-segment names such as `form_*_alter`,
 `preprocess_*`, `ENTITY_TYPE_presave`) with the same shape and edges.
 There is one `drupal_hook_impl` node per (module, hook), however many
 functions or methods implement it; each implementation has its own
-`hook_implemented_by` edge. `drupal_form` and `drupal_theme_hook` stay for
-P4–P5.
+`hook_implemented_by` edge. `drupal_theme_hook` stays for P5.
+
+**From P4** the `variable` implementations of `form_*_alter` and of the
+`ENTITY_TYPE_*` patterns that §5.5 binds become `drupal_hook_impl` nodes as
+P2b makes them for a declared hook, and `implements_hook` targets the declared
+pattern hook (`drupal_hook_form_form_id_alter`,
+`drupal_hook_form_base_form_id_alter`, `drupal_hook_entity_type_<op>`), never
+a node of the concrete name. The P3 overlay meets those edges through
+`confirmed_by`; the concrete-name hook nodes it made in P3
+(`drupal_hook_node_access`, …) are no longer created.
+
+`drupal_form` is **emitted from P4** (P4 spec §6.1), `layer: hook`:
+
+| Kind | Id | Attributes |
+|---|---|---|
+| a custom class whose `getFormId()` is `return '<literal>';` | `drupal:form:<form_id>` | `form_id`, `class_name`, and `base_form_id` when `getBaseFormId()` is a literal return; label the form id |
+| an entity type's `form.<op>` handler (an **entity form**) | `drupal:form:entity:<entity_type>:<op>` | `entity_form: true`, `entity_type`, `operation`, `class_name`, `pattern: "<entity>_*_<op>_form"` (the label; a description of `EntityForm::getFormId()`, never a matcher) |
+| a core/contrib form a custom fact targets | either id above | a boundary stub (§2.1) with the same attributes, from the registry's boundary maps |
+
+Two custom classes returning one literal form id share one node (merge.py's
+collapse, `declared_in`). A base form id is never a node of its own: it is an
+attribute of the forms that declare it, and the registry keeps a map base id →
+forms.
 
 `drupal_form` and `drupal_theme_hook` sit in this layer because their reason for
 existing is to give `hook_form_FORM_ID_alter` and `hook_preprocess_HOOK` a
@@ -322,12 +361,23 @@ resolvable target. Without them those hook chains have no endpoint.
 
 | Type | ID | Source |
 |---|---|---|
-| `drupal_entity_type` | `drupal:entity_type:<id>` | `#[ContentEntityType]` / `@ContentEntityType` and config variants |
+| `drupal_entity_type` | `drupal:entity_type:<id>` | `#[ContentEntityType]` / `@ContentEntityType` and config variants; **emitted from P4** (below) |
 | `drupal_bundle` | `drupal:bundle:<entity_type>:<bundle>` | `node.type.*`, `block_content.type.*`, … |
 | `drupal_field_storage` | `drupal:field_storage:<entity_type>:<field>` | `field.storage.*.yml` |
 | `drupal_field` | `drupal:field:<entity_type>:<bundle>:<field>` | `field.field.*.yml` |
 | `drupal_view_mode` | `drupal:view_mode:<entity_type>:<mode>` | `core.entity_view_mode.*` |
 | `drupal_display` | `drupal:display:<entity_type>:<bundle>:<mode>:<view\|form>` | `core.entity_{view,form}_display.*` |
+
+`drupal_entity_type` (P4 spec §5.3) is a custom class carrying
+`ContentEntityType` or `ConfigEntityType`, as an attribute or an annotation,
+read with the §3.4 matcher. It carries `entity_kind` (`content` | `config`),
+`class_name`, `provider`, and `bundle_entity_type`, `base_table`,
+`admin_permission` when they are literals. A handler class outside the graph
+gives no `entity_handler` edge; its FQCN goes on the node as `handlers:
+{name: fqcn}` instead. Core and contrib entity types (104 on the reference
+corpus, read by the registry over the boundary) become boundary stubs only as
+targets of a custom fact (`hooks_entity_type`, an entity form), with
+`entity_type`, `class_name` and `provider`.
 
 ### 3.7 Blocks — `layer: block`
 
@@ -399,9 +449,9 @@ parallel taxonomy.
 | `tagged_as` | service → tag | tag nodes make `event_subscriber`, `access_check`, `paramconverter`, `path_processor_*`, `theme_negotiator`, `cache.context` visible as groups without a node type each |
 | `decorates` | service → service | `decorates:` |
 | `parent_service` | service → service | `parent:` |
-| `uses_service` | PHP class/function → service | `\Drupal::service('id')` |
+| `uses_service` | PHP class/method/function → service | `via`, `target_name`; `methods`, `properties`, `shortcut`, `alias` when they apply (below) |
 | `alters_container` | PHP class → module | `*ServiceProvider` |
-| `subscribes_to_event` | PHP class → event | `getSubscribedEvents()`; `priority` attribute |
+| `subscribes_to_event` | PHP class → event | `getSubscribedEvents()`; `method` (the listeners, comma-joined, in dispatch order), `priority` (one listener) or `priorities` (several), when integers |
 
 From P3 the container overlay emits or confirms `declares_service`,
 `service_implemented_by`, `injects_service`, `injects_parameter` and
@@ -415,13 +465,54 @@ argument, is never visible there (private ids are hashed to
 an artifact carries one (a collector reading another dumper); on FormsRemote
 none does.
 
+**`uses_service` is emitted from P4** (P4 spec §7.1), one edge per (source,
+service) pair, for every way custom code reaches a service. `via` says which:
+
+| `via` | Form | Source |
+|---|---|---|
+| `service` | `\Drupal::service('x')` | the enclosing method or function |
+| `shortcut` | `\Drupal::<m>()`, `m` in the registry's shortcut map; the edge carries `shortcut: <m>` | the enclosing method or function |
+| `create` | `$container->get('x')` inside the class's own `create()`, as a constructor argument or a setter-injected property (`$instance->p = $container->get('x')`) | the class |
+| `injected` | a read or call of `$this->p`, `p` resolved by P4 spec §7.3 other than through the class's own `create()` (a `*.services.yml` argument, autowiring, a `src/Hook` class autowired by `HookCollectorPass`, a parent constructor, or an ancestor's `new static(…)` `create()`); the edge carries `properties: [p, …]`. A pair that already has a `create` edge keeps that one | the class |
+
+The shortcut map is learned from core's `core/lib/Drupal.php`: every public
+static method whose sole statement is `return static::getContainer()->get('<literal>')`
+(or `static::$container->…`); 28 methods on Drupal 11.4.7. The target is
+`service_id(resolve_alias(x))`, with the literal as written kept in `alias`
+when an alias was followed; a service outside the graph is a boundary stub. A
+non-literal id (`\Drupal::service(Foo::class)` included) is no edge but a
+`non_literal_service` candidate (§5.7).
+
+**`calls`** (core's relation) is also emitted from a **resolved receiver**
+(P4 spec §7.4): a call `R->m()` whose receiver is `\Drupal::service('x')`, a
+shortcut, `$this->p` with `p` resolved, or a local assigned exactly once from
+one of those, goes from the enclosing method or function to the method node
+`K::m` of the service's class `K`, walking `extends` within the graph. The
+edge carries `service: <id>`. Only a custom class node in the graph is a
+target: there is never a `calls` edge into the boundary. A call that cannot be
+bound that way stays on the carrying `uses_service` edge (the caller's own,
+or, for a property, the class's `create`/`injected` edge) as `methods: [m, …]`,
+and as `_pending_calls: [[caller, m], …]`, an internal attribute (like the
+`_overlay*` markers) that the P3 overlay reads to bind the call when the
+container gives the service a different class that is in the graph; those
+edges are `origin: container`. A chain resolves only its first call.
+
+**`subscribes_to_event` from P4** comes from a custom class's
+`getSubscribedEvents()` array: each key that is a string literal or a class
+constant `X::NAME` the registry resolves (`const NAME = '<literal>'` of
+classes named `*Events`, 168 on the reference corpus) targets
+`drupal:event:<name>`. Any other key, or a value naming no listener, is an
+`unresolved_event` candidate. The P3 overlay's listener edges meet these
+through `confirmed_by`. The reference corpus has no custom
+`getSubscribedEvents()`, so its two edges are the container's.
+
 ### 4.3 Routing and access
 
 | Relation | Source → target | Attributes |
 |---|---|---|
 | `declares_route` | module → route | |
 | `routes_to` | route → PHP class::method | `_controller` |
-| `routes_to_form` | route → form | `_form` — targets the form node, not the class |
+| `routes_to_form` | route → form | `_form` — targets the form node, not the class (from P4: re-pointed from the class node to the `drupal_form` whose `class_name` is that FQCN; the class keeps `routes_to` only for `_controller`) |
 | `requires_permission` | route → permission | `_permission` |
 | `access_checked_by` | route → class::method or service | `_custom_access`, `_entity_access` |
 | `references_route` | class / template / menu_link → route | `Url::fromRoute()`, Twig `path()`/`url()`, `route_name:` |
@@ -456,8 +547,15 @@ nodes can be bound: `plugin_implemented_by` and `derives_plugins` come in P4
 **From P3**, for every plugin the container knows (derivatives included),
 `provides_plugin`, `plugin_of_type`, `plugin_implemented_by` and
 `derives_plugins` are emitted now: the container gives the class and its
-file, so the class node is bound by `source_file` and short name. P4's static
-edges will meet them through `confirmed_by`. A plugin of a type read from a P1
+file, so the class node is bound by `source_file` and short name.
+
+**From P4** the same four edges are static for every PHP-discovered plugin
+(§3.4): `provides_plugin` from the owning extension, `plugin_of_type` to
+`type_id(type)`, `plugin_implemented_by` to the class node core emitted for
+the file (bound by `source_file` and short name), and `derives_plugins` to the
+deriver's class node when it is in the graph. The container's edges meet them
+through `confirmed_by`; a static plugin the container does not list gets
+`runtime: absent` (§2.2). A plugin of a type read from a P1
 links family (`menu.link`, `menu.local_task`, `menu.local_action`,
 `menu.contextual_link`) is P1's link node (`drupal:menu_link:<id>`, …), never a
 second `drupal_plugin` node; its `provides_plugin` yields to P1's
@@ -471,7 +569,9 @@ second `drupal_plugin` node; its `provides_plugin` yields to P1's
 | `invokes_hook` | PHP class/function → hook | `invokeAll`, `invoke`, `invokeAllWith`, `alter`, `hasImplementations`; `AMBIGUOUS` when the first argument is not a literal |
 | `implements_hook` | module → hook | `order` attribute from `#[Hook(order:)]`; the owning module is the `module:` parameter when present, not the file's module |
 | `hook_implemented_by` | hook_impl → PHP function/method | |
-| `alters_form` | hook_impl → form | `hook_form_FORM_ID_alter` |
+| `alters_form` | hook_impl → form | `hook_form_FORM_ID_alter` (and `form_BASE_FORM_ID_alter`); `bundle` when a proven bundle was read (§5.5); always `EXTRACTED` |
+| `form_implemented_by` | form → PHP class | P4: the form's counterpart of `plugin_implemented_by`; to the class node core emitted, for a custom form or an entity form whose handler is a custom class |
+| `hooks_entity_type` | hook_impl → entity_type | P4: `hook_ENTITY_TYPE_<op>`, the `ENTITY_TYPE_*` counterpart of `alters_form`; the entity type is custom or a boundary stub |
 | `declares_theme_hook` | module → theme_hook | `hook_theme()` |
 | `uses_template` | theme_hook → template | `template:` key |
 | `renders_theme_hook` | PHP class → theme_hook | `'#theme' => 'x'` in render arrays — the consuming half of `declares_theme_hook` |
@@ -527,12 +627,17 @@ matched, `undeclared`, `misplaced` — `#[Hook]` outside `src/Hook/` —,
 binding (`alters_form`, `preprocesses`, `suggests_template`, `ENTITY_TYPE_*`)
 waits for the form, theme-hook and entity inventories (P4–P6, §5.5).
 
+**From P4** `alters_form` and `hooks_entity_type` are bound (§5.5, as built),
+and a `form_*_alter` that names no known form is an `unbound_form` candidate
+(`module`, `name`, `form_id`, `file`, `line`) instead of a `variable` one.
+`preprocess_*` and `theme_suggestions_*` stay `variable` candidates for P5.
+
 ### 4.6 Data model
 
 | Relation | Source → target | Attributes |
 |---|---|---|
 | `defines_entity_type` | module → entity_type | |
-| `entity_handler` | entity_type → PHP class | `handler` attribute: `storage`, `list_builder`, `form`, `access`, `views_data` |
+| `entity_handler` | entity_type → PHP class | `handler` attribute: `storage`, `list_builder`, `view_builder`, `access`, `views_data`, `form.<op>`, `route_provider.<name>`; one class serving several handlers is one edge (§1.4) with the names comma-joined in declaration order, e.g. `form.add,form.edit` |
 | `has_bundle` | entity_type → bundle | |
 | `field_storage_of` | field_storage → entity_type | |
 | `field_instance_of` | field → field_storage | |
@@ -541,6 +646,11 @@ waits for the form, theme-hook and entity inventories (P4–P6, §5.5).
 | `field_uses_formatter` | display → plugin | view display |
 | `field_uses_widget` | display → plugin | form display |
 | `display_of` | display → bundle | `view_mode` attribute |
+
+P4 emits `defines_entity_type` (from the provider, attribute `owner`),
+`entity_handler`, and `requires_permission` (entity type → permission) for a
+literal `admin_permission`. A handler class outside the graph is no edge but
+an entry of the node's `handlers` map (§3.6).
 
 ### 4.7 Blocks
 
@@ -741,6 +851,34 @@ This makes the vocabulary self-reinforcing, and imposes a hard ordering: hook
 **discovery** is early and cheap, hook **binding** runs only after the form,
 theme-hook, entity-type and plugin inventories exist.
 
+**As built in P4** (P4 spec §6.2–§6.3), for the first and third rows; the
+registry holds the inventories (custom and boundary forms, base forms, entity
+types, each entity type's `form.<op>` operations and the bundles its bundle
+config files prove), so binding happens per file, in the extractor:
+
+- `form_<x>_alter`, first match wins: (1) a custom form whose `form_id` is
+  `x`; (2) every custom form whose `base_form_id` is `x`; (3) the boundary
+  form whose literal id is `x`; (4) every boundary form whose base id is `x`;
+  (5) `x == <t>_form`: every entity form of entity type `t` (its base form
+  id); (6) every entity form whose id `EntityForm::getFormId()` builds equals
+  `x` exactly — `<t>[_<op>]_form` for a `t` without a `bundle` key (the op
+  left out for `default`), `<t>_<bundle>[_<op>]_form` only for a bundle a
+  shipped config file name proves (`<provider>.<config_prefix>.<bundle>.yml`
+  in a sync store or `config/install|optional`). A match is `alters_form`
+  (`EXTRACTED`, with `bundle` when one was read), and `implements_hook`
+  targets `form_BASE_FORM_ID_alter` when the match came through a base form id
+  and that hook is declared, else `form_FORM_ID_alter`. No match is an
+  `unbound_form` candidate; nothing is guessed, and nothing is `INFERRED`.
+- `<t>_<op>` with `op` one of the operations core declares for `ENTITY_TYPE`
+  (every declared hook whose name contains it): when `t` is a known entity
+  type id, custom or boundary, `hooks_entity_type` and `implements_hook` to
+  `ENTITY_TYPE_<op>`; otherwise it stays a `variable` candidate. A procedural
+  `<ext>_<t>_<op>()` is split as above: the module list and the entity-type
+  list must agree on one split.
+
+`hook_preprocess_HOOK` (P5) and `hook_field_widget_WIDGET_TYPE_form_alter`
+are not bound yet.
+
 ### 5.6 No guessing
 
 Most functions named `<module>_<something>` are ordinary helpers, not hook
@@ -749,6 +887,25 @@ implementations.
 - match against a **known** hook → `implements_hook`, `EXTRACTED`;
 - no match → **no edge**. The function goes to the inventory as a candidate and
   is never presented as a fact.
+
+### 5.7 PHP candidates (P4)
+
+What P4's PHP reading sees but cannot prove goes to the inventory's
+`php_candidates` (rendered under "PHP candidates" in GRAPH_REPORT's Drupal
+coverage section), never to an edge. Every entry has `kind`, `module`, `file`
+and `line`:
+
+| Kind | When | Also carries |
+|---|---|---|
+| `unknown_plugin_type` | a plugin-looking attribute or annotation in `src/Plugin/**` that no learned type reads | `class`, `attribute` |
+| `non_literal_service` | `\Drupal::service()` or `$container->get()` with a non-literal id (`Foo::class` included) | `caller`, `argument` (source text), `via` |
+| `unresolved_receiver` | a call on `$this->p` whose property no §7.3 rule resolves, when the declared type is one some known service implements (so value objects never fill the list) | `class`, `property`, `type`, `method` |
+| `unresolved_event` | a `getSubscribedEvents()` key that is neither a literal nor a resolvable `*Events` constant, or a value naming no listener | `class`, `event` (source text), `method` |
+
+`unbound_form` (§4.5) is a hook candidate. GRAPH_REPORT's "PHP semantics"
+table counts what P4 put in the graph: plugins by type, entity types, forms
+and entity forms, `uses_service` by `via`, `calls` bound statically and by the
+container, `alters_form`, `hooks_entity_type` and `subscribes_to_event`.
 
 ---
 

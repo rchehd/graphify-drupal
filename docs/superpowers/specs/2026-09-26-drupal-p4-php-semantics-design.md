@@ -1,6 +1,6 @@
 # P4 — PHP semantics: plugins, entity types, forms, services, events
 
-Status: approved in brainstorming, awaiting spec review
+Status: implemented (branch `drupal-graph`); measured and closed in §15
 Date: 2026-09-26
 Related: `2026-09-22-drupal-graph-vocabulary.md` §3.4–3.6, §4.2–4.6, §5.4–5.6;
 `2026-09-22-drupal-graphify-architecture-design.md` §5;
@@ -469,3 +469,292 @@ The results go in §15.
 - **Property inference is narrow by design** (§7.3, §7.4). An unresolved
   receiver is a candidate only when its declared type is a known service's,
   so the inventory stays readable.
+
+## 15. Measured and the closing real run
+
+Run on 2026-09-27 against FormsRemote at `60b010db` (Drupal 11.4.7), with no
+drush: the P3 artifact collected on 2026-09-25 (same commit, status `fresh`)
+was reused through `GRAPHIFY_DRUPAL_CONTAINER`.
+
+1. `extract --code-only --out <scratch>/p4` with the artifact, twice;
+2. once without it into `<scratch>/p4-static`;
+3. `cluster-only --no-viz --no-label` on a copy of the first, for the report.
+
+`tests/test_drupal_corpus.py` (P4 section) asserts every number below that is
+a §12 criterion; the container half runs with `DRUPAL_CONTAINER_ARTIFACT`.
+
+### 15.1 Size and time
+
+| | nodes | edges | wall |
+|---|---|---|---|
+| P3, with the artifact | 4,946 | 10,724 | 10.8 s |
+| P3, static | 4,825 | 10,395 | |
+| **P4, with the artifact** (full, cold cache) | **5,051** | **11,523** | 10.9 s |
+| P4, with the artifact, unchanged rerun | 5,051 | 11,523 | 8.3 s |
+| **P4, static** (full, cold cache) | **5,003** | **11,342** | 12.0 s |
+
+- `prepare_run(FormsRemote)`: 2.85, 2.94 and 2.99 s cold (fresh out dir,
+  boundary caches cleared), under the 5 s budget. The corpus timing tests keep
+  that budget but take the best of up to three cold runs. A single run once
+  hit 5.37 s under two concurrent pytest processes (Task 7), which was CPU
+  contention, not the build.
+- The rerun's incremental line: `1142 files cached/unchanged, 2 re-extracted,
+  0 deleted`, the same as P3. The two are the files core never records in its
+  manifest: `docker/mssql/seed.sql` (tree_sitter_sql is not installed) and
+  `webform_integrations_logs.links.action.yml`, which is empty and so has zero
+  nodes. The rerun's graph has the same node ids and edges, with the same
+  attributes, except that 24 core `external` concept nodes (`fieldconfig`, `url`, …) gain
+  `_origin: semantic` from core's incremental merge. That is core behaviour,
+  not a Drupal one.
+- Static, P4 adds 178 nodes to P3: 39 plugins; 62 forms (34 custom and 28
+  entity forms); 8 entity types; 15 `drupal_hook_impl`s (the bound variable
+  hooks); and boundary stubs (27 services, 12 plugin types, 7 hooks, 4 entity
+  types, 3 entity forms), plus 1 core external. It adds 947 edges:
+  `uses_service` 487, `calls` 183, `form_implemented_by` 50, the plugin
+  triple 39 × 3, `entity_handler` 25, `routes_to_form` 25, `hook_implemented_by`
+  15, `implements_hook` 13, `hooks_entity_type` 12, `defines_entity_type` 8,
+  `requires_permission` 8, `alters_form` 3 and `derives_plugins` 1.
+- With the artifact, P4 adds 105 nodes and 799 edges to P3. That is less than
+  statically because P3's container had already added some of them (plugins,
+  and service stubs). The 11 concrete-name hook nodes P3's overlay made
+  (`drupal_hook_node_access`, `drupal_hook_form_webform_edit_form_alter`, …)
+  are gone: those implementations now implement the declared pattern hook
+  statically (§15.2).
+- `pending` edges in graph.json: 0 in all three runs.
+
+### 15.2 The §12 criteria on FormsRemote
+
+| Criterion | Expected | Measured |
+|---|---|---|
+| plugins | about 47 | **39** plugin nodes + **8** entity types (below) |
+| entity types | 8 | **8**: `system`, `task`, `task_workflow`, `webform_integration`, `webform_integration_lim`, `webform_integration_result`, `webform_integrations_log`, `webform_integrations_token` |
+| forms | about 34 | **34** custom forms (= the 34 `getFormId()`s) + **28** entity forms; `routes_to_form` 25, all to form nodes, all `confirmed_by: container` |
+| `uses_service` from all three forms | yes | `service` 35, `shortcut` 96, `create` 193, and `injected` 163: 487 edges |
+| `calls` from resolved receivers | above 0 | **183** static, all to custom method nodes, 0 into the boundary; 0 bound by the container |
+| `alters_form` for the 4 `form_*_alter`s | 4 or explained | **3**, the 4th explained (below) |
+| `hooks_entity_type` for the 6 `ENTITY_TYPE_*`s | 6 or explained | **12**: the 6 `#[Hook]` ones plus 6 procedural ones (below) |
+| unchanged rerun re-extracts no more than P3's two | ≤ 2 | **2** |
+| FormsRemote untouched | yes | yes (§15.5) |
+
+**Plugins: 39 nodes, not about 47.** §2's 47 counts constructs (32
+attributes + 15 annotations), not plugins:
+
+- 8 of the 32 attributes are the entity types, and 3 are `#[EcaAction]`
+  companions of an `#[Action]`, which carry no id and are not plugins. That
+  leaves 21 plugin attributes.
+- 2 of the 15 annotations are `@ViewsField` (`IntegrationUsageCount`,
+  `JsonPretty`). The `views.*` managers build `"Plugin/views/$type"` at
+  runtime, so the registry has no `subdir` or `annotation_class` for them, and
+  both are `unknown_plugin_type` candidates, as §5.1 says. The container knows
+  them: they are two of its eight container-only plugins. That leaves 13
+  plugin annotations.
+- 21 + 13 = 34 classes. Shared subdirs add 5 nodes: `action` and `eca.action`
+  both read `Plugin/Action` + `#[Action]` (×4), and core's `mail` and
+  mailsystem's replacement manager (`class:Drupal\mailsystem\MailsystemManager`)
+  both read `Plugin/Mail` (×1). 34 + 5 = 39.
+
+By type: `webform.element` 6, `webform_integration_type` 6, `action` 4,
+`eca.action` 4, `rest` 3, `element_info` 3, `webform.handler` 3,
+`field.formatter` 2 (one attribute, one annotation), `advancedqueue_job_type`
+2, `system_type` 2, and 1 each of `eca.event`, `eca.condition`, `mail` and
+`class:Drupal\mailsystem\MailsystemManager`. `derives_plugins`: 1 static
+(`eca_custom_webform_submission` → `WebformSubmissionEventDeriver`).
+
+With the artifact, 40 of the 48 own plugin nodes are `runtime: present` and
+8 are `runtime: absent`. The absent ones are:
+
+- eca_custom's 3 actions (`redirect_to_webform`, `task_create_action`,
+  `task_update_action`), each under both `action` and `eca.action`: 6 nodes.
+  eca_custom is enabled, but the container lists none of them. Its
+  `src/Hook/PluginInfoHooks.php` implements `action_info_alter` (a
+  container-only hook implementation in the divergence log), which removes
+  them at runtime.
+- the deriver's base id `eca_custom_webform_submission`. The container lists
+  only the derivative `…:insert`, which the overlay adds as its own node.
+- `webform_integrations_email_smtp` under the mailsystem type. The artifact
+  has no plugin list for that class-keyed type and lists the plugin under
+  `mail`, where it is confirmed.
+
+31 static plugins have `provides_plugin` and `plugin_implemented_by`
+`confirmed_by: container`. The container adds 8 plugins no static reader can
+see: `help_topic` 2, `views.field` 2 and `views_bulk_operations_action` 4.
+
+**Entity types.** `defines_entity_type` 8, `requires_permission` 8 (one
+literal `admin_permission` each), and `entity_handler` 25. Handlers whose
+class is core's or contrib's (24, e.g. `views_data` → `EntityViewsData`,
+`form.delete` → `ContentEntityDeleteForm`) are entries of the node's
+`handlers` map. On 7 entity types one form class serves both `form.add` and
+`form.edit`. That is one edge (one relation per pair) with `handler:
+"form.add,form.edit"`, a vocabulary decision recorded in vocabulary §4.6.
+
+**`alters_form`: 3, not 4.** §2's regex count of `form_*_alter` includes
+govuk_forms' `theme_suggestions_form_element_alter`. That is a
+`theme_suggestions_*_alter` hook, which stays a `variable` candidate for P5.
+The three bound, all `EXTRACTED`, none `INFERRED`:
+
+| implementation | form | how |
+|---|---|---|
+| `eca_custom_form_node_case_viewer_edit_form_alter` | entity form `node`/`edit` | rule 6, `bundle: case_viewer`, proven by `node.type.case_viewer.yml` |
+| `eca_custom_form_node_case_viewer_form_alter` | entity form `node`/`default` | rule 6 (op left out for `default`), `bundle: case_viewer` |
+| `webform_integrations_form_webform_edit_form_alter` | entity form `webform`/`edit` (boundary) | rule 6, `webform` has no bundle key |
+
+Each implements `form_FORM_ID_alter`, and the container confirms it. There
+are 0 `unbound_form` candidates.
+
+**`hooks_entity_type`: 12, not 6.** §2 counted the `#[Hook]` implementations
+only. The six procedural `<ext>_<t>_<op>()` implementations P2b also left as
+`variable` candidates bind by the same rule, once module list and entity-type
+list agree on the split:
+
+- attribute (6): eca_custom `node_access`, `node_view`,
+  `webform_submission_insert`, `webform_submission_presave`,
+  `webform_submission_update`; webform_integrations
+  `webform_submission_insert`;
+- procedural (6): custom_forms `user_access`, `user_presave`; webform_domain
+  `node_access`; webform_integrations_logs `user_predelete`;
+  webform_integrations `webform_presave`, `webform_submission_presave`.
+
+All targets are boundary entity types (`node`, `user`, `webform`,
+`webform_submission`). All 13 `implements_hook` edges to the pattern hooks
+(`entity_type_<op>` and `form_form_id_alter`, one per module and hook) are
+`confirmed_by: container`.
+
+**Events.** Custom code has no `getSubscribedEvents()`, so `subscribes_to_event`
+is 0 statically and there are 0 `unresolved_event` candidates. With the
+artifact, 2 edges are `origin: container`: the two custom route subscribers
+(`DomainRouteSubscriber`, `RouteSubscriber`) → `routing.route_alter`, method
+`onAlterRoutes`.
+
+### 15.3 Service use, calls and the registry
+
+- The registry: 28 shortcuts (below); 211 custom classes with constructor
+  facts; 48 setter-injected properties in 14 classes (`create_props`); 16
+  autowired `src/Hook` classes (`hook_services`); 104 entity types; 374
+  forms and 8 base form ids across core, contrib and custom; `form.<op>`
+  operations for 75 entity types (278 in all); bundle lists for the 8 entity
+  types with a `bundle` key; 168 `*Events` constants; 388
+  aliases.
+- **Shortcuts: 28, not the plan's ~35–40.** The plan counted `->get(` lines
+  in `Drupal.php` (40). The exact-return rule (§7.1) admits only a method
+  whose sole statement is `return static::getContainer()->get('<literal>')`.
+  The other 12 are `service($id)`, `hasRequest()`, `request()`,
+  `cache($bin)`, `classResolver()`'s two (a guarded early return), and the
+  chained `keyValueExpirable`, `config`, `queue`, `keyValue`,
+  `isConfigSyncing` and `logger`. So `\Drupal::config()` and
+  `\Drupal::logger()` give no edge, which is why `shortcut` is 96 edges for
+  §2's 130 `\Drupal::<m>()` sites. Those counts are also per (source, service)
+  pair, not per call site.
+- `service` 35 is the 35 literal `\Drupal::service('x')` sites, one pair each.
+  The other 2 sites use `::class` ids and are `non_literal_service`
+  candidates. `create` 193 is 194 `$container->get(` sites less one `::class`
+  id, also a candidate. No custom code uses an alias, so no edge carries
+  `alias`.
+- 315 of the 487 `uses_service` edges carry `methods`: calls not bound to a
+  custom method, because the class is core's or contrib's. 23 of their
+  `_pending_calls` entries were offered to the container. None was bound: the
+  container gives no service a different class inside the graph. (The 5
+  classes that differ, such as `plugin.manager.mail` → `MailsystemManager`,
+  are all contrib or core.)
+- Every `calls` edge with `service` targets a custom method node; there is
+  never a `calls` edge into the boundary.
+
+**Candidates by kind:**
+
+| Section | Kind | Count | Examples |
+|---|---|---|---|
+| PHP | `unresolved_receiver` | 24 | `DeploymentStatusCommands::$deploymentStatus` and `::$dateFormatter` (12 calls; a Drush command class built by Drush's `AutowireTrait`, which no §7.3 rule reads), `IntegrationImportForm::$logger` (10; `LoggerInterface`, passed `$container->get('logger.factory')->get(…)`, a chain, so unknown), `TaskListFilterForm::$stageDirectory` (2; its `create()` passes a `::class` id) |
+| PHP | `non_literal_service` | 3 | `$container->get(WorkflowStageDirectory::class)` in `TaskListFilterForm::create`; `\Drupal::service(WorkflowStageDirectory::class)` in `TaskListAllowedValues`; `\Drupal::service(TaskSummaryUpdater::class)` in `TaskSummaryBatch` |
+| PHP | `unknown_plugin_type` | 2 | `@ViewsField` on `IntegrationUsageCount`, `JsonPretty` |
+| PHP | `unresolved_event` | 0 | |
+| hook | `variable` | 9 | `preprocess_*` 7, `theme_suggestions_*_alter` 2 (P5) |
+| hook | `undeclared` | 3 | eca_custom's `action_info_alter`, `eca_condition_info_alter`, `eca_event_info_alter` |
+| hook | `unknown_receiver` | 14 | all in custom `tests/` (`ReflectionMethod::invoke`, a unit test's `alter()` helper) |
+| hook | `unbound_form` | 0 | |
+
+GRAPH_REPORT's "PHP semantics" table, with the artifact: plugins 48 (the
+static 39, plus the container's 8, plus the eca.event derivative), entity
+types 8, forms 34, entity forms 28, `uses_service` `create 193, injected 163,
+service 35, shortcut 96`, calls bound 183 static and 0 by the container,
+`alters_form` 3, `hooks_entity_type` 12, `subscribes_to_event` 2.
+
+### 15.4 Rulings and deviations made during implementation
+
+These are recorded where the spec states the rule. They are listed here so
+the phase can be reviewed in one place.
+
+- Setter injection (`$instance->p = $container->get('x')` in `create()`) is
+  in scope, as §7.3 rule 1b (`create_props`, §7.2). Only a direct property
+  assignment with a literal id counts.
+- Annotations match by short name, as Drupal's reader does, unless a `use`
+  or a leading `\` fixes a different FQCN (§5.1).
+- Rule 3b: a custom `src/Hook/` class with a `#[Hook]` attribute, defined by
+  no `*.services.yml`, is autowired, as `HookCollectorPass` does (§7.3).
+- `uses_service` has the `injected` carrier for rules 2–4 and for properties
+  resolved through an ancestor (§7.1). Rule 1 through an ancestor applies
+  only to `new static(…)` or the exact class. The target is
+  `service_id(resolve_alias(x))`.
+- Binding of `form_*_alter` and `ENTITY_TYPE_*` happens per file, in
+  `hooks.py`, against the registry's maps. `unbound_form` replaces the
+  `variable` candidate for a `form_*_alter`. An entity-form alter needs an
+  exact `EntityForm::getFormId()` match: with a bundle key, only for a bundle
+  a config file name proves (sync, `config/install` or `config/optional`:
+  what the site ships, as for all static facts). There are no `INFERRED`
+  edges. A base-form match targets `form_BASE_FORM_ID_alter` when that hook
+  is declared (§6.1–§6.2, amended in Task 5).
+- One class serving several entity handlers gives one `entity_handler` edge
+  with a comma-joined `handler` (vocabulary §4.6).
+- The incremental rules live in `graphify/drupal/staleness.py` (`discovery.py`
+  was too large). `affected_files` forces:
+  - the class file of every service whose wiring changed;
+  - the users of a changed alias;
+  - the classes whose `hook_services` membership changed;
+  - the hook files, when forms, base forms, entity types, entity-form
+    handlers, bundles, extension info or event constants change;
+  - every custom file, when the shortcut map changes (§9, widened).
+- The inventory's PHP candidates are cached in
+  `<out>/drupal-php-candidates.json`, keyed by file stat and a digest of the
+  registry and the extractor's code.
+
+### 15.5 FormsRemote untouched
+
+Before and after all three runs, and again after the final test suite:
+
+- `git -C FormsRemote status --porcelain` was `?? docs/` (the user's own
+  untracked directory, which was already there);
+- `FormsRemote/graphify-out/` held one file, `cache/stat-index.json`, whose
+  mtime (2026-09-24) and size were identical.
+
+Nothing was written into the corpus, and no drush, ddev or docker command was
+run. `test_p4_an_unchanged_rerun_re_extracts_two_files_and_the_corpus_is_untouched`
+checks both in every corpus run.
+
+### 15.6 Defects
+
+The closing run found no P4 defect. Every number that differs from §2 or §12
+is explained above by what the corpus holds, not by a fix. Two test issues
+were fixed:
+
+- the `<5 s` timing flake, now best of three cold runs with the budget kept;
+- an unused import in `tests/test_drupal_container_overlay.py`.
+
+Final suite: 6,501 passed, 100 skipped, and the 4 known
+`test_ollama_retry_cap` failures (`openai` is not installed). `-k drupal`
+with `DRUPAL_CONTAINER_ARTIFACT` set: 774 passed, and 4 skipped for missing
+optional dependencies (`falkordb`, `docx`, tree-sitter-sql, `mcp`).
+
+### 15.7 Left for later phases
+
+- `preprocess_*` and `theme_suggestions_*` (9 candidates) are P5.
+- `views.*` plugins from PHP need the dynamic `Plugin/views/$type` subdirs
+  (2 candidates).
+- Chains beyond the first call, and receivers outside §7.3/§7.4 (the 24
+  `unresolved_receiver`s), need return and parameter types. Drush's
+  `AutowireTrait` (12 of them) would be a rule of its own.
+- The deferred minors in the P4 ledger, all reviewed as non-blocking:
+  - `php_classes.py` is large enough to split, and its Doctrine reader could
+    be its own module;
+  - `<ext>.post_update.php` is not read;
+  - a `RemoveHook`-emptied class is still treated as autowired;
+  - the default form of a bundle-less type is labelled
+    `form_BASE_FORM_ID_alter`;
+  - `_sync_config_names` does not consult `is_ignored`.
