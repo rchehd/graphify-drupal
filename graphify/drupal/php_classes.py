@@ -1591,6 +1591,169 @@ def read_service_sites(path: Path, source: bytes | None = None,
         return [], []
 
 
+# -- getSubscribedEvents() (spec §8) --
+
+
+@dataclass(frozen=True)
+class SubscribedEvent:
+    """One key of a class's `getSubscribedEvents()` array."""
+    class_name: str      # the short class name, as declared
+    fqcn: str
+    line: int            # the key's line
+    event: str           # a string literal key, else ""
+    constant: str        # `X::NAME` resolved to "Fqcn::NAME", else ""
+    raw: str             # the key's source text, verbatim
+    #: `(method, priority)` per listener; priority 0 when left out (Symfony's
+    #: default), None when it is not an integer literal.
+    listeners: tuple[tuple[str, int | None], ...]
+
+
+def _int_literal(node: "tree_sitter.Node | None") -> int | None:
+    if node is None:
+        return None
+    if node.type == "integer" or (node.type == "unary_op_expression"
+                                  and [c.type for c in node.named_children] == ["integer"]):
+        try:
+            return int("".join(_text(node).split()).replace("_", ""), 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _array_values(node: "tree_sitter.Node") -> "list[tuple[tree_sitter.Node | None, tree_sitter.Node]]":
+    """`(key or None, value)` per element of an array literal."""
+    out: list[tuple[tree_sitter.Node | None, tree_sitter.Node]] = []
+    for element in node.named_children:
+        if element.type != "array_element_initializer" or not element.named_children:
+            continue
+        parts = [c for c in element.named_children if c.type != "comment"]
+        if len(parts) == 2:
+            out.append((parts[0], parts[1]))
+        elif len(parts) == 1:
+            out.append((None, parts[0]))
+    return out
+
+
+def _listener(node: "tree_sitter.Node") -> tuple[str, int | None] | None:
+    """`'m'` or `['m']` / `['m', <priority>]`."""
+    method = _literal_string(node)
+    if method is not None:
+        return (method, 0) if method else None
+    if node.type != "array_creation_expression":
+        return None
+    values = [v for k, v in _array_values(node) if k is None]
+    method = _literal_string(values[0]) if values else None
+    if not method or len(values) > 2:
+        return None
+    return method, (_int_literal(values[1]) if len(values) == 2 else 0)
+
+
+def _listeners(node: "tree_sitter.Node") -> list[tuple[str, int | None]]:
+    """A key's value: `'m'`, `['m', prio]`, or a list of those."""
+    one = _listener(node)
+    if one is not None:
+        return [one]
+    if node.type != "array_creation_expression":
+        return []
+    found = [_listener(v) for k, v in _array_values(node) if k is None]
+    return [f for f in found if f is not None]
+
+
+def _event_key(node: "tree_sitter.Node", fqcn: str, namespace: str,
+               uses: dict[str, str]) -> tuple[str, str]:
+    """`(literal, "Fqcn::NAME")` of an event key; both "" for anything else."""
+    literal = _literal_string(node)
+    if literal is not None:
+        return literal, ""
+    if node.type != "class_constant_access_expression" or len(node.named_children) != 2:
+        return "", ""
+    scope, name = node.named_children
+    if name.type != "name":
+        return "", ""
+    scope_text = _text(scope)
+    if scope.type == "relative_scope":
+        if scope_text not in ("self", "static"):
+            return "", ""
+        owner = fqcn
+    elif scope.type in ("name", "qualified_name"):
+        owner = resolve_name(scope_text, namespace, uses)
+    else:
+        return "", ""
+    return "", f"{owner}::{_text(name)}"
+
+
+def _subscribed_events(class_node: "tree_sitter.Node", namespace: str,
+                       uses: dict[str, str]) -> list[SubscribedEvent]:
+    """The keys of `getSubscribedEvents()`'s returned array: a returned array
+    literal, or a returned variable built with `$v = [...]`, `$v[K] = V` and
+    `$v[K][] = V`. Keys in source order, listeners of a repeated key joined."""
+    name = _text(class_node.child_by_field_name("name"))
+    body = class_node.child_by_field_name("body")
+    method = _find_method(body, "getSubscribedEvents") if body is not None and name else None
+    method_body = method.child_by_field_name("body") if method is not None else None
+    if method_body is None:
+        return []
+    fqcn = resolve_name(name, namespace, uses)
+    nodes = list(_walk_scope(method_body))
+    returned = {_variable(n.named_children[0]) for n in nodes
+                if n.type == "return_statement" and len(n.named_children) == 1}
+    returned.discard("")
+    entries: list[tuple[tree_sitter.Node, list[tuple[str, int | None]]]] = []
+
+    def add_array(array: "tree_sitter.Node") -> None:
+        for key, value in _array_values(array):
+            if key is not None:
+                entries.append((key, _listeners(value)))
+
+    for n in nodes:
+        if n.type == "return_statement" and len(n.named_children) == 1 \
+                and n.named_children[0].type == "array_creation_expression":
+            add_array(n.named_children[0])
+        if n.type != "assignment_expression":
+            continue
+        left, right = n.child_by_field_name("left"), n.child_by_field_name("right")
+        if left is None or right is None:
+            continue
+        if _variable(left) in returned and right.type == "array_creation_expression":
+            add_array(right)
+            continue
+        if left.type != "subscript_expression" or not left.named_children:
+            continue
+        inner = left.named_children
+        if len(inner) == 1 and inner[0].type == "subscript_expression" \
+                and len(inner[0].named_children) == 2 \
+                and _variable(inner[0].named_children[0]) in returned:
+            one = _listener(right)            # `$v[K][] = V`: one listener
+            entries.append((inner[0].named_children[1], [one] if one is not None else []))
+        elif len(inner) == 2 and _variable(inner[0]) in returned:
+            entries.append((inner[1], _listeners(right)))
+
+    merged: dict[str, SubscribedEvent] = {}
+    for key, listeners in entries:
+        raw = _text(key)
+        literal, constant = _event_key(key, fqcn, namespace, uses)
+        ident = literal or constant or raw
+        found = merged.get(ident)
+        if found is None:
+            merged[ident] = SubscribedEvent(name, fqcn, key.start_point[0] + 1, literal, constant,
+                                            raw, tuple(listeners))
+        else:
+            merged[ident] = SubscribedEvent(found.class_name, fqcn, found.line, found.event,
+                                            found.constant, found.raw,
+                                            found.listeners + tuple(listeners))
+    return list(merged.values())
+
+
+def _events_of(root: "tree_sitter.Node") -> list[SubscribedEvent]:
+    out: list[SubscribedEvent] = []
+    for class_node, namespace, uses in _classes(root):
+        try:
+            out.extend(_subscribed_events(class_node, namespace, uses))
+        except Exception:
+            continue
+    return out
+
+
 @dataclass(frozen=True)
 class FileSemantics:
     """`read_class_semantics` plus `read_service_sites`, from one parse."""
@@ -1601,6 +1764,8 @@ class FileSemantics:
     service_calls: list[ServiceCall]
     #: every `$this->p` read or called (not assigned), for `via: injected`
     property_uses: list[PropertyUse] = field(default_factory=list)
+    #: `getSubscribedEvents()` keys (spec §8)
+    events: list[SubscribedEvent] = field(default_factory=list)
 
 
 def read_file_semantics(path: Path) -> FileSemantics:
@@ -1617,4 +1782,5 @@ def read_file_semantics(path: Path) -> FileSemantics:
         uses, calls, properties = _service_sites(root)
     except Exception:
         uses, calls, properties = [], [], []
-    return FileSemantics(facts, annotations, attributed, uses, calls, properties)
+    events = _events_of(root) if b"getSubscribedEvents" in parsed[0] else []
+    return FileSemantics(facts, annotations, attributed, uses, calls, properties, events)

@@ -773,14 +773,17 @@ def test_p2b_criterion_3_no_custom_hook_is_silent(p2b):
                    if e["relation"] == "hook_implemented_by"}
     candidates = {(c["file"], c["line"]) for c in inventory["hook_candidates"]}
     assert [s for s in attributes + procedural if s not in implemented | candidates] == []
-    assert len({s for s in attributes if s in implemented}) == 19
+    # 19 literal, declared hooks + 8 variable ones P4 Task 5 binds (2
+    # `form_*_alter`, 6 `ENTITY_TYPE_*`).
+    assert len({s for s in attributes if s in implemented}) == 27
     assert {s for s in procedural if s not in implemented} == set()
 
     by_kind = collections.Counter(c["kind"] for c in inventory["hook_candidates"])
-    # 24 variable-segment names (form_*_alter, preprocess_*, *_access, ...) and
+    # 9 variable-segment names (preprocess_*, theme_suggestions_*: P5) -- the
+    # 15 form alters and entity-type hooks are bound since P4 Task 5 -- and
     # 3 plugin-info alters no `*.api.php` declares. The invocation-site
     # entries (`unknown_receiver`) are in test_p2b_invocations.
-    assert (by_kind["variable"], by_kind["undeclared"]) == (24, 3)
+    assert (by_kind["variable"], by_kind["undeclared"]) == (9, 3)
     assert inventory["summary"]["hook_candidates"] == len(inventory["hook_candidates"])
 
 
@@ -788,13 +791,14 @@ def test_p2b_criterion_4_every_hook_implemented_by_target_exists(p2b):
     extraction = p2b["extraction"]
     ids = {n["id"] for n in extraction["nodes"]}
     by = [e for e in extraction["edges"] if e["relation"] == "hook_implemented_by"]
-    assert len(by) == 42
+    # 42 literal, declared hooks + 15 variable ones bound (P4 Task 5).
+    assert len(by) == 57
     assert [e["target"] for e in by if e["target"] not in ids] == []
     assert [e["source"] for e in by if e["source"] not in ids] == []
     impls = [n for n in extraction["nodes"] if n.get("type") == "drupal_hook_impl"]
-    # One node per (module, hook): 42 implementations share 39 nodes.
-    assert len(impls) == 39
-    assert collections.Counter(n["via"] for n in impls) == {"attribute": 17, "procedural": 22}
+    # One node per (module, hook): 57 implementations share 54 nodes.
+    assert len(impls) == 54
+    assert collections.Counter(n["via"] for n in impls) == {"attribute": 25, "procedural": 29}
 
 
 def test_p2b_criterion_5_registry_and_boundary_under_five_seconds(tmp_path):

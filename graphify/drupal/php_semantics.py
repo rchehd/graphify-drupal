@@ -57,6 +57,7 @@ PENDING_PROPERTY_CALL = "property_call"
 _UNKNOWN_PLUGIN_TYPE = "unknown_plugin_type"
 _NON_LITERAL_SERVICE = "non_literal_service"
 _UNRESOLVED_RECEIVER = "unresolved_receiver"
+_UNRESOLVED_EVENT = "unresolved_event"
 _PLUGIN_DIR = "Plugin/"
 _ENTITY_KINDS = {"ContentEntityType": "content", "ConfigEntityType": "config"}
 #: Literal entity type attributes copied onto the node (spec §5.3).
@@ -145,6 +146,7 @@ class _File:
     service_uses: list = field(default_factory=list)
     service_calls: list = field(default_factory=list)
     property_uses: list = field(default_factory=list)
+    events: list = field(default_factory=list)
     nodes: list[dict[str, Any]] = field(default_factory=list)
     edges: list[dict[str, Any]] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -211,6 +213,7 @@ def _read(path: Path, core_result: dict | None, registry: Any = None) -> _File |
         stem=_file_stem(path), facts=read.facts, annotations=read.annotations,
         attributed=read.attributed, service_uses=read.service_uses,
         service_calls=read.service_calls, property_uses=read.property_uses,
+        events=read.events,
     )
 
 
@@ -258,13 +261,17 @@ class _Declared:
 
 
 def _declarations(f: _File) -> list[_Declared]:
+    return _declarations_of(f.attributed, f.annotations)
+
+
+def _declarations_of(attributed: list, annotations: list) -> list[_Declared]:
     found: list[_Declared] = []
-    names = {cls.fqcn: cls.name for cls in f.attributed}
-    for cls in f.attributed:
+    names = {cls.fqcn: cls.name for cls in attributed}
+    for cls in attributed:
         for attribute in cls.attributes:
             found.append(_Declared(cls.fqcn, cls.name, attribute.line,
                                    _attribute_values(attribute), attribute=attribute.name))
-    for fqcn, annotation in f.annotations:
+    for fqcn, annotation in annotations:
         found.append(_Declared(fqcn, names.get(fqcn, _short(fqcn)), annotation.line,
                                dict(annotation.values), short=annotation.short,
                                name=annotation.name, imported=annotation.imported))
@@ -396,6 +403,54 @@ def entity_form_pattern(entity_type: str, operation: str) -> str:
     if operation == "default":
         return f"{entity_type}_*_form"
     return f"{entity_type}_*_{operation}_form"
+
+
+_ENTITY_FORM_OPS_ATTR = "_drupal_entity_form_ops"
+
+
+def entity_form_operations(registry: Any, entity_type: str) -> tuple[str, ...]:
+    """The `form.<op>` operations entity type `entity_type` declares, custom
+    or boundary: its class (the registry's `entity_types`) re-read on first
+    use and cached on the registry object. The same reading as the per-file
+    extractor's entity forms (`_entity_form`). Empty when the class file is
+    unknown or unreadable; never raises."""
+    cache = getattr(registry, _ENTITY_FORM_OPS_ATTR, None)
+    if cache is None:
+        cache = {}
+        try:
+            setattr(registry, _ENTITY_FORM_OPS_ATTR, cache)
+        except Exception:
+            pass
+    found = cache.get(entity_type)
+    if found is None:
+        try:
+            found = cache[entity_type] = _read_entity_form_operations(registry, entity_type)
+        except Exception:
+            found = cache[entity_type] = ()
+    return found
+
+
+def _read_entity_form_operations(registry: Any, entity_type: str) -> tuple[str, ...]:
+    from graphify.drupal.php_classes import read_class_semantics
+    from graphify.drupal.resolvers import _class_file
+
+    entry = (registry.entity_types or {}).get(entity_type)
+    if not entry or len(entry) < 2:
+        return ()
+    fqcn = str(entry[1])
+    file = _class_file(registry, fqcn)
+    if not file:
+        return ()
+    _facts, annotations, attributed = read_class_semantics(Path(file))
+    ops: list[str] = []
+    for d in _declarations_of(attributed, annotations):
+        if d.class_fqcn != fqcn or d.values.get("id") != entity_type or not _entity_kind(d):
+            continue
+        for name in _handlers(d.values.get("handlers")):
+            op = name[len(_FORM_HANDLER):] if name.startswith(_FORM_HANDLER) else ""
+            if op and "." not in op and op not in ops:
+                ops.append(op)
+    return tuple(ops)
 
 
 def _entity_form(f: _File, entity_type: str, operation: str, fqcn: str, line: int) -> None:
@@ -589,8 +644,47 @@ def _injected(f: _File, classes: dict[str, str]) -> None:
                        target_name=service, properties=sorted(props))
 
 
+# -- events (spec §8) --------------------------------------------------------------------
+
+
+def event_id(name: str) -> str:
+    return make_id("drupal", "event", name)
+
+
+def _events(f: _File) -> None:
+    """`subscribes_to_event` (class -> `drupal_event`) for each key of a
+    class's `getSubscribedEvents()` that is a string literal or a class
+    constant the registry's `event_constants` resolves; any other key is an
+    `unresolved_event` candidate. `method` lists the key's listeners
+    (comma-joined, one edge per class and event); `priority` is the
+    listener's integer priority when there is one listener, `priorities`
+    the list when there are several."""
+    if not f.src_rel or not f.events:
+        return
+    constants = f.registry.event_constants or {}
+    for key in f.events:
+        name = key.event or constants.get(key.constant, "")
+        methods = [m for m, _p in key.listeners]
+        if not name:
+            f.candidate(_UNRESOLVED_EVENT, key.line, **{
+                "class": key.fqcn, "event": key.raw, "method": ",".join(methods)})
+            continue
+        source = f.class_node(key.class_name)
+        if source is None or not methods:
+            continue
+        priorities = [p for _m, p in key.listeners]
+        extra: dict[str, Any] = {"method": ",".join(methods)}
+        if len(priorities) == 1:
+            if priorities[0] is not None:
+                extra["priority"] = priorities[0]
+        elif all(p is not None for p in priorities):
+            extra["priorities"] = priorities
+        f.add_edge(source, event_id(name), "subscribes_to_event", key.line, target_name=name, **extra)
+
+
 #: Every producer, run in order over one file's reading. Tasks 3-5 add theirs.
-_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types, _forms, _services)
+_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types, _forms, _services,
+                                                   _events)
 
 
 def _run(path: Path, core_result: dict | None, registry: Any = None) -> dict[str, Any]:

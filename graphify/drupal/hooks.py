@@ -219,6 +219,17 @@ def _is_hook_class_file(path: Path, registry: Any) -> bool:
 
 
 @dataclass(frozen=True)
+class _Binding:
+    """A variable hook bound through the registry's inventories (P4 spec
+    §6.2-§6.3): the declared pattern hook it implements, and the node(s) it
+    is about."""
+    declared: str                                  # "form_FORM_ID_alter", "ENTITY_TYPE_<op>"
+    relation: str                                  # "alters_form" | "hooks_entity_type"
+    targets: tuple[tuple[str, str, str], ...]      # (node id, target_name, confidence)
+    attrs: tuple[tuple[str, str], ...] = ()        # impl node attributes
+
+
+@dataclass(frozen=True)
 class _Impl:
     module: str
     hook: str
@@ -228,6 +239,7 @@ class _Impl:
     class_name: str = ""
     method: str = ""
     order: str = ""
+    binding: _Binding | None = None
 
 
 _PATTERN_CACHE_ATTR = "_drupal_hook_patterns"
@@ -258,6 +270,158 @@ def _classify(name: str, registry: Any) -> tuple[str, str]:
         if regex.fullmatch(name):
             return "variable", pattern
     return "undeclared", ""
+
+
+# -- variable hooks bound (P4 spec §6.2-§6.3) -----------------------------------------
+
+FORM_ALTER = "form_FORM_ID_alter"
+_FORM_ALTER_PATTERN = hook_pattern(FORM_ALTER)
+_FORM_ALTER_NAME = re.compile(r"form_(.+)_alter")
+ENTITY_TYPE_PREFIX = "ENTITY_TYPE_"
+_ENTITY_OPS_ATTR = "_drupal_entity_type_ops"
+#: `_bind`'s answer for a `form_<x>_alter` no inventory knows: `(marker, x)`.
+_UNBOUND_FORM = "unbound_form"
+
+
+def _entity_type_ops(registry: Any) -> frozenset[str]:
+    """`<op>` of every declared `ENTITY_TYPE_<op>` hook with no further
+    variable segment, cached on the registry object."""
+    cached = getattr(registry, _ENTITY_OPS_ATTR, None)
+    if cached is None:
+        cached = frozenset(
+            name[len(ENTITY_TYPE_PREFIX):] for name in registry.hooks
+            if name.startswith(ENTITY_TYPE_PREFIX) and len(name) > len(ENTITY_TYPE_PREFIX)
+            and not hook_pattern(name[len(ENTITY_TYPE_PREFIX):]))
+        try:
+            setattr(registry, _ENTITY_OPS_ATTR, cached)
+        except Exception:
+            pass
+    return cached
+
+
+def _entity_form_regex(pattern: str) -> "re.Pattern[str]":
+    """`php_semantics.entity_form_pattern`'s `_*` is the optional `_<bundle>`
+    of `EntityForm::getFormId()` (`<entity>[_<bundle>][_<op>]_form`)."""
+    return re.compile("(?:_.+)?".join(re.escape(part) for part in pattern.split("_*")))
+
+
+def _form_targets(x: str, registry: Any) -> tuple[tuple[str, str, str], ...]:
+    """The form(s) `form_<x>_alter` alters: a custom form whose literal
+    `getFormId()` is `x`, else every custom form whose `getBaseFormId()` is
+    `x`, else the registry's boundary form `x`, else the one entity form
+    whose pattern matches `x` most literally (`INFERRED`: the bundle is a
+    runtime value). Empty when nothing matches or two entity forms tie."""
+    from graphify.drupal.php_semantics import entity_form_id, entity_form_operations, \
+        entity_form_pattern, form_id
+
+    facts = [f for f in (registry.class_facts or {}).values() if isinstance(f, dict)]
+    if any(f.get("form_id") == x for f in facts):
+        return ((form_id(x), x, "EXTRACTED"),)
+    based = sorted({f["form_id"] for f in facts
+                    if f.get("base_form_id") == x and isinstance(f.get("form_id"), str) and f["form_id"]})
+    if based:
+        return tuple((form_id(i), i, "EXTRACTED") for i in based)
+    if x in (registry.forms or {}):
+        return ((form_id(x), x, "EXTRACTED"),)
+    matches: list[tuple[int, str, str]] = []
+    for entity_type in registry.entity_types or {}:
+        if not x.startswith(entity_type + "_"):
+            continue
+        for op in entity_form_operations(registry, entity_type):
+            pattern = entity_form_pattern(entity_type, op)
+            if _entity_form_regex(pattern).fullmatch(x):
+                literal = len(pattern.replace("_*", ""))
+                matches.append((literal, entity_form_id(entity_type, op), pattern))
+    if not matches:
+        return ()
+    best = max(m[0] for m in matches)
+    winners = {(nid, pattern) for literal, nid, pattern in matches if literal == best}
+    if len(winners) != 1:
+        return ()
+    nid, pattern = next(iter(winners))
+    return ((nid, pattern, "INFERRED"),)
+
+
+def _entity_split(name: str, module: str, registry: Any, function: str) -> tuple[str, str] | None:
+    """`(entity type, op)` of `<t>_<op>` implemented by `module`, when the
+    entity type list and the op list agree on one split (vocabulary §5.5).
+    A procedural `function` must also read that one way across the module
+    list: another module `m` with `function == m_<t'>_<op'>` for a known
+    `t'` and `op'` makes it ambiguous. None otherwise."""
+    ops = _entity_type_ops(registry)
+    types = registry.entity_types or {}
+
+    def splits(rest: str) -> list[tuple[str, str]]:
+        return [(rest[:i], rest[i + 1:]) for i, ch in enumerate(rest)
+                if ch == "_" and rest[:i] in types and rest[i + 1:] in ops]
+
+    found = [(module, t, op) for t, op in splits(name)]
+    if function:
+        modules = registry.extension_info or registry.extensions or {}
+        for other in modules:
+            if other != module and function.startswith(other + "_"):
+                found += [(other, t, op) for t, op in splits(function[len(other) + 1:])]
+    if len(found) != 1 or found[0][0] != module:
+        return None
+    return found[0][1], found[0][2]
+
+
+def _bind(pattern: str, name: str, module: str, registry: Any,
+          function: str = "") -> _Binding | tuple[str, str] | None:
+    """A `variable` hook of the two patterns P4 binds, bound (spec §6.2-§6.3):
+    a `_Binding`; `(_UNBOUND_FORM, x)` for a `form_<x>_alter` no form
+    inventory knows; None for anything that stays P2b's candidate."""
+    from graphify.drupal.php_semantics import entity_type_id
+
+    if pattern == _FORM_ALTER_PATTERN and FORM_ALTER in registry.hooks:
+        match = _FORM_ALTER_NAME.fullmatch(name)
+        if match is None:
+            return None
+        x = match.group(1)
+        targets = _form_targets(x, registry)
+        if not targets:
+            return _UNBOUND_FORM, x
+        return _Binding(FORM_ALTER, "alters_form", targets, (("form_id", x),))
+    ops = _entity_type_ops(registry)
+    if not (pattern.startswith("*_") and pattern[2:] in ops):
+        return None
+    split = _entity_split(name, module, registry, function)
+    if split is None:
+        return None
+    entity_type, op = split
+    return _Binding(ENTITY_TYPE_PREFIX + op, "hooks_entity_type",
+                    ((entity_type_id(entity_type), entity_type, "EXTRACTED"),),
+                    (("entity_type", entity_type), ("operation", op)))
+
+
+def declared_hook_of(registry: Any, module: str, name: str) -> str:
+    """The declared pattern hook a concrete variable hook `name` of `module`
+    implements (`form_FORM_ID_alter`, `ENTITY_TYPE_<op>`) when it binds as
+    an attribute implementation would (the module given, not split), else
+    "". For the P3 overlay, whose container names the concrete hook."""
+    try:
+        if registry is None or name in registry.hooks:
+            return ""
+        kind, pattern = _classify(name, registry)
+        bound = _bind(pattern, name, module, registry) if kind == "variable" else None
+        return bound.declared if isinstance(bound, _Binding) else ""
+    except Exception:
+        return ""
+
+
+def _variable(impls: list[_Impl], candidates: list[dict], impl: _Impl, pattern: str,
+              path: Path, registry: Any, function: str = "") -> None:
+    """A `variable` hook: an implementation when `_bind` binds it, else an
+    `unbound_form` or P2b's `variable` candidate."""
+    bound = _bind(pattern, impl.hook, impl.module, registry, function)
+    if isinstance(bound, _Binding):
+        impls.append(_Impl(impl.module, impl.hook, impl.via, impl.line, impl.function,
+                           impl.class_name, impl.method, impl.order, bound))
+    elif isinstance(bound, tuple):
+        candidates.append({"kind": _UNBOUND_FORM, "module": impl.module, "name": impl.hook,
+                           "form_id": bound[1], "file": str(path), "line": impl.line})
+    else:
+        candidates.append(_candidate("variable", impl.module, impl.hook, path, impl.line, pattern))
 
 
 def _candidate(kind: str, module: str, name: str, path: Path, line: int, pattern: str = "") -> dict:
@@ -294,7 +458,9 @@ def _procedural(path: Path, ext: str, registry: Any, impls: list[_Impl], candida
         if kind == "declared":
             impls.append(_Impl(ext, rest, "procedural", function.line, function=function.name))
         elif kind == "variable":
-            candidates.append(_candidate(kind, ext, rest, path, function.line, pattern))
+            _variable(impls, candidates, _Impl(ext, rest, "procedural", function.line,
+                                               function=function.name),
+                      pattern, path, registry, function.name)
         elif _claims_a_hook(function, rest, path):
             candidates.append(_candidate(kind, ext, rest, path, function.line))
 
@@ -342,6 +508,10 @@ def _attribute(path: Path, owner: str, class_name: str, method: str, class_level
     if kind == "declared":
         impls.append(_Impl(module, name, "attribute", attribute.line,
                            class_name=class_name, method=method, order=order))
+    elif kind == "variable":
+        _variable(impls, candidates, _Impl(module, name, "attribute", attribute.line,
+                                           class_name=class_name, method=method, order=order),
+                  pattern, path, registry)
     else:
         candidates.append(_candidate(kind, module, name, path, attribute.line, pattern))
 
@@ -440,15 +610,25 @@ def _extract_hook_implementations(path: Path, core_result: dict) -> dict[str, An
                 attrs.update(class_name=impl.class_name, method=impl.method)
             if impl.order:
                 attrs["order"] = impl.order
+            if impl.binding is not None:
+                attrs["declared_hook"] = impl.binding.declared
+                attrs.update(impl.binding.attrs)
             nodes.append(node(impl_id, f"{impl.module}:{impl.hook}", type="drupal_hook_impl",
                               layer="hook", path=path, line=impl.line, **attrs))
-        declaration = registry.hooks.get(impl.hook)
+        # A bound variable hook implements its declared pattern hook
+        # (`form_FORM_ID_alter`), never a hook node of its concrete name.
+        implemented = impl.binding.declared if impl.binding is not None else impl.hook
+        declaration = registry.hooks.get(implemented)
         if declaration is None or declaration.provider != impl.module:
             # One relation per ordered node pair: an extension implementing
             # its own hook already has `declares_hook` to it, so the pair is
             # not doubled (the impl node and `hook_implemented_by` still say it).
-            add_edge(extension_id(impl.module), hook_id(impl.hook), "implements_hook", impl.line,
-                     owner=impl.module, target_name=impl.hook)
+            add_edge(extension_id(impl.module), hook_id(implemented), "implements_hook", impl.line,
+                     owner=impl.module, target_name=implemented)
+        if impl.binding is not None:
+            for target, target_name, confidence in impl.binding.targets:
+                add_edge(impl_id, target, impl.binding.relation, impl.line,
+                         target_name=target_name, confidence=confidence)
         if impl.function:
             target = _make_id(stem, impl.function)
         else:

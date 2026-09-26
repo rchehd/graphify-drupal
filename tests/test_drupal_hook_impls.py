@@ -256,10 +256,11 @@ def test_procedural_implementations(tmp_path, _isolated_discovery_state):
         (extension_id("foo"), "implements_hook", hook_id("cron")),
         (impl, "hook_implemented_by", _core_id(core_result, "foo_cron()")),
     }
-    # `form_user_login_form_alter` only matches a variable hook: no edge.
+    # `form_user_login_form_alter` matches a variable hook, and no form
+    # inventory knows `user_login_form` (P4 Task 5): no edge.
     assert result["hook_candidates"] == [{
-        "kind": "variable", "module": "foo", "name": "form_user_login_form_alter",
-        "pattern": "form_*_alter", "file": str(path), "line": 14,
+        "kind": "unbound_form", "module": "foo", "name": "form_user_login_form_alter",
+        "form_id": "user_login_form", "file": str(path), "line": 14,
     }]
 
 
@@ -424,16 +425,16 @@ def test_the_inventory_lists_every_candidate_of_the_detected_files(tmp_path, _is
     inventory = build_inventory(registry, detected, root)
 
     assert inventory["hook_candidates"] == [
+        {"kind": "unbound_form", "module": "foo", "name": "form_user_login_form_alter",
+         "form_id": "user_login_form", "file": f"{FOO}/foo.module", "line": 14},
         {"kind": "undeclared", "module": "bar", "name": "node_insert",
          "file": f"{FOO}/src/Hook/FooHooks.php", "line": 18},
         {"kind": "undeclared", "module": "foo", "name": "views_data",
          "file": f"{FOO}/foo.views.inc", "line": 6},
-        {"kind": "variable", "module": "foo", "name": "form_user_login_form_alter",
-         "pattern": "form_*_alter", "file": f"{FOO}/foo.module", "line": 14},
     ]
     assert inventory["summary"]["hook_candidates"] == 3
     text = render_section(inventory)
-    assert "### Hook candidates\n- undeclared: 2\n- variable: 1" in text
+    assert "### Hook candidates\n- unbound_form: 1\n- undeclared: 2" in text
 
 
 def test_the_inventory_counts_only_detected_files(tmp_path, _isolated_discovery_state):
@@ -498,10 +499,13 @@ def test_corpus_custom_implementations_are_edges_or_candidates(tmp_path, _isolat
             candidates[c["kind"]] = candidates.get(c["kind"], 0) + 1
     # Measured on FormsRemote (task-4-report.md): spec §2 counts 19 attribute
     # hooks naming a declared hook literally and 23 procedural ones.
-    assert impls == {"attribute": 19, "procedural": 23}
-    # 12 attribute candidates (3 undeclared, 9 variable) + 15 procedural
-    # variable ones (`update_N` / `post_update_*` are not hooks), none under tests/.
-    assert candidates == {"undeclared": 3, "variable": 24}
+    # Plus the variable hooks P4 Task 5 binds: 8 attribute (2 form alters,
+    # 6 entity-type hooks), 7 procedural (1 form alter, 6 entity-type hooks).
+    assert impls == {"attribute": 27, "procedural": 30}
+    # 4 attribute candidates (3 undeclared, 1 variable) + 8 procedural
+    # variable ones (`preprocess_*`, `theme_suggestions_*`: P5; `update_N` /
+    # `post_update_*` are not hooks), none under tests/.
+    assert candidates == {"undeclared": 3, "variable": 9}
 
 
 # -- fix round 1 ---------------------------------------------------------------------

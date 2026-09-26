@@ -54,7 +54,7 @@ import networkx as nx
 from graphify.drupal.boundary import included_realms, install_map, realm_of
 from graphify.drupal.container import Artifact, ArtifactError, check_staleness, load_artifact
 from graphify.drupal.discovery import type_id
-from graphify.drupal.hooks import hook_id, hook_impl_id
+from graphify.drupal.hooks import declared_hook_of, hook_id, hook_impl_id
 from graphify.drupal.yaml_common import (
     link_id,
     parameter_id,
@@ -942,13 +942,19 @@ class _Overlay:
                             class_name=_short(cls) if cls else None, method=method or None)
                 self.applied("hooks")
                 self.impl_order(nid, order)
-                decl = self.registry.hooks.get(hook) if self.registry is not None else None
+                # A variable hook the registry's inventories bind (P4 spec
+                # §6.2-§6.3) implements its declared pattern hook, as the
+                # static implementation does: `form_x_alter` meets
+                # `form_FORM_ID_alter`, never a hook node of its own.
+                implemented = declared_hook_of(self.registry, module, hook) or hook
+                decl = self.registry.hooks.get(implemented) if self.registry is not None else None
                 if decl is None or decl.provider != module:
                     # P2b's rule: an extension declaring the hook already has
                     # `declares_hook` to it, one relation per pair.
                     ext = self.ensure(extension_id(module), type="drupal_extension",
                                       layer="extension", label=module, realm=realm)
-                    self.edge(ext, self.hook_target(hook), "implements_hook", target_name=hook)
+                    self.edge(ext, self.hook_target(implemented), "implements_hook",
+                              target_name=implemented)
                 if target is not None:
                     self.edge(nid, target, "hook_implemented_by")
 

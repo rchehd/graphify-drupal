@@ -50,7 +50,19 @@ _RESOLVABLE: dict[str, tuple[str, str]] = {
     # named by the edge's `target_name`; Task 6 adds the registry's facts.
     "implements_hook": ("drupal_hook", "hook"),
     "invokes_hook": ("drupal_hook", "hook"),
+    # A boundary form or entity form a custom `form_<x>_alter` alters, and a
+    # boundary entity type a custom `<t>_<op>` hooks (P4 spec §6.2-§6.3).
+    "alters_form": ("drupal_form", "hook"),
+    "hooks_entity_type": ("drupal_entity_type", "model"),
+    # An event custom code subscribes to (P4 spec §8): not the boundary, see
+    # `_NOT_BOUNDARY`.
+    "subscribes_to_event": ("drupal_event", "di"),
 }
+
+#: Node types this pass makes that are not the boundary: an event is where
+#: custom code listens (the P3 overlay's reading too), so its node takes the
+#: realm of the file that named it.
+_NOT_BOUNDARY = frozenset({"drupal_event"})
 
 
 #: Owner -> declared entity. The source is the extension that owns the file;
@@ -281,7 +293,30 @@ class _BoundaryIndex:
             return {type_id(pt): t for pt, t in r.types.items()}
         if kind == "drupal_hook":
             return {hook_id(name): decl for name, decl in r.hooks.items()}
+        if kind == "drupal_entity_type":
+            from graphify.drupal.php_semantics import entity_type_id
+
+            return {entity_type_id(name): (name, *entry)
+                    for name, entry in (r.entity_types or {}).items()}
+        if kind == "drupal_form":
+            from graphify.drupal.php_semantics import form_id
+
+            return {form_id(name): (name, *entry) for name, entry in (r.forms or {}).items()}
         return {}
+
+    def _entity_form(self, nid: str) -> tuple[str, str] | None:
+        """`(entity type, operation)` of the entity form node id `nid`, from
+        the registry's entity types (`php_semantics.entity_form_operations`)."""
+        from graphify.drupal.php_semantics import entity_form_id, entity_form_operations
+
+        for entity_type in self.registry.entity_types or {}:
+            prefix = entity_form_id(entity_type, "")
+            if not nid.startswith(prefix + "_"):
+                continue
+            for op in entity_form_operations(self.registry, entity_type):
+                if entity_form_id(entity_type, op) == nid:
+                    return entity_type, op
+        return None
 
     def _extension_realm(self, name: str) -> str | None:
         from graphify.drupal.boundary import realm_of
@@ -296,6 +331,8 @@ class _BoundaryIndex:
 
         kind = node.get("type")
         found = self._map(str(kind)).get(node.get("id"))
+        if found is None and kind == "drupal_form":
+            return self._entity_form_facts(str(node.get("id")))
         if found is None:
             return {}
         r = self.registry
@@ -323,6 +360,28 @@ class _BoundaryIndex:
             if found.pattern:
                 facts["pattern"] = found.pattern
             facts["realm"] = realm_of(Path(found.file))
+        elif kind in ("drupal_entity_type", "drupal_form"):
+            name, provider, class_name = (tuple(found) + ("", ""))[:3]
+            facts["entity_type" if kind == "drupal_entity_type" else "form_id"] = name
+            facts["provider"], facts["class_name"] = provider, class_name
+            realm = self._extension_realm(provider) if provider else None
+            if realm is not None:
+                facts["realm"] = realm
+        return facts
+
+    def _entity_form_facts(self, nid: str) -> dict[str, Any]:
+        from graphify.drupal.php_semantics import entity_form_pattern
+
+        found = self._entity_form(nid)
+        if found is None:
+            return {}
+        entity_type, op = found
+        facts: dict[str, Any] = {"entity_form": True, "entity_type": entity_type, "operation": op,
+                                 "pattern": entity_form_pattern(entity_type, op)}
+        provider = (tuple(self.registry.entity_types.get(entity_type) or ()) + ("",))[0]
+        realm = self._extension_realm(provider) if provider else None
+        if realm is not None:
+            facts["realm"] = realm
         return facts
 
 
@@ -333,6 +392,8 @@ def _mark_boundary(created: dict[str, dict[str, Any]]) -> None:
     registry = current_registry()
     index = _BoundaryIndex(registry) if registry is not None else None
     for stub in created.values():
+        if stub.get("type") in _NOT_BOUNDARY:
+            continue
         stub["boundary"] = True
         if index is not None:
             stub.update(index.facts(stub))
@@ -717,6 +778,11 @@ def resolve_missing_targets(
         if node_type == "drupal_hook":
             created[target]["hook_name"] = edge.get("target_name") or target
             created[target]["missing"] = True
+        if node_type in _NOT_BOUNDARY:
+            from graphify.drupal.boundary import realm_of
+
+            created[target]["realm"] = realm_of(Path(str(edge.get("source_file", ""))))
+            created[target].pop("external", None)
         if node_type == "drupal_plugin_type":
             # A type no manager file in the graph defines. On a composer site
             # that is mostly a type the registry knows but whose manager lives
