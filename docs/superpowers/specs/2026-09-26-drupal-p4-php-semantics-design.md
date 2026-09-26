@@ -240,6 +240,13 @@ and the entity type list must both agree on one split, or it is a candidate.
 | `\Drupal::service('x')` | enclosing method or function | `service` |
 | `\Drupal::<m>()` in the shortcut map | enclosing method or function | `shortcut` |
 | `$container->get('x')` inside `create()` | the class | `create` |
+| `$this->p` read or called, `p` resolved by §7.3 other than the class's own `create()` (rules 2, 3, 3b, 4, or 1/1b through an ancestor) | the class | `injected` |
+
+An `injected` edge is one per (class, service) pair, with `properties: [p, …]`.
+It appears only when the property is used, so injection alone adds no edge.
+A pair that already has a `create` edge (the class's own `create()`) keeps
+that edge. The `injected` edge is the carrier of `methods` / `_pending_calls`
+(§7.4) for calls on such a property, as the other rows are for their calls.
 
 The shortcut map is learned from core's `core/lib/Drupal.php`: every public
 static method whose return expression is exactly
@@ -249,8 +256,10 @@ static method whose return expression is exactly
 neither is `\Drupal::service()`. On FormsRemote's core that file has 40
 `->get(` calls.
 
-The target is `service_id(x)`, a boundary stub if needed (P2b rule). A
-non-literal id gives a `non_literal_service` candidate.
+The target is `service_id(resolve_alias(x))`: the registry's aliases
+(`x: '@y'`, `x: {alias: y}`) are followed, and the literal as written is kept
+in an `alias` attribute when it differs. It is a boundary stub if needed (the
+P2b rule). A non-literal id gives a `non_literal_service` candidate.
 
 ### 7.2 Constructor facts
 
@@ -277,7 +286,10 @@ A property `$this->p` of class `C` names service `x` when one of these holds,
 first match wins:
 
 1. `create()` passes `$container->get('x')` at the position of the
-   parameter assigned to `p`;
+   parameter assigned to `p`. The `create()` is the class's own, or an
+   ancestor's, but an ancestor's only when it builds with `new static(…)`.
+   An ancestor's `new self(…)` / `new <Ancestor>(…)` builds the ancestor, not
+   `C`, so it says nothing about `C`'s properties;
 
    1b. `create()` assigns `$container->get('x')` to `$<returned>->p`
    (setter injection, §7.2);
@@ -286,6 +298,15 @@ first match wins:
 3. `C` is an autowired service (`autowire: true`, or `_defaults`) and the
    parameter's type is a service id or alias the registry knows, i.e. an
    interface/class used as a service id;
+
+   3b. the same when `C` is a custom class under its extension's `src/Hook/`
+   with a `#[Hook]` attribute (on the class or a method) and no
+   `*.services.yml` defines it. Core's
+   `core/lib/Drupal/Core/Hook/HookCollectorPass.php`
+   (`registerHookServices`: `if (!$container->hasDefinition($class))
+   $container->register($class, $class)->setAutowired(TRUE)`) registers
+   every such class as an autowired service whose id is its FQCN. The
+   registry records them as `hook_services`;
 4. a parent class's constructor facts give it, when `C` calls
    `parent::__construct($a, …)` with the parameter passed through.
 

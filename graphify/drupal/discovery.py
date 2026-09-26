@@ -21,7 +21,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from graphify.drupal.boundary import boundary_digest
-from graphify.drupal.hooks import HookDecl, hook_dependent_files, hook_id, hook_pattern, read_hook_stubs
+from graphify.drupal.hooks import (
+    HOOK_ATTRIBUTE,
+    HookDecl,
+    hook_dependent_files,
+    hook_id,
+    hook_pattern,
+    read_hook_stubs,
+)
 from graphify.drupal.paths import extension_machine_name, is_drupal_info_yaml
 from graphify.drupal.php_classes import (
     Arg,
@@ -96,6 +103,10 @@ class Registry:
     #: custom service id -> `{"arguments": [service id or "" per position], "autowire": bool}`
     #: (P4 §7.3 rules 2 and 3).
     service_wiring: dict[str, dict] = field(default_factory=dict)
+    #: Custom `src/Hook/` classes with a `#[Hook]` (class or method): core's
+    #: `HookCollectorPass::registerHookServices` registers each as an
+    #: autowired service whose id is its FQCN (P4 §7.3 rule 3b). Sorted.
+    hook_services: list[str] = field(default_factory=list)
 
     def by_yaml_name(self) -> dict[str, PluginType]:
         """Non-deferred types that read `<ext>.<yaml_name>.yml` files."""
@@ -124,6 +135,7 @@ class Registry:
             "event_constants": dict(self.event_constants),
             "service_aliases": dict(self.service_aliases),
             "service_wiring": {k: _wiring(v) for k, v in self.service_wiring.items()},
+            "hook_services": list(self.hook_services),
         }
 
     @classmethod
@@ -145,6 +157,7 @@ class Registry:
             event_constants=dict(data.get("event_constants") or {}),
             service_aliases={str(k): str(v) for k, v in (data.get("service_aliases") or {}).items()},
             service_wiring={str(k): _wiring(v) for k, v in (data.get("service_wiring") or {}).items()},
+            hook_services=[str(c) for c in data.get("hook_services") or []],
         )
 
 
@@ -892,6 +905,7 @@ def _learn_php(builder: _Builder, walk: _Walk,
     forms: tuple[dict, dict] = ({}, {})
     base_forms: tuple[dict, dict] = ({}, {})
     event_constants: dict[str, str] = {}
+    hook_services: set[str] = set()
 
     for path in walk.php:
         try:
@@ -920,6 +934,12 @@ def _learn_php(builder: _Builder, walk: _Walk,
             if f.fqcn.rsplit("\\", 1)[-1].endswith("Events"):
                 for name, value in f.constants.items():
                     event_constants.setdefault(f"{f.fqcn}::{name}", value)
+        if custom and owner and "/src/Hook/" in path.as_posix() \
+                and path.as_posix().startswith(builder.walk.extensions.get(owner, "\0") + "/src/Hook/"):
+            for cls in attributed:
+                if any(a.name == HOOK_ATTRIBUTE for a in cls.attributes) \
+                        or any(a.name == HOOK_ATTRIBUTE for m in cls.methods for a in m.attributes):
+                    hook_services.add(cls.fqcn)
         for cls in attributed:
             for attr in cls.attributes:
                 if attr.name not in _ENTITY_TYPE_ATTRIBUTES:
@@ -945,6 +965,7 @@ def _learn_php(builder: _Builder, walk: _Walk,
         # and within one side a literal form id over a base form id.
         "forms": {**base_forms[0], **forms[0], **base_forms[1], **forms[1]},
         "event_constants": event_constants,
+        "hook_services": sorted(hook_services),
     }
 
 
@@ -1092,6 +1113,10 @@ def set_current(
     global _current, _previous, _force_miss, _current_run
     _current = registry
     _previous = previous
+    # What `php_services` built from the registry it last saw.
+    from graphify.drupal.php_services import clear_cache
+
+    clear_cache()
     _force_miss = frozenset(forced) if registry is not None else frozenset()
     if registry is None:
         _current_run = None

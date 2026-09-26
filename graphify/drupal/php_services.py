@@ -9,12 +9,17 @@ and the P3 overlay, so the three cannot disagree:
 - `property_service`: which service `$this->p` of a custom class holds, by
   §7.3's rules, first match wins:
   1. `create()` passes `$container->get('x')` at the position of the
-     constructor parameter assigned to `p`;
+     constructor parameter assigned to `p` -- the class's own `create()`,
+     or an ancestor's that builds with `new static(...)` (an ancestor's
+     `new self(...)` builds the ancestor, not this class);
   1b. `create()` assigns `$container->get('x')` to the instance it returns
      (setter injection);
   2. the class is a service whose `arguments:` has `@x` at that position;
   3. the class is an autowired service, and that parameter's type is a
      service id or an alias the registry knows;
+  3b. the same for a `src/Hook/` class with a `#[Hook]` that no
+     `*.services.yml` defines: core's `HookCollectorPass` registers it as an
+     autowired service (`Registry.hook_services`);
   4. a parent's constructor assigns `p` from the parameter the class passes
      through `parent::__construct(...)` -- folded into the positions rules
      1-3 read, so the class's own `create()` and service definition decide;
@@ -78,6 +83,7 @@ class _Index:
             except Exception:
                 continue
         self.service_classes = {str(v[0]).lstrip("\\") for v in registry.services.values() if v}
+        self.hook_services = set(getattr(registry, "hook_services", None) or ())
         self.wired: dict[str, list[dict]] = {}
         for sid, wiring in (getattr(registry, "service_wiring", None) or {}).items():
             cls = service_class(registry, sid)
@@ -86,6 +92,13 @@ class _Index:
 
 
 _cache: tuple[Any, _Index] | None = None
+
+
+def clear_cache() -> None:
+    """Forget the lookups built for a registry (`discovery.set_current`
+    calls this whenever the current registry changes)."""
+    global _cache
+    _cache = None
 
 
 def _index(registry: Any) -> _Index:
@@ -152,11 +165,13 @@ def property_service(registry: Any, fqcn: str, prop: str) -> tuple[str, str]:
     """`(service id, declared type)` of `$this->prop` in class `fqcn` (spec
     §7.3). The service is "" when no rule names it; the type is the
     constructor parameter's resolved class or interface, "" when there is
-    none (no parameter, a builtin, a union)."""
+    none (no parameter, a builtin, a union). The service's aliases are
+    followed, as `uses_service` targets are."""
     try:
-        return _property_service(registry, fqcn, prop)
+        service, type_name = _property_service(registry, fqcn, prop)
     except Exception:
         return "", ""
+    return (resolve_alias(registry, service) if service else ""), type_name
 
 
 def _property_service(registry: Any, fqcn: str, prop: str) -> tuple[str, str]:
@@ -166,8 +181,11 @@ def _property_service(registry: Any, fqcn: str, prop: str) -> tuple[str, str]:
     positions, ctor = _positions(chain)
     i = positions.get(prop)
     type_name = ctor.params[i].type if i is not None else ""
-    # Rule 1: the nearest `new static(...)` up the chain builds this class.
-    create_args = next((f.create_args for f in chain if f.create_args), ())
+    # Rule 1: the nearest `create()` up the chain that builds this class --
+    # its own, or an ancestor's `new static(...)`.
+    builder = next((f for f in chain if f.create_args), None)
+    create_args = builder.create_args if builder is not None \
+        and (builder is chain[0] or builder.create_static) else ()
     if i is not None and i < len(create_args) and create_args[i]:
         return create_args[i], type_name
     # Rule 1b: setter injection, the class's own `create()` first.
@@ -181,8 +199,11 @@ def _property_service(registry: Any, fqcn: str, prop: str) -> tuple[str, str]:
     service = _one({w["arguments"][i] for w in wirings if i < len(w["arguments"])})
     if service:
         return resolve_alias(registry, service), type_name
-    # Rule 3: an autowired service, the parameter typed with a service id or alias.
-    if any(w.get("autowire") for w in wirings):
+    # Rule 3: an autowired service, the parameter typed with a service id or
+    # alias; 3b: a hook class core autowires, unless a services.yml defines it.
+    autowired = any(w.get("autowire") for w in wirings) \
+        or (not wirings and chain[0].fqcn in _index(registry).hook_services)
+    if autowired:
         service = service_for_type(registry, type_name)
         if service:
             return service, type_name

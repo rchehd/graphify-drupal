@@ -144,6 +144,7 @@ class _File:
     attributed: list = field(default_factory=list)
     service_uses: list = field(default_factory=list)
     service_calls: list = field(default_factory=list)
+    property_uses: list = field(default_factory=list)
     nodes: list[dict[str, Any]] = field(default_factory=list)
     edges: list[dict[str, Any]] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -209,7 +210,7 @@ def _read(path: Path, core_result: dict | None, registry: Any = None) -> _File |
                     for n in (core_result or {}).get("nodes") or ()},
         stem=_file_stem(path), facts=read.facts, annotations=read.annotations,
         attributed=read.attributed, service_uses=read.service_uses,
-        service_calls=read.service_calls,
+        service_calls=read.service_calls, property_uses=read.property_uses,
     )
 
 
@@ -500,7 +501,7 @@ def _caller_name(site: Any) -> str:
 
 
 def _services(f: _File) -> None:
-    """`uses_service` from each of spec §7.1's three forms, and a pending
+    """`uses_service` from each of spec §7.1's forms, and a pending
     `calls` edge for each method call on a receiver naming a service (§7.4):
     `service_call` when the service is known here, `property_call` for
     `$this->p`, which the resolver settles with §7.3's rules. A non-literal
@@ -531,6 +532,7 @@ def _services(f: _File) -> None:
                    target_name=target, **extra)
 
     classes = {_short(facts.fqcn): facts.fqcn for facts in f.facts}
+    _injected(f, classes)
     for call in f.service_calls:
         source = _caller(f, call)
         if call.receiver == "property":
@@ -554,6 +556,37 @@ def _services(f: _File) -> None:
         sid = resolve_alias(registry, sid)
         f.add_edge(source, pending_call_id(sid, call.name), "calls", call.line,
                    **{PENDING: PENDING_SERVICE_CALL}, service=sid, method=call.name)
+
+
+def _injected(f: _File, classes: dict[str, str]) -> None:
+    """`uses_service` `via: injected` from a class to each service a
+    property it uses (reads or calls, never only assigns) holds by §7.3's
+    rules: one edge per (class, service), `properties` listing them. The
+    pair a `via: create` edge already has keeps that edge (emitted first):
+    this carries the calls on a service the class did not get in its own
+    `create()` -- services.yml arguments, autowiring, a parent's
+    constructor or `create()`."""
+    from graphify.drupal.php_services import property_service
+    from graphify.drupal.yaml_common import service_id
+
+    found: dict[tuple[str, str], tuple[int, set[str]]] = {}
+    seen: set[tuple[str, str]] = set()
+    for use in f.property_uses:
+        key = (use.class_name, use.name)
+        fqcn = classes.get(use.class_name)
+        if key in seen or not fqcn:
+            continue
+        seen.add(key)
+        service = property_service(f.registry, fqcn, use.name)[0]
+        if not service:
+            continue
+        line, props = found.setdefault((use.class_name, service), (use.line, set()))
+        props.add(use.name)
+    for (class_name, service), (line, props) in found.items():
+        source = f.class_node(class_name)
+        if source is not None:
+            f.add_edge(source, service_id(service), "uses_service", line, via="injected",
+                       target_name=service, properties=sorted(props))
 
 
 #: Every producer, run in order over one file's reading. Tasks 3-5 add theirs.

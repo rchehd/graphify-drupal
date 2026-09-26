@@ -1076,6 +1076,9 @@ class ClassFacts:
     #: property -> service id, setter injection in `create()`:
     #: `$v->p = $container->get('<literal>')` where `create()` returns `$v`.
     create_props: dict[str, str] = field(default_factory=dict)
+    #: `create()` builds with `new static(...)` (so a subclass inheriting it
+    #: is what it builds), not `new self(...)` / `new <Class>(...)`.
+    create_static: bool = False
 
     def to_dict(self) -> dict:
         """A JSON-shaped copy: lists for tuples, `params` as dicts."""
@@ -1086,6 +1089,7 @@ class ClassFacts:
             "create_args": list(self.create_args), "form_id": self.form_id,
             "base_form_id": self.base_form_id, "constants": dict(self.constants),
             "create_props": dict(self.create_props),
+            "create_static": self.create_static,
         }
 
     @classmethod
@@ -1104,6 +1108,7 @@ class ClassFacts:
             base_form_id=str(data.get("base_form_id") or ""),
             constants={str(k): str(v) for k, v in (data.get("constants") or {}).items()},
             create_props={str(k): str(v) for k, v in (data.get("create_props") or {}).items()},
+            create_static=data.get("create_static") is True,
         )
 
 
@@ -1198,15 +1203,21 @@ def _parent_args(ctor_body: "tree_sitter.Node") -> tuple[str, ...]:
 
 def _create_args(create: "tree_sitter.Node | None", fqcn: str,
                  namespace: str, uses: dict[str, str]) -> tuple[str, ...]:
-    """The service id per position of `create()`'s `new static|self|<C>(...)`,
-    where `<C>` is the class itself; "" for any argument that is not
-    `$container->get('<literal>')` on `create()`'s first parameter."""
+    return _create_new(create, fqcn, namespace, uses)[0]
+
+
+def _create_new(create: "tree_sitter.Node | None", fqcn: str,
+                namespace: str, uses: dict[str, str]) -> tuple[tuple[str, ...], bool]:
+    """`(service id per position, built with new static)` of `create()`'s
+    `new static|self|<C>(...)`, where `<C>` is the class itself; "" for any
+    argument that is not `$container->get('<literal>')` on `create()`'s
+    first parameter."""
     if create is None:
-        return ()
+        return (), False
     params = _params(create, namespace, uses)
     body = create.child_by_field_name("body")
     if not params or body is None:
-        return ()
+        return (), False
     receivers = frozenset({f"${params[0].name}"})
     for node in _walk_scope(body):
         if node.type != "object_creation_expression":
@@ -1216,8 +1227,8 @@ def _create_args(create: "tree_sitter.Node | None", fqcn: str,
         if name not in ("static", "self") and resolve_name(name, namespace, uses) != fqcn:
             continue
         args = next((c for c in node.named_children if c.type == "arguments"), None)
-        return tuple(_container_get(v, receivers) for v in _positional(args))
-    return ()
+        return tuple(_container_get(v, receivers) for v in _positional(args)), name == "static"
+    return (), False
 
 
 def _create_props(create: "tree_sitter.Node | None", namespace: str,
@@ -1292,10 +1303,11 @@ def _class_facts(class_node: "tree_sitter.Node", namespace: str, uses: dict[str,
     assigns = _assigns(ctor_body, {p.name for p in params}) if ctor_body is not None else {}
     parent_args = _parent_args(ctor_body) if ctor_body is not None else ()
     create = _find_method(body, "create")
+    create_args, create_static = _create_new(create, fqcn, namespace, uses)
     return ClassFacts(
         fqcn=fqcn, file=file, extends=extends, params=params, assigns=assigns,
         parent_args=parent_args,
-        create_args=_create_args(create, fqcn, namespace, uses),
+        create_args=create_args, create_static=create_static,
         create_props=_create_props(create, namespace, uses),
         form_id=_literal_return(_find_method(body, "getFormId")),
         base_form_id=_literal_return(_find_method(body, "getBaseFormId")),
@@ -1374,6 +1386,14 @@ class ServiceUse:
 
 
 @dataclass(frozen=True)
+class PropertyUse:
+    """`$this->p` read or called in a class's method (not assigned to)."""
+    name: str
+    line: int
+    class_name: str
+
+
+@dataclass(frozen=True)
 class ServiceCall:
     """`R->name(...)` on a receiver that names a service (spec §7.4)."""
     name: str        # the called method
@@ -1413,6 +1433,7 @@ class _Sites:
         self.writes: dict[tuple[int, str], int] = {}
         self.sources: dict[tuple[int, str], tuple[str, str]] = {}
         self.local_calls: list[tuple[tuple[int, str], str, int, _Scope]] = []
+        self.properties: list[PropertyUse] = []
 
     def receiver(self, node: "tree_sitter.Node | None") -> tuple[str, str] | None:
         """`(kind, target)` when `node` names a service (spec §7.4), else None."""
@@ -1456,6 +1477,8 @@ class _Sites:
             for child in node.named_children:
                 if child.type == "anonymous_function_use_clause":
                     self.write(scope, child)
+        elif kind in ("member_access_expression", "nullsafe_member_access_expression"):
+            self.property_use(node, scope)
         elif kind == "scoped_call_expression":
             self.drupal_call(node, scope)
         elif kind in _MEMBER_CALLS:
@@ -1483,6 +1506,20 @@ class _Sites:
         elif kind in ("global_declaration", "function_static_declaration", "catch_clause"):
             self.write(scope, node if kind != "catch_clause"
                        else node.child_by_field_name("name"))
+
+    def property_use(self, node: "tree_sitter.Node", scope: _Scope) -> None:
+        if not scope.class_name or _text(node.child_by_field_name("object")) != "$this":
+            return
+        prop = node.child_by_field_name("name")
+        parent = node.parent
+        if prop is None or prop.type != "name":
+            return
+        if parent is not None and parent.type in (
+                "assignment_expression", "augmented_assignment_expression",
+                "reference_assignment_expression") \
+                and parent.child_by_field_name("left") == node:
+            return
+        self.properties.append(PropertyUse(_text(prop), node.start_point[0] + 1, scope.class_name))
 
     def drupal_call(self, node: "tree_sitter.Node", scope: _Scope) -> None:
         if not _is_drupal(node.child_by_field_name("scope"), self.namespace, self.uses):
@@ -1520,17 +1557,18 @@ class _Sites:
         if variable and variable != "this":
             self.local_calls.append(((scope.frame, variable), name, line, scope))
 
-    def finish(self) -> tuple[list[ServiceUse], list[ServiceCall]]:
+    def finish(self) -> tuple[list[ServiceUse], list[ServiceCall], list[PropertyUse]]:
         for key, name, line, scope in self.local_calls:
             found = self.sources.get(key)
             if found is not None and self.writes.get(key) == 1:
                 self.calls.append(ServiceCall(name, line, scope.function, scope.class_name,
                                               scope.method, *found, local=key[1]))
         self.calls.sort(key=lambda c: c.line)
-        return self.found_uses, self.calls
+        return self.found_uses, self.calls, self.properties
 
 
-def _service_sites(root: "tree_sitter.Node") -> tuple[list[ServiceUse], list[ServiceCall]]:
+def _service_sites(root: "tree_sitter.Node",
+                   ) -> tuple[list[ServiceUse], list[ServiceCall], list[PropertyUse]]:
     sites = _Sites()
     _walk_scoped(root, _Scope(), sites.visit)
     return sites.finish()
@@ -1548,7 +1586,7 @@ def read_service_sites(path: Path, source: bytes | None = None,
         parsed = _parse(path, source)
         if parsed is None:
             return [], []
-        return _service_sites(parsed[1])
+        return _service_sites(parsed[1])[:2]
     except Exception:
         return [], []
 
@@ -1561,6 +1599,8 @@ class FileSemantics:
     attributed: list[AttributedClass]
     service_uses: list[ServiceUse]
     service_calls: list[ServiceCall]
+    #: every `$this->p` read or called (not assigned), for `via: injected`
+    property_uses: list[PropertyUse] = field(default_factory=list)
 
 
 def read_file_semantics(path: Path) -> FileSemantics:
@@ -1570,11 +1610,11 @@ def read_file_semantics(path: Path) -> FileSemantics:
     except Exception:
         parsed = None
     if parsed is None:
-        return FileSemantics([], [], [], [], [])
+        return FileSemantics([], [], [], [], [], [])
     facts, annotations, attributed = _class_semantics(parsed[1], Path(path).as_posix())
     root = parsed[1]
     try:
-        uses, calls = _service_sites(root)
+        uses, calls, properties = _service_sites(root)
     except Exception:
-        uses, calls = [], []
-    return FileSemantics(facts, annotations, attributed, uses, calls)
+        uses, calls, properties = [], [], []
+    return FileSemantics(facts, annotations, attributed, uses, calls, properties)

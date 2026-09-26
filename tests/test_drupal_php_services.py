@@ -68,6 +68,9 @@ services:
   foo.child:
     class: Drupal\\foo\\FooChild
     arguments: ['@foo.helper', '@entity_type.manager']
+  foo.unused:
+    class: Drupal\\foo\\FooUnused
+    arguments: ['@foo.helper']
 """
 
 FOO_HELPER_INTERFACE = r"""<?php
@@ -125,6 +128,23 @@ class FooController {
 
   public function dynamic() {
     \Drupal::service('foo.dynamic')->run();
+  }
+
+  public function closures() {
+    $h = \Drupal::service('foo.helper');
+    $f = function () {
+      $h->run();
+    };
+    $g = function () use ($h) {
+      $h->run();
+    };
+  }
+
+  public function looped(array $items) {
+    foreach ($items as $h) {
+    }
+    $h = \Drupal::service('foo.helper');
+    $h->run();
   }
 }
 """
@@ -188,6 +208,10 @@ class FooConsumer {
 
   public function go() {
     $this->h->run();
+  }
+
+  public function maybe() {
+    $this->h?->run();
   }
 }
 """
@@ -256,6 +280,71 @@ class FooLoose {
 }
 """
 
+# Injected but never used: no `via: injected` edge.
+FOO_UNUSED = r"""<?php
+namespace Drupal\foo;
+
+class FooUnused {
+
+  public function __construct(protected FooHelperInterface $helper) {
+  }
+}
+"""
+
+# Rule 1 through an ancestor: `new self(...)` builds the ancestor, `new
+# static(...)` builds the subclass.
+FOO_SELF_BASE = r"""<?php
+namespace Drupal\foo;
+
+use Symfony\Component\DependencyInjection\ContainerInterface;
+
+class FooSelfBase {
+
+  public function __construct(protected FooHelperInterface $helper) {
+  }
+
+  public static function create(ContainerInterface $container) {
+    return new self($container->get('foo.helper'));
+  }
+}
+"""
+
+FOO_SELF_CHILD = r"""<?php
+namespace Drupal\foo;
+
+class FooSelfChild extends FooSelfBase {
+
+  public function go() {
+    $this->helper->run();
+  }
+}
+"""
+
+FOO_STATIC_BASE = FOO_SELF_BASE.replace("FooSelfBase", "FooStaticBase").replace(
+    "new self(", "new static(")
+
+FOO_STATIC_CHILD = FOO_SELF_CHILD.replace("FooSelfChild", "FooStaticChild").replace(
+    "FooSelfBase", "FooStaticBase")
+
+# Rule 3b: core's HookCollectorPass autowires a `#[Hook]` class in src/Hook.
+FOO_HOOKS = r"""<?php
+namespace Drupal\foo\Hook;
+
+use Drupal\Core\Hook\Attribute\Hook;
+use Drupal\foo\FooHelperInterface;
+
+class FooHooks {
+
+  public function __construct(protected FooHelperInterface $helper) {
+  }
+
+  #[Hook('cron')]
+  public function cron() {
+    $this->helper->run();
+  }
+}
+"""
+
 FOO_MODULE = r"""<?php
 
 function foo_cron() {
@@ -282,6 +371,12 @@ def _services_site(root: Path) -> Path:
         f"{FOO}/src/FooBase.php": FOO_BASE,
         f"{FOO}/src/FooChild.php": FOO_CHILD,
         f"{FOO}/src/FooLoose.php": FOO_LOOSE,
+        f"{FOO}/src/FooUnused.php": FOO_UNUSED,
+        f"{FOO}/src/FooSelfBase.php": FOO_SELF_BASE,
+        f"{FOO}/src/FooSelfChild.php": FOO_SELF_CHILD,
+        f"{FOO}/src/FooStaticBase.php": FOO_STATIC_BASE,
+        f"{FOO}/src/FooStaticChild.php": FOO_STATIC_CHILD,
+        f"{FOO}/src/Hook/FooHooks.php": FOO_HOOKS,
     })
 
 
@@ -336,7 +431,9 @@ def test_the_registry_keeps_aliases_and_custom_service_wiring(tmp_path):
     }
     wiring = registry.service_wiring
     # Custom services only: core's `entity_type.manager` is not wired here.
-    assert set(wiring) == {"foo.helper", "foo.worker", "foo.consumer", "foo.auto", "foo.child"}
+    assert set(wiring) == {"foo.helper", "foo.worker", "foo.consumer", "foo.auto", "foo.child",
+                           "foo.unused"}
+    assert registry.hook_services == ["Drupal\\foo\\Hook\\FooHooks"]
     assert wiring["foo.consumer"] == {"arguments": ["foo.helper", ""], "autowire": False}
     assert wiring["foo.auto"] == {"arguments": [], "autowire": True}
     assert wiring["foo.child"]["arguments"] == ["foo.helper", "entity_type.manager"]
@@ -345,7 +442,8 @@ def test_the_registry_keeps_aliases_and_custom_service_wiring(tmp_path):
     assert again.service_wiring == registry.service_wiring
     # An older registry file without the maps still loads.
     old = registry.to_json()
-    del old["service_aliases"], old["service_wiring"]
+    assert again.hook_services == registry.hook_services
+    del old["service_aliases"], old["service_wiring"], old["hook_services"]
     assert Registry.from_json(old).service_wiring == {}
 
 
@@ -384,10 +482,26 @@ def test_the_rules_resolve_properties_in_order(tmp_path):
         "entity_type.manager", "Drupal\\Core\\Entity\\EntityTypeManagerInterface")
     # Rule 4: the parent's constructor assigns what the child passes through.
     assert property_service(registry, "Drupal\\foo\\FooChild", "helper") == ("foo.helper", helper)
+    # Rule 3b: a `#[Hook]` class in src/Hook is autowired by core.
+    assert property_service(registry, "Drupal\\foo\\Hook\\FooHooks", "helper") == ("foo.helper", helper)
+    # Rule 1 through an ancestor only for `new static(...)`.
+    assert property_service(registry, "Drupal\\foo\\FooStaticChild", "helper") == ("foo.helper", helper)
+    assert property_service(registry, "Drupal\\foo\\FooSelfChild", "helper") == ("", helper)
+    assert property_service(registry, "Drupal\\foo\\FooSelfBase", "helper") == ("foo.helper", helper)
     # Unresolved: typed, but no rule names the service.
     assert property_service(registry, "Drupal\\foo\\FooLoose", "helper") == ("", helper)
     assert property_service(registry, "Drupal\\foo\\FooLoose", "when") == ("", "DateTimeImmutable")
     assert property_service(registry, "Drupal\\foo\\Nope", "x") == ("", "")
+
+
+def test_the_lookup_cache_never_outlives_its_registry(tmp_path):
+    from graphify.drupal import discovery, php_services
+
+    registry = prepare_run(_services_site(tmp_path))
+    assert php_services.property_service(registry, "Drupal\\foo\\FooConsumer", "h")[0] == "foo.helper"
+    assert php_services._cache is not None and php_services._cache[0] is registry
+    discovery.set_current(None)
+    assert php_services._cache is None
 
 
 # -- the per-file extractor ------------------------------------------------------------------
@@ -418,6 +532,8 @@ def test_the_extractor_emits_uses_service_and_pending_calls(tmp_path):
         (method("aliased"), service_id("foo.helper"), "service"),
         (method("inherited"), service_id("foo.worker"), "service"),
         (method("dynamic"), service_id("foo.dynamic"), "service"),
+        (method("closures"), service_id("foo.helper"), "service"),
+        (method("looped"), service_id("foo.helper"), "service"),
     }
     shortcut = next(e for e in result["edges"] if e.get("via") == "shortcut")
     assert (shortcut["shortcut"], shortcut["target_name"]) == ("entityTypeManager",
@@ -435,8 +551,10 @@ def test_the_extractor_emits_uses_service_and_pending_calls(tmp_path):
         (method("dynamic"), "foo.dynamic", "run"),
     }
     assert all(e["relation"] == "calls" for e in result["edges"] if e.get(PENDING) == "service_call")
-    # `$x` is assigned twice in `twice()`: its call is not resolved.
-    assert not [e for e in result["edges"] if e["source"] == method("twice") and e.get(PENDING)]
+    # Not resolved: `$x` is assigned twice; a closure's `$h` is its own
+    # (captured by `use` or not); a `foreach` variable is written twice.
+    for name in ("twice", "closures", "looped"):
+        assert not [e for e in result["edges"] if e["source"] == method(name) and e.get(PENDING)], name
 
     (candidate,) = result["php_candidates"]
     assert {k: candidate[k] for k in ("kind", "module", "via", "argument")} == {
@@ -459,6 +577,42 @@ def test_create_gives_a_class_level_uses_service_and_property_calls(tmp_path):
     assert {k: call[k] for k in ("source", "relation", "class", "property", "method")} == {
         "source": _method(core, "FooForm.php", "FooForm", "submitForm"), "relation": "calls",
         "class": "Drupal\\foo\\Form\\FooForm", "property": "helper", "method": "run"}
+
+
+def test_a_used_injected_property_gives_a_via_injected_edge(tmp_path):
+    from graphify.drupal.php_semantics import PENDING, extract_php_semantics
+
+    root = _services_site(tmp_path)
+    prepare_run(root)
+
+    def uses(file: str, cls: str) -> dict:
+        path = root / FOO / "src" / file
+        core = _core_php(path)
+        result = extract_php_semantics(path, core)
+        source = _php_node(core, Path(file).name, cls)
+        return {(e["target"], e["via"]): e for e in result["edges"]
+                if e["relation"] == "uses_service" and e["source"] == source}
+
+    consumer = uses("FooConsumer.php", "FooConsumer")
+    assert set(consumer) == {(service_id("foo.helper"), "injected")}
+    assert consumer[(service_id("foo.helper"), "injected")]["properties"] == ["h"]
+    assert set(uses("FooAuto.php", "FooAuto")) == {
+        (service_id("foo.helper"), "injected"), (service_id("entity_type.manager"), "injected")}
+    assert set(uses("FooChild.php", "FooChild")) == {(service_id("foo.helper"), "injected")}
+    assert set(uses("Hook/FooHooks.php", "FooHooks")) == {(service_id("foo.helper"), "injected")}
+    assert set(uses("FooStaticChild.php", "FooStaticChild")) == {
+        (service_id("foo.helper"), "injected")}
+    # Its own `create()` already carries the pair: no second edge.
+    assert set(uses("Form/FooForm.php", "FooForm")) == {(service_id("foo.helper"), "create")}
+    # Injection alone, and an unresolved property, add nothing.
+    assert uses("FooUnused.php", "FooUnused") == {}
+    assert uses("FooSelfChild.php", "FooSelfChild") == {}
+    # The nullsafe `?->` is a receiver like `->`.
+    path = root / FOO / "src/FooConsumer.php"
+    core = _core_php(path)
+    pending = {(e["source"], e["method"]) for e in extract_php_semantics(path, core)["edges"]
+               if e.get(PENDING) == "property_call"}
+    assert (_method(core, "FooConsumer.php", "FooConsumer", "maybe"), "run") in pending
 
 
 def test_a_procedural_function_uses_a_service(tmp_path):
@@ -485,7 +639,8 @@ def test_unresolved_receivers_are_candidates_only_for_service_types(tmp_path):
             for c in result["php_candidates"]] == [{
         "kind": "unresolved_receiver", "class": "Drupal\\foo\\FooLoose", "property": "helper",
         "type": "Drupal\\foo\\FooHelperInterface", "method": "run"}]
-    for resolved in ("FooConsumer.php", "FooAuto.php", "FooChild.php"):
+    for resolved in ("FooConsumer.php", "FooAuto.php", "FooChild.php", "Hook/FooHooks.php",
+                     "FooStaticChild.php"):
         path = root / FOO / "src" / resolved
         assert extract_php_semantics(path, _core_php(path))["php_candidates"] == [], resolved
 
@@ -512,6 +667,9 @@ def test_calls_are_bound_to_the_service_class_s_method(tmp_path):
         (m("FooForm.php", "FooForm", "submitForm"), run),                  # rule 1
         (m("FooSetterForm.php", "FooSetterForm", "submitForm"), run),      # rule 1b
         (m("FooConsumer.php", "FooConsumer", "go"), run),                  # rule 2
+        (m("FooConsumer.php", "FooConsumer", "maybe"), run),               # `?->`
+        (m("FooHooks.php", "FooHooks", "cron"), run),                      # rule 3b
+        (m("FooStaticChild.php", "FooStaticChild", "go"), run),            # rule 1, `new static`
         (m("FooAuto.php", "FooAuto", "go"), run),                          # rule 3
         (m("FooChild.php", "FooChild", "go"), run),                        # rule 4
         (_php_node(result, "foo.module", "foo_cron()"), run),
@@ -529,6 +687,10 @@ def test_calls_are_bound_to_the_service_class_s_method(tmp_path):
     dynamic = uses[(m("FooController.php", "FooController", "dynamic"), service_id("foo.dynamic"))]
     assert dynamic["methods"] == ["run"]
     assert dynamic["_pending_calls"] == [[m("FooController.php", "FooController", "dynamic"), "run"]]
+    # The `via: injected` edge carries a boundary class's methods too.
+    auto = uses[(_php_node(result, "FooAuto.php", "FooAuto"), service_id("entity_type.manager"))]
+    assert (auto["via"], auto["methods"]) == ("injected", ["getStorage"])
+    assert auto["_pending_calls"] == [[m("FooAuto.php", "FooAuto", "go"), "getStorage"]]
     # A service no `*.services.yml` in the graph declares is a boundary stub.
     stub = nodes[service_id("foo.dynamic")]
     assert (stub["type"], stub["boundary"]) == ("drupal_service", True)
@@ -540,12 +702,15 @@ def test_a_cli_run_writes_no_pending_key(tmp_path):
     graph = _cli(root, out)
     links = _links(graph)
     assert not [e for e in links if "pending" in e]
-    assert sum(1 for e in links if e["relation"] == "calls" and "service" in e) == 9
+    assert sum(1 for e in links if e["relation"] == "calls" and "service" in e) == 12
     assert {e["via"] for e in links if e["relation"] == "uses_service"} == {
-        "service", "shortcut", "create"}
+        "service", "shortcut", "create", "injected"}
+    waiting = {e["target"]: e["_pending_calls"] for e in links if e.get("_pending_calls")}
+    assert len(waiting[service_id("foo.dynamic")]) == 1
     inventory = json.loads((out / "graphify-out" / "drupal-inventory.json").read_text(encoding="utf-8"))
-    assert sorted(c["kind"] for c in inventory["php_candidates"]) == [
-        "non_literal_service", "unresolved_receiver"]
+    assert sorted((c["kind"], c.get("class", "")) for c in inventory["php_candidates"]) == [
+        ("non_literal_service", ""), ("unresolved_receiver", "Drupal\\foo\\FooLoose"),
+        ("unresolved_receiver", "Drupal\\foo\\FooSelfChild")]
     # An unchanged rerun gives the same edges.
     again = _cli(root, out)
     assert sorted((e["source"], e["relation"], e["target"]) for e in _links(again)) == sorted(
@@ -612,6 +777,34 @@ def test_the_overlay_binds_calls_on_a_container_only_class(tmp_path):
     assert _dump(G) == static
 
 
+def test_pending_calls_survive_graphify_update(tmp_path):
+    """`_pending_calls` lives on the caller file's edge: through `graphify
+    update` (graph.json as the baseline) the overlay keeps binding it, and
+    without the artifact the container's `calls` goes away."""
+    root = _services_site(tmp_path / "site")
+    artifact = tmp_path / "drupal-container.json"
+    artifact.write_text(json.dumps(_artifact(root).data), encoding="utf-8")
+
+    def state(graph: dict):
+        links = _links(graph)
+        assert not [e for e in links if "pending" in e]
+        waiting = sum(1 for e in links if e.get("_pending_calls"))
+        container = sorted((e["source"], e["target"]) for e in links if e["relation"] == "calls"
+                           and e.get("service") == "foo.dynamic" and e.get("origin") == "container")
+        static = sorted((e["source"], e["target"]) for e in links
+                        if e["relation"] == "calls" and "service" in e and "origin" not in e)
+        return waiting, container, static
+
+    first = state(_cli(root, root, artifact, command="update"))
+    assert first[0] > 0 and len(first[1]) == 1
+    for touched in ("src/FooLoose.php", "src/Controller/FooController.php", "src/FooHelper.php"):
+        path = root / FOO / touched
+        path.write_text(path.read_text(encoding="utf-8") + "\n// touch\n", encoding="utf-8")
+        assert state(_cli(root, root, artifact, command="update")) == first, touched
+    waiting, container, static = state(_cli(root, root, None, command="update"))
+    assert (waiting, container, static) == (first[0], [], first[2])
+
+
 # -- the reference corpus ------------------------------------------------------------------------
 
 CORPUS = Path(os.environ.get("DRUPAL_CORPUS", "/home/user/Projects/FormsRemote"))
@@ -652,9 +845,10 @@ def test_corpus_service_use_and_calls(tmp_path):
     assert {k: kinds[k] for k in ("non_literal_service", "unresolved_receiver")} == CORPUS_CANDIDATES
 
 
-#: Measured on FormsRemote (see the Task 4 report): `uses_service` edges,
-#: one per (caller, service) pair -- 37 `\Drupal::service()`, 109 shortcut
-#: and 194 `create()` sites; `calls` 145 through properties, 15 direct.
-CORPUS_USES_BY_VIA = {"service": 35, "shortcut": 96, "create": 193}
-CORPUS_CALLS = 160
-CORPUS_CANDIDATES = {"non_literal_service": 3, "unresolved_receiver": 71}
+#: Measured on FormsRemote (see the Task 4 report and its fix round 1):
+#: `uses_service` edges, one per (caller, service) pair -- 37
+#: `\Drupal::service()`, 109 shortcut and 194 `create()` sites, and
+#: `injected` from used properties; `calls` 168 through properties, 15 direct.
+CORPUS_USES_BY_VIA = {"service": 35, "shortcut": 96, "create": 193, "injected": 163}
+CORPUS_CALLS = 183
+CORPUS_CANDIDATES = {"non_literal_service": 3, "unresolved_receiver": 24}

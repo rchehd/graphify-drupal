@@ -376,6 +376,7 @@ def test_class_facts(tmp_path):
         parent_args=(),
         create_args=("foo.helper", "", ""),
         create_props={},
+        create_static=True,
         form_id="foo_promoted",
         base_form_id="foo_base",
         constants={"MODE": "edit", "OTHER": "other"},
