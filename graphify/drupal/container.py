@@ -23,6 +23,7 @@ extension directories are found by walking for `*.info.yml`.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -420,7 +421,7 @@ def _stable(data: dict) -> dict:
 
 def _registry_hook_names(root: Path) -> list[str]:
     """The static registry's hook names, building the registry when this
-    process has none (`prepare_run` writes only under the out dir)."""
+    process has none (`main` points `prepare_run`'s out dir at a temp dir)."""
     from graphify.drupal import discovery
 
     registry = discovery.current_registry()
@@ -492,13 +493,31 @@ def _summary(data: dict, path: Path) -> str:
     return "\n".join(lines)
 
 
+@contextlib.contextmanager
+def _restoring_discovery():
+    """A registry `prepare_run` makes inside the block does not outlive it,
+    unless one was already current (its env var pointed at a temp dir)."""
+    from graphify.drupal import discovery
+
+    before = discovery.current_registry()
+    saved = os.environ.get(discovery.ENV_VAR)
+    try:
+        yield
+    finally:
+        if before is None:
+            discovery.set_current(None)
+            if saved is None:
+                os.environ.pop(discovery.ENV_VAR, None)
+            else:
+                os.environ[discovery.ENV_VAR] = saved
+
+
 def main(argv: list[str]) -> int:
     """`container [PATH] [--out FILE] [--print-script] [--runner-command CMD]`.
 
     Returns 0 on success, 1 when drush or the artifact fails (message on
     stderr, no traceback, an existing artifact untouched), 2 on bad usage."""
     import argparse
-    import contextlib
     import sys
 
     from graphify.drupal.runners import RunnerError
@@ -522,13 +541,19 @@ def main(argv: list[str]) -> int:
         print(_OPEN_TAG + "\n" + collector_code(), end="")
         return 0
 
+    import tempfile
+
     from graphify.drupal import discovery
 
     root = Path(args.path).resolve()
     out = Path(args.out).resolve() if args.out else artifact_path(root)
-    scope = discovery.using_out_dir(out.parent) if args.out else contextlib.nullcontext()
     try:
-        with scope:
+        # The registry `collect` builds (`prepare_run`, for the hook list and
+        # the stamp) goes to a temp dir: never beside the artifact, and never
+        # into the site's own out dir, where the next build would read it as
+        # its previous registry.
+        with tempfile.TemporaryDirectory(prefix="graphify-drupal-container-") as scratch, \
+                discovery.using_out_dir(Path(scratch)), _restoring_discovery():
             data = collect(root, args.runner_command)
         write_artifact(data, out)
     except (RunnerError, ArtifactError, OSError) as exc:

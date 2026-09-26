@@ -367,6 +367,40 @@ def test_main_writes_the_same_bytes_twice(tmp_path, fake_drush, capsys, _isolate
     assert not (root / "graphify-out").exists()
 
 
+def test_main_with_out_in_the_root_leaves_no_registry_file(tmp_path, fake_drush,
+                                                          _isolated_discovery_state):
+    """The registry the command builds for the hook list and the stamp is
+    written to a temp dir: `--out <root>/drupal-container.json` must not drop
+    a `drupal-discovery.json` into the project (final review, finding 3)."""
+    from tests.test_drupal_discovery import _site
+
+    root = _site(tmp_path / "site", {
+        "web/modules/custom/foo/foo.info.yml": "name: Foo\ntype: module\n",
+        "web/modules/custom/foo/foo.services.yml": "services: {}\n",
+    })
+    out = root / "drupal-container.json"
+
+    assert main(["container", str(root), "--out", str(out)]) == 0
+    assert out.is_file()
+    assert [p for p in root.rglob("drupal-discovery.json")] == []
+    assert not (root / "graphify-out").exists()
+    assert fake_drush["calls"]
+
+
+def test_main_without_out_leaves_no_registry_file_either(tmp_path, fake_drush, monkeypatch,
+                                                        _isolated_discovery_state):
+    from tests.test_drupal_discovery import _site
+
+    root = _site(tmp_path / "site", {
+        "web/modules/custom/foo/foo.info.yml": "name: Foo\ntype: module\n",
+    })
+    monkeypatch.delenv(container.ENV_ARTIFACT, raising=False)
+
+    assert main(["container", str(root)]) == 0
+    assert (root / "drupal-container.json").is_file()
+    assert [p for p in root.rglob("drupal-discovery.json")] == []
+
+
 def test_main_on_bootstrap_failure_keeps_the_previous_artifact(tmp_path, fake_drush, capsys,
                                                                _isolated_discovery_state):
     out = tmp_path / "drupal-container.json"

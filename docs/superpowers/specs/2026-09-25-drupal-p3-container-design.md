@@ -392,7 +392,9 @@ GRAPH_REPORT's "Drupal coverage" section gains a "Container" block:
   `schema_version` and the top-level keys, strips the absolute roots, adds the
   host half of the stamp, writes atomically, and prints a one-screen summary
   (counts per source, errors, path written). On any failure the exit code is
-  non-zero and an existing artifact is left untouched.
+  non-zero and an existing artifact is left untouched. The registry it builds
+  for the hook list and the stamp (`prepare_run`) is written to a temp dir,
+  never beside the artifact or into the site's out dir.
 
 The collector ships as package data: `pyproject.toml`'s
 `[tool.setuptools.package-data]` gains `"graphify.drupal" =
@@ -404,7 +406,10 @@ raising `DrupalSeamError` otherwise:
 - `cli.dispatch_command`: `cmd == "drupal"` goes to
   `graphify.drupal.container.main(sys.argv[2:])`; everything else goes to core
   unchanged;
-- `build.build_from_json`: the gated overlay (§7.1) runs on the returned graph.
+- `build.build_from_json`: the gated overlay (§7.1) runs on the returned graph;
+- `build._load_existing_graph`, `build.dedupe_nodes`/`build.dedupe_edges` and
+  `watch._check_shrink`: the incremental baseline, the raw `--no-cluster`
+  write and core's shrink guards (§7.1).
 
 Core's help guard answers `graphify drupal container --help` with its generic
 line, so the command's usage is printed on a bad argument instead.
