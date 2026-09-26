@@ -452,8 +452,22 @@ def _patch_extract(extract: ModuleType) -> None:
                 widened = collision_group(
                     given + _registry_widening(given, context, anchor), context, anchor)
                 if len(widened) > len(given):
-                    _strip_context(kwargs, widened[len(given):], anchor)
-                    paths = widened
+                    pulled = widened[len(given):]
+                    _strip_context(kwargs, pulled, anchor)
+                    # In place: `graphify watch` (and the git hooks, which run
+                    # its `_rebuild_code`) evicts the old nodes and edges only
+                    # of the files in its own `extract_targets` list, the one
+                    # passed here, and counts its `rebuilt_sources` from it.
+                    # A new list would leave a pulled file's old edges in the
+                    # graph beside its fresh ones. The CLI reads
+                    # `extracted_sources` instead, which sees them either way.
+                    if not isinstance(paths, list):
+                        raise DrupalSeamError(
+                            "graphify.extract.extract was given "
+                            f"{type(paths).__name__} paths on an incremental run; the "
+                            "Drupal registry widening extends the caller's list in "
+                            "place -- graphify/drupal/register.py must be updated")
+                    paths.extend(pulled)
             # Boundary stubs name their paths relative to the scan root; the
             # resolver runs inside this call but is not handed the root.
             with scanning(anchor):

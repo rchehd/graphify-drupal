@@ -5,10 +5,13 @@ alias, a `create()` up the chain, the boundary forms, entity types, bundles or
 event constants, a plugin type, a class another file's edge names -- and the
 inventory and GRAPH_REPORT count what P4 produced.
 
-Each case is a real CLI run (`extract`, then `update` or `extract` again) on a
-synthetic site: core's incremental merge keeps an unchanged file's edges from
-graph.json and hands the resolvers only the fresh files, so only a forced
-re-extraction moves them.
+Each case is a real run on a synthetic site: core's incremental merge keeps
+an unchanged file's edges from graph.json and hands the resolvers only the
+fresh files, so only a forced re-extraction moves them. Every staleness case
+runs through each incremental path (`Run`, `MODES`): the CLI's incremental
+`extract`, `graphify watch`'s rebuild (which the git hooks run too) with and
+without `--no-cluster`, and a full build; each incremental graph must also
+equal a full build of the same tree.
 """
 from __future__ import annotations
 
@@ -105,6 +108,143 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+# -- the harness: every staleness case runs through each incremental path -----------------
+
+# `extract`: `extract --code-only --out` twice (core's CLI incremental merge).
+# `watch` / `watch-nc`: `update` first, then `graphify watch`'s own rebuild
+# (`watch._rebuild_code(changed_paths=…)`, which the git hooks call too), with
+# and without `--no-cluster`. `full`: the second run starts from nothing.
+MODES = ("extract", "watch", "watch-nc", "full")
+
+_WATCH = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from graphify.watch import _rebuild_code\n"
+    "ok = _rebuild_code(Path(sys.argv[1]), changed_paths=[Path(p) for p in sys.argv[3:]],\n"
+    "                   no_cluster=sys.argv[2] == '1')\n"
+    "sys.exit(0 if ok else 1)\n"
+)
+
+# Attributes a clustering pass or a run's layout owns, not the extraction.
+_VOLATILE = {"community", "community_name", "norm_label"}
+# Core's own incremental run resolves a type reference into an unchanged file
+# differently from a full one (an external stub instead of the class): a plain
+# edit of one PHP file, no Drupal fact involved, shows the same difference.
+# Those edges and the stubs they name are core's, and are left out.
+_CORE_TYPE_REFS = {"references", "imports", "imports_from", "implements", "inherits"}
+
+
+def _canonical(graph: dict) -> tuple[set, set]:
+    def freeze(item: dict) -> str:
+        return json.dumps({k: v for k, v in item.items() if k not in _VOLATILE},
+                          sort_keys=True, default=str)
+
+    nodes = {freeze(n) for n in graph["nodes"] if n.get("source_file") or n.get("type")}
+    edges = {freeze(e) for e in _links(graph) if e.get("relation") not in _CORE_TYPE_REFS}
+    return nodes, edges
+
+
+class Run:
+    """One staleness case in one mode: `build()`, edit through `edit`/`write`/
+    `unlink` (watch needs the changed paths), then `again()`. `again()` also
+    checks the incremental graph equals a full build of the same tree."""
+
+    def __init__(self, mode: str, root: Path, tmp: Path):
+        self.mode, self.root, self.tmp = mode, root, tmp
+        self.changed: list[Path] = []
+        self.rerun: int | None = None
+        self.out = root / "graphify-out" if mode.startswith("watch") else tmp / "out" / "graphify-out"
+
+    def _cli(self, *args: str) -> None:
+        proc = subprocess.run([sys.executable, "-m", "graphify", *args],
+                              capture_output=True, text=True, cwd=self.root.parent, env=_env())
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        found = _SUMMARY.search(proc.stdout)
+        self.rerun = int(found.group(1)) if found else None
+
+    def _first(self) -> dict:
+        if self.mode.startswith("watch"):
+            self._cli("update", str(self.root), *(["--no-cluster"] if self.mode == "watch-nc" else []))
+        else:
+            self._cli("extract", str(self.root), "--code-only", "--out", str(self.out.parent))
+        return json.loads((self.out / "graph.json").read_text(encoding="utf-8"))
+
+    def build(self) -> dict:
+        return self._first()
+
+    def edit(self, path: Path, old: str, new: str) -> None:
+        _edit(path, old, new)
+        self.changed.append(path)
+
+    def write(self, path: Path, text: str) -> None:
+        _write(path, text)
+        self.changed.append(path)
+
+    def unlink(self, path: Path) -> None:
+        path.unlink()
+        self.changed.append(path)
+
+    def again(self, *, same_as_full: bool = True) -> dict:
+        import shutil
+
+        if self.mode == "full":
+            shutil.rmtree(self.out)
+            return self._first()
+        if self.mode == "extract":
+            self._cli("extract", str(self.root), "--code-only", "--out", str(self.out.parent))
+        else:
+            if all(_in_boundary(self.root, p) for p in self.changed):
+                # `graphify watch` ignores boundary events by design (the
+                # registry prunes core and contrib from its detect, see
+                # register._noise): a boundary change reaches the graph with
+                # the next rebuild a tracked change triggers.
+                nudge = self.root / FOO / "foo.info.yml"
+                nudge.write_text(nudge.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+                self.changed.append(nudge)
+            proc = subprocess.run(
+                [sys.executable, "-c", _WATCH, str(self.root), "1" if self.mode == "watch-nc" else "0",
+                 *map(str, self.changed)],
+                capture_output=True, text=True, cwd=self.root.parent, env=_env())
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+        self.changed = []
+        rerun = self.rerun
+        graph = json.loads((self.out / "graph.json").read_text(encoding="utf-8"))
+        if same_as_full:
+            # Outside the scanned tree, so the full build does not read it.
+            saved = self.tmp / "incremental-out"
+            shutil.move(self.out, saved)
+            full = self._first()
+            shutil.rmtree(self.out)
+            shutil.move(saved, self.out)
+            assert _canonical(graph) == _canonical(full), _diff(graph, full)
+        self.rerun = rerun
+        return graph
+
+
+def _in_boundary(root: Path, path: Path) -> bool:
+    rel = path.relative_to(root).as_posix()
+    return rel.startswith(("web/core/", "web/modules/contrib/", "vendor/"))
+
+
+def _diff(incremental: dict, full: dict) -> str:
+    from collections import Counter
+
+    (n1, e1), (n2, e2) = _canonical(incremental), _canonical(full)
+
+    def kinds(items, key):
+        return dict(Counter(json.loads(i).get(key) for i in items))
+
+    return (f"nodes only incremental {kinds(n1 - n2, 'type')} {sorted(n1 - n2)[:3]}\n"
+            f"nodes only full {kinds(n2 - n1, 'type')} {sorted(n2 - n1)[:3]}\n"
+            f"edges only incremental {kinds(e1 - e2, 'relation')} {sorted(e1 - e2)[:3]}\n"
+            f"edges only full {kinds(e2 - e1, 'relation')} {sorted(e2 - e1)[:3]}")
+
+
+@pytest.fixture(params=MODES)
+def mode(request) -> str:
+    return request.param
+
+
 # -- services ----------------------------------------------------------------------------
 
 
@@ -122,30 +262,49 @@ def _method(graph: dict, file: str, cls: str, method: str) -> str:
     return _make_id(_node(graph, file, cls), method)
 
 
-def test_a_changed_service_class_re_extracts_its_users_and_their_calls_follow(tmp_path):
+def test_a_changed_service_class_re_extracts_its_users_and_their_calls_follow(tmp_path, mode):
     root = _services_with_other(tmp_path / "site")
-    out = tmp_path / "out"
+    run = Run(mode, root, tmp_path)
     controller = "src/Controller/FooController.php"
-    first, _ = _extract(root, out)
+    first = run.build()
     page = _method(first, controller, "FooController", "page")
     helper_run = _method(first, "src/FooHelper.php", "FooHelper", "run")
     other_run = _method(first, "src/FooOther.php", "FooOther", "run")
     assert helper_run in _targets(first, page, "calls")
 
-    _edit(root / FOO / "foo.services.yml",
-          "  foo.helper:\n    class: Drupal\\foo\\FooHelper\n",
-          "  foo.helper:\n    class: Drupal\\foo\\FooOther\n")
-    second, rerun = _extract(root, out)
+    run.edit(root / FOO / "foo.services.yml",
+             "  foo.helper:\n    class: Drupal\\foo\\FooHelper\n",
+             "  foo.helper:\n    class: Drupal\\foo\\FooOther\n")
+    second = run.again()
 
     calls = _targets(second, page, "calls")
     assert other_run in calls and helper_run not in calls
-    # Its users (the controller among them) were pulled in, not only the YAML.
-    assert rerun is not None and rerun > 1
+    if mode == "extract":
+        # Its users (the controller among them) were pulled in, not only the YAML.
+        assert run.rerun is not None and run.rerun > 1
+
+
+def test_changed_arguments_move_the_injected_edge(tmp_path, mode):
+    """The Task 4 re-review scenario: `foo.consumer`'s `@foo.helper` becomes
+    `@foo.other`; FooConsumer.php is unchanged, its `via: injected` edge must
+    move -- and under `graphify watch` the old one must not stay beside it."""
+    root = _services_with_other(tmp_path / "site")
+    run = Run(mode, root, tmp_path)
+    first = run.build()
+    consumer = _node(first, "src/FooConsumer.php", "FooConsumer")
+    assert _targets(first, consumer, "uses_service", via="injected") == {service_id("foo.helper")}
+
+    run.edit(root / FOO / "foo.services.yml", "arguments: ['@foo.helper', '%foo.param%']",
+             "arguments: ['@foo.other', '%foo.param%']")
+    second = run.again()
+
+    assert _targets(second, consumer, "uses_service", via="injected") == {service_id("foo.other")}
+    go = _method(second, "src/FooConsumer.php", "FooConsumer", "go")
+    assert _targets(second, go, "calls") == {_method(second, "src/FooOther.php", "FooOther", "run")}
 
 
 def test_changed_arguments_move_the_injected_edge_under_update(tmp_path):
-    """The Task 4 re-review scenario: `foo.consumer`'s `@foo.helper` becomes
-    `@foo.other`; FooConsumer.php is unchanged, its `via: injected` edge must move."""
+    """`graphify update` (a full code rebuild through watch's path)."""
     root = _services_with_other(tmp_path / "site")
     first = _update(root)
     consumer = _node(first, "src/FooConsumer.php", "FooConsumer")
@@ -160,39 +319,39 @@ def test_changed_arguments_move_the_injected_edge_under_update(tmp_path):
     assert _targets(second, go, "calls") == {_method(second, "src/FooOther.php", "FooOther", "run")}
 
 
-def test_a_changed_create_argument_moves_the_subclass_s_property_service(tmp_path):
+def test_a_changed_create_argument_moves_the_subclass_s_property_service(tmp_path, mode):
     root = _services_with_other(tmp_path / "site")
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     child = _node(first, "src/FooStaticChild.php", "FooStaticChild")
     assert _targets(first, child, "uses_service", via="injected") == {service_id("foo.helper")}
 
-    _edit(root / FOO / "src/FooStaticBase.php", "$container->get('foo.helper')",
-          "$container->get('foo.other')")
-    second, _ = _extract(root, out)
+    run.edit(root / FOO / "src/FooStaticBase.php", "$container->get('foo.helper')",
+             "$container->get('foo.other')")
+    second = run.again()
 
     assert _targets(second, child, "uses_service", via="injected") == {service_id("foo.other")}
     go = _method(second, "src/FooStaticChild.php", "FooStaticChild", "go")
     assert _targets(second, go, "calls") == {_method(second, "src/FooOther.php", "FooOther", "run")}
 
 
-def test_a_retargeted_alias_moves_its_users(tmp_path):
+def test_a_retargeted_alias_moves_its_users(tmp_path, mode):
     """A direct use (`\\Drupal::service('foo.helper_alias')`, its edge keeps
     `alias`) and an injected one (`arguments: ['@foo.helper_alias']`, its
     edge names only the resolved service) both follow the alias."""
     root = _services_with_other(tmp_path / "site")
     _edit(root / FOO / "foo.services.yml", "arguments: ['@foo.helper', '%foo.param%']",
           "arguments: ['@foo.helper_alias', '%foo.param%']")
-    out = tmp_path / "out"
+    run = Run(mode, root, tmp_path)
     controller = "src/Controller/FooController.php"
-    first, _ = _extract(root, out)
+    first = run.build()
     aliased = _method(first, controller, "FooController", "aliased")
     consumer = _node(first, "src/FooConsumer.php", "FooConsumer")
     assert _targets(first, aliased, "uses_service") == {service_id("foo.helper")}
     assert _targets(first, consumer, "uses_service", via="injected") == {service_id("foo.helper")}
 
-    _edit(root / FOO / "foo.services.yml", "    alias: foo.helper\n", "    alias: foo.other\n")
-    second, _ = _extract(root, out)
+    run.edit(root / FOO / "foo.services.yml", "    alias: foo.helper\n", "    alias: foo.other\n")
+    second = run.again()
 
     assert _targets(second, aliased, "uses_service") == {service_id("foo.other")}
     assert _targets(second, aliased, "calls") == {_method(second, "src/FooOther.php", "FooOther", "run")}
@@ -211,35 +370,35 @@ class FooShort {
 """
 
 
-def test_a_new_drupal_shortcut_names_the_service_of_an_unchanged_call(tmp_path):
+def test_a_new_drupal_shortcut_names_the_service_of_an_unchanged_call(tmp_path, mode):
     root = _services_with_other(tmp_path / "site")
     _write(root / FOO / "src/FooShort.php", FOO_SHORT)
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     go = _method(first, "src/FooShort.php", "FooShort", "go")
     assert _targets(first, go, "uses_service") == set()
 
-    _edit(root / "web/core/lib/Drupal.php", "  public static function entityTypeManager() {",
-          "  public static function fooHelper() {\n"
-          "    return static::getContainer()->get('foo.helper');\n  }\n\n"
-          "  public static function entityTypeManager() {")
-    second, _ = _extract(root, out)
+    run.edit(root / "web/core/lib/Drupal.php", "  public static function entityTypeManager() {",
+             "  public static function fooHelper() {\n"
+             "    return static::getContainer()->get('foo.helper');\n  }\n\n"
+             "  public static function entityTypeManager() {")
+    second = run.again()
 
     assert _targets(second, go, "uses_service", via="shortcut") == {service_id("foo.helper")}
 
 
-def test_a_hook_class_defined_as_a_service_loses_autowiring(tmp_path):
+def test_a_hook_class_defined_as_a_service_loses_autowiring(tmp_path, mode):
     """Rule 3b stops applying once a `*.services.yml` defines the hook class:
     FooHooks.php is unchanged, its injected edge follows the definition."""
     root = _services_with_other(tmp_path / "site")
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     hooks = _node(first, "src/Hook/FooHooks.php", "FooHooks")
     assert _targets(first, hooks, "uses_service", via="injected") == {service_id("foo.helper")}
 
-    _edit(root / FOO / "foo.services.yml", "  foo.worker:\n",
-          "  Drupal\\foo\\Hook\\FooHooks:\n    arguments: ['@foo.other']\n  foo.worker:\n")
-    second, _ = _extract(root, out)
+    run.edit(root / FOO / "foo.services.yml", "  foo.worker:\n",
+             "  Drupal\\foo\\Hook\\FooHooks:\n    arguments: ['@foo.other']\n  foo.worker:\n")
+    second = run.again()
 
     assert _targets(second, hooks, "uses_service", via="injected") == {service_id("foo.other")}
 
@@ -263,62 +422,63 @@ def _alters(graph: dict, impl_hook: str) -> set[str]:
     return _targets(graph, hook_impl_id("foo", impl_hook), "alters_form")
 
 
-def test_a_new_contrib_form_binds_a_previously_unbound_alter(tmp_path):
+def test_a_new_contrib_form_binds_a_previously_unbound_alter(tmp_path, mode):
     root = _binding_site(tmp_path / "site")
     settings = root / BAR / "src/Form/BarSettingsForm.php"
     settings.unlink()
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     assert _alters(first, "form_bar_settings_alter") == set()
 
-    _write(settings, _form("Drupal\\bar\\Form", "BarSettingsForm", "bar_settings"))
-    second, rerun = _extract(root, out)
+    run.write(settings, _form("Drupal\\bar\\Form", "BarSettingsForm", "bar_settings"))
+    second = run.again()
 
     assert _alters(second, "form_bar_settings_alter") == {form_id("bar_settings")}
-    assert rerun
+    if mode == "extract":
+        assert run.rerun
 
 
-def test_a_new_bundle_config_file_binds_an_entity_form_alter(tmp_path):
+def test_a_new_bundle_config_file_binds_an_entity_form_alter(tmp_path, mode):
     root = _binding_site(tmp_path / "site")
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     assert _alters(first, "form_node_blog_form_alter") == set()
 
-    _write(root / "config/sync/node.type.blog.yml", "")
-    second, _ = _extract(root, out)
+    run.write(root / "config/sync/node.type.blog.yml", "")
+    second = run.again()
 
     assert _alters(second, "form_node_blog_form_alter") == {entity_form_id("node", "default")}
 
 
-def test_a_new_event_constant_binds_the_subscriber(tmp_path):
+def test_a_new_event_constant_binds_the_subscriber(tmp_path, mode):
     root = _binding_site(tmp_path / "site")
     events = root / BAR / "src/BarEvents.php"
     saved = events.read_text(encoding="utf-8")
     events.unlink()
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     subscriber = _node(first, "src/EventSubscriber/FooSubscriber.php", "FooSubscriber")
     assert event_id("bar.save") not in _targets(first, subscriber, "subscribes_to_event")
 
-    _write(events, saved)
-    second, _ = _extract(root, out)
+    run.write(events, saved)
+    second = run.again()
 
     assert event_id("bar.save") in _targets(second, subscriber, "subscribes_to_event")
 
 
-def test_a_changed_form_id_re_binds_the_unchanged_route(tmp_path):
+def test_a_changed_form_id_re_binds_the_unchanged_route(tmp_path, mode):
     root = _binding_site(tmp_path / "site")
     _write(root / "web/modules/custom/foo/foo.routing.yml",
            "foo.plain:\n  path: '/foo/plain'\n  defaults:\n"
            "    _form: '\\Drupal\\foo\\Form\\PlainForm'\n  requirements:\n"
            "    _access: 'TRUE'\n")
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     route = make_id("drupal", "route", "foo.plain")
     assert _targets(first, route, "routes_to_form") == {form_id("foo_plain")}
 
-    _edit(root / "web/modules/custom/foo/src/Form/PlainForm.php", "'foo_plain'", "'foo_plainer'")
-    second, _ = _extract(root, out)
+    run.edit(root / "web/modules/custom/foo/src/Form/PlainForm.php", "'foo_plain'", "'foo_plainer'")
+    second = run.again()
 
     assert _targets(second, route, "routes_to_form") == {form_id("foo_plainer")}
 
@@ -348,36 +508,36 @@ class ThingManager extends DefaultPluginManager {
 """
 
 
-def test_a_new_deriver_class_binds_the_unchanged_plugin(tmp_path):
+def test_a_new_deriver_class_binds_the_unchanged_plugin(tmp_path, mode):
     root = _plugin_site(tmp_path / "site")
     deriver = root / FOO / "src/Plugin/Derivative/FooDeriver.php"
     saved = deriver.read_text(encoding="utf-8")
     deriver.unlink()
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     block = plugin_id("block", "foo_block")
     assert _targets(first, block, "derives_plugins") == set()
 
-    _write(deriver, saved)
-    second, _ = _extract(root, out)
+    run.write(deriver, saved)
+    second = run.again()
 
     assert _targets(second, block, "derives_plugins") == {
         _node(second, "src/Plugin/Derivative/FooDeriver.php", "FooDeriver")}
 
 
-def test_a_new_plugin_type_types_an_unchanged_class(tmp_path):
+def test_a_new_plugin_type_types_an_unchanged_class(tmp_path, mode):
     root = _plugin_site(tmp_path / "site")
-    out = tmp_path / "out"
-    first, _ = _extract(root, out)
+    run = Run(mode, root, tmp_path)
+    first = run.build()
     assert plugin_id("thing", "thing") not in {n["id"] for n in first["nodes"]}
 
     thing = root / "web/modules/contrib/thing"
-    _write(thing / "thing.info.yml", "name: Thing\ntype: module\n")
-    _write(thing / "thing.services.yml",
-           "services:\n  plugin.manager.thing:\n    class: Drupal\\thing\\ThingManager\n"
-           "    parent: default_plugin_manager\n")
-    _write(thing / "src/ThingManager.php", THING_MANAGER)
-    second, _ = _extract(root, out)
+    run.write(thing / "thing.info.yml", "name: Thing\ntype: module\n")
+    run.write(thing / "thing.services.yml",
+              "services:\n  plugin.manager.thing:\n    class: Drupal\\thing\\ThingManager\n"
+              "    parent: default_plugin_manager\n")
+    run.write(thing / "src/ThingManager.php", THING_MANAGER)
+    second = run.again()
 
     assert plugin_id("thing", "thing") in {n["id"] for n in second["nodes"]}
 
@@ -576,3 +736,24 @@ def test_a_subscriber_known_only_as_an_unresolved_event_binds_once_the_constant_
     second, _ = _extract(root, out)
 
     assert _targets(second, subscriber, "subscribes_to_event") == {event_id("bar.save")}
+
+
+def test_the_registry_widening_extends_the_caller_s_list_in_place(tmp_path, monkeypatch):
+    """`graphify watch` evicts the old edges of the files in its own
+    `extract_targets` list only: a widened file must land in that list."""
+    import graphify.extract as core_extract
+    from graphify.drupal import register
+    from graphify.drupal.register import DrupalSeamError
+
+    changed, pulled = tmp_path / "a.php", tmp_path / "b.php"
+    for path in (changed, pulled):
+        _write(path, "<?php\nfunction f_" + path.stem + "() {\n}\n")
+    monkeypatch.setattr(register, "_registry_widening", lambda given, context, anchor: [pulled])
+    context = [{"id": "f_b", "label": "f_b()", "source_file": str(pulled), "type": "code"}]
+
+    paths = [changed]
+    core_extract.extract(paths, cache_root=tmp_path, resolution_context_nodes=list(context))
+    assert paths == [changed, pulled]
+
+    with pytest.raises(DrupalSeamError):
+        core_extract.extract((changed,), cache_root=tmp_path, resolution_context_nodes=list(context))
