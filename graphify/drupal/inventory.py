@@ -20,6 +20,7 @@ YAML file is simply not counted toward `yaml_plugins`.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -245,27 +246,81 @@ def _hook_candidates(registry: Registry, detected: set[str], root: Path) -> list
     return found
 
 
-def _php_candidates(registry: Registry, detected: set[str], root: Path) -> list[dict[str, Any]]:
+_PHP_CANDIDATES_FILENAME = "drupal-php-candidates.json"
+
+
+def _registry_digest(registry: Registry) -> str:
+    import hashlib
+
+    return hashlib.sha1(json.dumps(registry.to_json(), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _stat_key(path: Path) -> list[int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size]
+
+
+def _php_candidates(registry: Registry, detected: set[str], root: Path,
+                    cache_dir: Path | None = None) -> list[dict[str, Any]]:
     """Every `php_candidates` entry (P4 spec §10) of the detected PHP and
     procedural files (services are used in both), `file` relative to
     `root`: read from the full file list, like `_hook_candidates`, with the
-    extractor's own `find_php_candidates`."""
+    extractor's own `find_php_candidates`.
+
+    Parsing every custom PHP file on each `detect()` costs about half a
+    second on the reference corpus, so with a `cache_dir` a file's entries
+    are kept in `<cache_dir>/drupal-php-candidates.json`, keyed by its
+    mtime and size and valid only for the registry they were read against
+    (a digest of all of it): a changed registry reads every file again."""
+    digest = _registry_digest(registry) if cache_dir is not None else ""
+    cached: dict[str, Any] = {}
+    if cache_dir is not None:
+        try:
+            data = json.loads((Path(cache_dir) / _PHP_CANDIDATES_FILENAME).read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("registry") == digest \
+                    and isinstance(data.get("files"), dict):
+                cached = data["files"]
+        except (OSError, ValueError, TypeError):
+            cached = {}
+    fresh: dict[str, Any] = {}
     found: list[dict[str, Any]] = []
     for p in sorted(detected):
         path = Path(p)
         if path.suffix != ".php" and not is_procedural_file(path):
             continue
-        for entry in find_php_candidates(path, registry):
-            found.append({**entry, "file": _relative(entry["file"], root)})
+        key = _stat_key(path) if cache_dir is not None else None
+        entry = cached.get(p)
+        if key is not None and isinstance(entry, dict) and entry.get("stat") == key \
+                and isinstance(entry.get("found"), list):
+            entries = entry["found"]
+        else:
+            entries = find_php_candidates(path, registry)
+        if key is not None:
+            fresh[p] = {"stat": key, "found": entries}
+        for item in entries:
+            found.append({**item, "file": _relative(item["file"], root)})
+    if cache_dir is not None and fresh != cached:
+        try:
+            target = Path(cache_dir) / _PHP_CANDIDATES_FILENAME
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({"registry": digest, "files": fresh}, sort_keys=True),
+                              encoding="utf-8")
+        except (OSError, TypeError, ValueError):
+            pass
     found.sort(key=lambda e: (e["kind"], e["module"], e["file"], e["line"]))
     return found
 
 
-def build_inventory(registry: Registry, detected_files: set[str], root: Path) -> dict:
+def build_inventory(registry: Registry, detected_files: set[str], root: Path,
+                    cache_dir: Path | None = None) -> dict:
     """The coverage inventory (spec §5.7): what plugin discovery, the P1/P1b
     families and P5/P6's deferred families claim of `detected_files`, and
     what is left over. `root` is the scan root `detected_files`' `examples`
-    are made relative to."""
+    are made relative to; `cache_dir` (the out dir) keeps the PHP
+    candidates between runs (`_php_candidates`)."""
     root = Path(root).resolve()
     detected = {str(Path(p).absolute()) for p in detected_files}
     root_yaml = [str(Path(p).absolute()) for p in registry.root_yaml]
@@ -323,7 +378,7 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         filtered += 1
 
     candidates = _hook_candidates(registry, detected, root)
-    php_candidates = _php_candidates(registry, detected, root)
+    php_candidates = _php_candidates(registry, detected, root, cache_dir)
 
     unrecognised_files = sum(e["files"] for e in unrecognised)
     boundary, boundary_reasons, composer_error = _boundary_counts(registry, root)
@@ -354,6 +409,78 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
     return inventory
 
 
+#: Edge relations P4 counts in the graph (spec §10).
+_P4_RELATIONS = ("alters_form", "hooks_entity_type", "subscribes_to_event")
+
+
+def graph_counts(graph: Any) -> dict[str, Any]:
+    """What P4 put in the graph (spec §10): plugins by type, entity types,
+    forms and entity forms (boundary stubs left out), `uses_service` by
+    `via`, `calls` bound from a resolved receiver (static, and the P3
+    overlay's separately), and the `alters_form`, `hooks_entity_type`,
+    `subscribes_to_event` edges. `graph` is a networkx graph or a
+    graph.json-shaped dict; anything else counts nothing. Never raises."""
+    counts: dict[str, Any] = {
+        "plugins": {}, "entity_types": 0, "forms": 0, "entity_forms": 0,
+        "uses_service": {}, "calls_bound": 0, "calls_container": 0,
+        **{r: 0 for r in _P4_RELATIONS},
+    }
+    try:
+        nodes, edges = _graph_items(graph)
+        for n in nodes:
+            if not isinstance(n, dict) or n.get("boundary"):
+                continue
+            kind = n.get("type")
+            if kind == "drupal_plugin":
+                ptype = str(n.get("plugin_type") or "")
+                counts["plugins"][ptype] = counts["plugins"].get(ptype, 0) + 1
+            elif kind == "drupal_entity_type":
+                counts["entity_types"] += 1
+            elif kind == "drupal_form":
+                counts["entity_forms" if n.get("entity_form") else "forms"] += 1
+        for e in edges:
+            if not isinstance(e, dict):
+                continue
+            relation = e.get("relation")
+            if relation == "uses_service":
+                via = str(e.get("via") or "")
+                counts["uses_service"][via] = counts["uses_service"].get(via, 0) + 1
+            elif relation == "calls" and e.get("service"):
+                counts["calls_container" if e.get("origin") == "container" else "calls_bound"] += 1
+            elif relation in _P4_RELATIONS:
+                counts[relation] += 1
+    except Exception:
+        pass
+    counts["plugins"] = dict(sorted(counts["plugins"].items()))
+    counts["uses_service"] = dict(sorted(counts["uses_service"].items()))
+    return counts
+
+
+def _graph_items(graph: Any) -> tuple[list, list]:
+    if isinstance(graph, dict):
+        links = graph.get("links")
+        return list(graph.get("nodes") or []), list(links if isinstance(links, list)
+                                                    else graph.get("edges") or [])
+    nodes = [dict(data) | {"id": nid} for nid, data in graph.nodes(data=True)]
+    edges = [dict(data) for _u, _v, data in graph.edges(data=True)]
+    return nodes, edges
+
+
+def _render_graph_counts(counts: dict) -> list[str]:
+    plugins = counts.get("plugins") or {}
+    lines = ["### PHP semantics", "", "| metric | value |", "| --- | --- |",
+             f"| plugins | {sum(plugins.values()) if isinstance(plugins, dict) else 0} |",
+             f"| plugins by type | {_counts(plugins)} |",
+             f"| entity types | {counts.get('entity_types', 0)} |",
+             f"| forms | {counts.get('forms', 0)} |",
+             f"| entity forms | {counts.get('entity_forms', 0)} |",
+             f"| uses_service by via | {_counts(counts.get('uses_service'))} |",
+             f"| calls bound (static) | {counts.get('calls_bound', 0)} |",
+             f"| calls bound (container) | {counts.get('calls_container', 0)} |"]
+    lines += [f"| {r} | {counts.get(r, 0)} |" for r in _P4_RELATIONS]
+    return lines
+
+
 _SUMMARY_LABELS = (
     ("types", "plugin types"),
     ("registered_types", "registered types"),
@@ -382,7 +509,8 @@ def _counts(counts: object, order: tuple[str, ...] = ()) -> str:
 def render_section(inventory: dict) -> str:
     """Markdown "Drupal coverage" section appended to `GRAPH_REPORT.md`.
 
-    Tolerant of a missing key or an inventory with nothing in it: every list
+    The graph's P4 counts (`graph_counts`) render when the inventory carries
+    them under `graph` (the report seam adds them). Tolerant of a missing key or an inventory with nothing in it: every list
     renders as "none" and every summary count as 0, rather than raising.
     """
     inventory = inventory or {}
@@ -438,6 +566,10 @@ def render_section(inventory: dict) -> str:
             lines.append(f"- {kind}: {php_by_kind[kind]}")
     else:
         lines.append("- none")
+
+    graph = inventory.get("graph")
+    if isinstance(graph, dict):
+        lines += ["", *_render_graph_counts(graph)]
 
     lines += ["", "### Unresolved managers"]
     unresolved = inventory.get("managers_unresolved") or []

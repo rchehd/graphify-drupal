@@ -223,7 +223,8 @@ def _patch_detect(detect: ModuleType) -> None:
                     detected.update(paths)
                 detected.update(result.get("unclassified") or [])
                 try:
-                    inventory = build_inventory(registry, detected, root_path)
+                    inventory = build_inventory(registry, detected, root_path,
+                                                out_dir(root_path, cache_root))
                 except Exception:
                     inventory = None
                 set_current_inventory(inventory)
@@ -652,21 +653,39 @@ def _patch_report(report: ModuleType) -> None:
             graph_out = noted[0] if noted else None
             noted[:] = []
             text = original(*args, **kwargs)
-            from graphify.drupal.discovery import out_dir
-            from graphify.drupal.inventory import current_inventory, load_inventory, render_section
+            from graphify.drupal.discovery import current_run, out_dir
+            from graphify.drupal.inventory import (
+                current_inventory, graph_counts, load_inventory, render_section, write_inventory,
+            )
 
             root = kwargs.get("root")
             if root is None and len(args) > 8:
                 root = args[8]
-            inventory = current_inventory()
+            inventory, home = current_inventory(), None
             if inventory is None and graph_out is not None:
-                inventory = load_inventory(graph_out)
+                inventory, home = load_inventory(graph_out), graph_out
             if inventory is None and root is not None:
                 # No `cache_root` here: `out_dir(root)` is the default out dir
                 # under `root` itself.
-                inventory = load_inventory(out_dir(Path(root)))
+                home = out_dir(Path(root))
+                inventory = load_inventory(home)
             if inventory is None:
                 return text
+            # What P4 put in the graph being reported (spec §10), kept beside
+            # the inventory for the next reader too; a write failure keeps it
+            # in the report only.
+            graph = args[0] if args else kwargs.get("G")
+            inventory = {**inventory, "graph": graph_counts(graph)}
+            if home is None and graph_out is not None:
+                home = graph_out
+            if home is None:
+                run = current_run()
+                home = run[1] if run is not None else None
+            if home is not None:
+                try:
+                    write_inventory(inventory, home)
+                except OSError:
+                    pass
             return text + "\n" + render_section(inventory)
         generate_.__name__ = generate_.__qualname__ = "generate"
         generate_.__doc__ = original.__doc__

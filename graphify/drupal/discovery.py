@@ -39,6 +39,7 @@ from graphify.drupal.php_classes import (
     read_php_class,
     resolve_name,
 )
+from graphify.drupal.staleness import PreviousRun, stale_files
 from graphify.drupal.yaml_common import load_drupal_yaml
 from graphify.ids import make_id
 
@@ -1250,16 +1251,21 @@ def affected_files(previous: Registry | None, current: Registry | None,
     graph.json (`_invokes_hook_files`, spec §11.1): the registry never learns
     of such a file (it names no extension, service or hook of its own), so
     without this it would keep edges to a stub whose boundary status just
-    changed. Empty when there is no previous registry: a first run extracts
+    changed. A custom class whose constructor/`create()` facts changed: its
+    file and its subclasses' (`_class_facts_files`). Everything else P4 reads
+    per file from cross-file registry state: `staleness.stale_files`, which
+    reads the previous graph.json and inventory only when a rule needs them.
+    Empty when there is no previous registry: a first run extracts
     everything anyway.
     """
     if previous is None:
         return set()
     current = current if current is not None else Registry(web_root=None)
     result: set[str] = set()
+    prior = PreviousRun(graph_path, root)
     if boundary_changed:
         result |= _boundary_dependent_files(previous) | _boundary_dependent_files(current)
-        result |= _invokes_hook_files(graph_path, root)
+        result |= prior.edge_files(lambda e: e.get("relation") == "invokes_hook")
 
     old_families, new_families = previous.by_yaml_name(), current.by_yaml_name()
     suffixes = tuple(
@@ -1298,6 +1304,10 @@ def affected_files(previous: Registry | None, current: Registry | None,
     # A custom class whose constructor/`create()` facts changed (P4 §9): its
     # file, and every in-graph subclass's -- they inherit what it injects.
     result |= _class_facts_files(previous.class_facts, current.class_facts)
+    # Everything else P4 reads per file from cross-file registry state (P4
+    # §9): services, aliases and wiring, forms, entity types and bundles,
+    # event constants, plugin types, classes other files name, shortcuts.
+    result |= stale_files(previous, current, prior)
     return result
 
 
@@ -1373,41 +1383,11 @@ def _invokes_hook_files(graph_path: Path | None, root: Path | None) -> set[str]:
     whose boundary/stub status a moved boundary can change.
 
     `source_file` is root-relative POSIX, as graph.json stores it; an
-    already-absolute one is accepted as-is. Anything that is not an
-    `invokes_hook` edge (a node, a P3 container-overlay item) is ignored.
-    Missing `graph_path`/`root`, an unreadable or malformed graph.json, or a
-    path that no longer exists on disk each add nothing.
+    already-absolute one is accepted as-is. Missing `graph_path`/`root`, an
+    unreadable or malformed graph.json, or a path that no longer exists on
+    disk each add nothing (`staleness.PreviousRun`).
     """
-    if graph_path is None or root is None:
-        return set()
-    try:
-        data = json.loads(Path(graph_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    links = data.get("links")
-    if not isinstance(links, list):
-        links = data.get("edges")
-    if not isinstance(links, list):
-        return set()
-    root = Path(root)
-    out: set[str] = set()
-    for item in links:
-        if not isinstance(item, dict) or item.get("relation") != "invokes_hook":
-            continue
-        source_file = item.get("source_file")
-        if not source_file or not isinstance(source_file, str):
-            continue
-        path = Path(source_file)
-        if not path.is_absolute():
-            path = root / path
-        try:
-            if path.is_file():
-                out.add(path.resolve().as_posix())
-        except OSError:
-            continue
-    return out
+    return PreviousRun(graph_path, root).edge_files(lambda e: e.get("relation") == "invokes_hook")
 
 
 def _hook_names(hooks: dict[str, HookDecl]) -> dict[str, tuple[str, str]]:
