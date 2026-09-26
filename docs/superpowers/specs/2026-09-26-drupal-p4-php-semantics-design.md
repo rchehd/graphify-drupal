@@ -69,7 +69,7 @@ The closing real run.
 
 - `preprocess_*` and `theme_suggestions_*` (P5).
 - Bundles, fields, displays; the real ids of entity forms (P6).
-- Type inference beyond §7's three rules. A local variable holding a
+- Type inference beyond §7.3's four rules and §7.4. A local variable holding a
   service (`$s = \Drupal::…(); $s->x()`) is resolved only in the single
   assignment form of §7.4.
 - `configures_plugin` (P6).
