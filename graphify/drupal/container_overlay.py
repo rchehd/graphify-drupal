@@ -473,6 +473,8 @@ class _Overlay:
         self._confirmed: set[tuple[str, str]] = set()
         self._conflicted: set[tuple[str, str, str]] = set()
         self._ordered: set[str] = set()
+        #: class FQCN -> static form node id, built on first use (`form_node`).
+        self._forms: dict[str, str] | None = None
         #: `realm_of` per path: each pass asks once per fact and phase, and
         #: FormsRemote's artifact names ~4,000 files (26k calls, 1.3 s uncached).
         self._realms: dict[str, str | None] = {}
@@ -546,6 +548,21 @@ class _Overlay:
             if found is not None:
                 return found
         return self.binder.php_node(file, cls)
+
+    def form_node(self, value: str) -> str | None:
+        """The static `drupal_form` whose class is `value` (P4 spec §6.1): the
+        resolver points `routes_to_form` there, so the container confirms
+        that edge rather than naming the class node beside it (a false
+        conflict). An entity form is no route target (`bind_route_forms`)."""
+        if self._forms is None:
+            by_class: dict[str, set[str]] = {}
+            for nid, data in self.G.nodes(data=True):
+                cls = data.get("class_name")
+                if data.get("type") == "drupal_form" and not data.get("entity_form") \
+                        and not data.get(_OVERLAY) and isinstance(cls, str):
+                    by_class.setdefault(cls.lstrip("\\"), set()).add(nid)
+            self._forms = {cls: next(iter(ids)) for cls, ids in by_class.items() if len(ids) == 1}
+        return self._forms.get(value.strip().lstrip("\\"))
 
     # -- mutation primitives --
 
@@ -786,7 +803,9 @@ class _Overlay:
                 value = defaults.get(key)
                 if not isinstance(value, str) or not value:
                     continue
-                target = self.bind_callable(value)
+                target = self.form_node(value) if key == "_form" else None
+                if target is None:
+                    target = self.bind_callable(value)
                 if target is not None:
                     self.edge(nid, target, relation)
                 else:

@@ -382,6 +382,32 @@ def _class_file(registry: Any, fqcn: str) -> str:
     return f"{directory.rstrip('/')}/src/{'/'.join(parts[2:])}.php"
 
 
+def _class_nodes(all_nodes: list[dict], registry: Any, fqcns: Any) -> dict[str, str]:
+    """`{fqcn: node id}` for each class in `fqcns` whose one non-`drupal_*`
+    node has the class's file as `source_file` and its short name as label
+    (P2b/P3's binding). A class outside the graph, or answered by two nodes,
+    is left out."""
+    wanted: dict[str, tuple[str, str]] = {}
+    for fqcn in fqcns:
+        file = _class_file(registry, fqcn)
+        wanted[fqcn] = (_normal_file(file) if file else "", fqcn.rsplit("\\", 1)[-1])
+    labels = {short for file, short in wanted.values() if file}
+    if not labels:
+        return {}
+    index: dict[tuple[str, str], list[str]] = {}
+    for n in all_nodes:
+        label, source_file = n.get("label"), n.get("source_file")
+        if label not in labels or not source_file or str(n.get("type") or "").startswith("drupal_"):
+            continue
+        index.setdefault((_normal_file(str(source_file)), label), []).append(n["id"])
+    out: dict[str, str] = {}
+    for fqcn, key in wanted.items():
+        found = index.get(key, [])
+        if key[0] and len(found) == 1:
+            out[fqcn] = found[0]
+    return out
+
+
 def bind_pending(all_nodes: list[dict], all_edges: list[dict]) -> None:
     """Bind each pending class edge (`php_semantics.PENDING_CLASS`) to the class
     node whose `source_file` is the class's file and whose label is its short
@@ -402,25 +428,13 @@ def bind_pending(all_nodes: list[dict], all_edges: list[dict]) -> None:
     if not pending:
         return
     registry = current_registry()
-    wanted: dict[str, tuple[str, str]] = {}
-    for e in pending:
-        fqcn = e["target_name"]
-        if fqcn not in wanted:
-            file = _class_file(registry, fqcn)
-            wanted[fqcn] = (_normal_file(file) if file else "", fqcn.rsplit("\\", 1)[-1])
-    labels = {short for file, short in wanted.values() if file}
-    index: dict[tuple[str, str], list[str]] = {}
-    for n in all_nodes:
-        label, source_file = n.get("label"), n.get("source_file")
-        if label not in labels or not source_file or str(n.get("type") or "").startswith("drupal_"):
-            continue
-        index.setdefault((_normal_file(str(source_file)), label), []).append(n["id"])
+    bound = _class_nodes(all_nodes, registry, {e["target_name"] for e in pending})
     by_id: dict[str, dict] | None = None
     for e in pending:
-        found = index.get(wanted[e["target_name"]], [])
-        if len(found) != 1:
+        found = bound.get(e["target_name"])
+        if found is None:
             continue
-        e["target"] = found[0]
+        e["target"] = found
         e.pop(PENDING, None)
         if e.get("relation") == "entity_handler" and isinstance(e.get("handler"), str):
             if by_id is None:
@@ -432,6 +446,64 @@ def bind_pending(all_nodes: list[dict], all_edges: list[dict]) -> None:
                     handlers.pop(name, None)
                 if not handlers:
                     source.pop("handlers", None)
+
+
+def bind_route_forms(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """`routes_to_form` from each route whose P1 `form` attribute (`_form:`)
+    names a class: to the form node of that class (spec §6.1), else to the
+    class node itself, else nothing (the attribute stays the only record).
+
+    The form node is found by its `class_name`, or -- when it is an unchanged
+    file's context node on an incremental run, which carries no attributes --
+    by the registry's literal `getFormId()` of the class. Entity forms are
+    never a route's target: a class serving several operations is no one
+    form. Appends only, as `bind_pending` rewrites only."""
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.php_semantics import form_id
+
+    routes = [n for n in all_nodes if n.get("type") == "drupal_route"
+              and isinstance(n.get("form"), str) and n["form"].strip().lstrip("\\")]
+    if not routes:
+        return
+    registry = current_registry()
+    known = {n.get("id") for n in all_nodes}
+    by_class: dict[str, set[str]] = {}
+    for n in all_nodes:
+        if n.get("type") == "drupal_form" and not n.get("entity_form") \
+                and isinstance(n.get("class_name"), str):
+            by_class.setdefault(n["class_name"].lstrip("\\"), set()).add(n["id"])
+    facts = registry.class_facts if registry is not None else {}
+
+    def form_node(fqcn: str) -> str | None:
+        found = by_class.get(fqcn, set())
+        if len(found) == 1:
+            return next(iter(found))
+        literal = (facts.get(fqcn) or {}).get("form_id") if not found else None
+        if isinstance(literal, str) and literal and form_id(literal) in known:
+            return form_id(literal)
+        return None
+
+    targets: dict[str, str | None] = {}
+    for r in routes:
+        fqcn = r["form"].strip().lstrip("\\")
+        if fqcn not in targets:
+            targets[fqcn] = form_node(fqcn)
+    classes = _class_nodes(all_nodes, registry,
+                           [fqcn for fqcn, target in targets.items() if target is None])
+    taken = {(e.get("source"), e.get("target")) for e in all_edges}
+    for r in routes:
+        fqcn = r["form"].strip().lstrip("\\")
+        target = targets[fqcn] or classes.get(fqcn)
+        if target is None or (r["id"], target) in taken:
+            continue
+        taken.add((r["id"], target))
+        all_edges.append({
+            "source": r["id"], "target": target, "relation": "routes_to_form",
+            "confidence": "EXTRACTED", "_origin": "static_yaml",
+            "source_file": r.get("source_file", ""),
+            "source_location": r.get("source_location") or "L1",
+            "target_name": fqcn,
+        })
 
 
 def drop_pending(result: Any) -> Any:
@@ -463,6 +535,7 @@ def resolve_missing_targets(
     from graphify.drupal.yaml_common import config_id
 
     bind_pending(all_nodes, all_edges)
+    bind_route_forms(all_nodes, all_edges)
     _retarget_domain_overrides(all_nodes, all_edges)
     _draw_schema_for(all_nodes, all_edges)
 

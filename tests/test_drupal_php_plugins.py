@@ -276,7 +276,7 @@ def test_entity_types_from_an_attribute_and_an_annotation(tmp_path):
     config = extract_php_semantics(root / FOO / "src/Entity/FooType.php",
                                    _core_php(root / FOO / "src/Entity/FooType.php"))
 
-    (foo,) = content["nodes"]
+    (foo,) = [n for n in content["nodes"] if n["type"] == "drupal_entity_type"]
     assert (foo["id"], foo["type"], foo["layer"], foo["label"]) == (
         make_id("drupal", "entity_type", "foo"), "drupal_entity_type", "model", "foo")
     assert (foo["entity_kind"], foo["class_name"], foo["base_table"], foo["admin_permission"]) == (
@@ -294,7 +294,7 @@ def test_entity_types_from_an_attribute_and_an_annotation(tmp_path):
     assert all(e[PENDING] for e in handlers.values())
     assert handlers["storage"]["target_name"] == "Drupal\\foo\\FooStorage"
 
-    (foo_type,) = config["nodes"]
+    (foo_type,) = [n for n in config["nodes"] if n["type"] == "drupal_entity_type"]
     assert (foo_type["id"], foo_type["type"], foo_type["entity_kind"], foo_type["class_name"]) == (
         make_id("drupal", "entity_type", "foo_type"), "drupal_entity_type", "config",
         "Drupal\\foo\\Entity\\FooType")

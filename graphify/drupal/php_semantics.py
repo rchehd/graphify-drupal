@@ -5,8 +5,9 @@ handler (`register.py`'s dispatch, and `hooks.extract_php_with_hooks` for
 `src/Hook/**`) for every in-graph `.php` under an extension's `src/`
 (`is_semantics_file`). It reads the file once (`php_classes.read_class_semantics`)
 and runs each producer in `_PRODUCERS` over that one reading. P4 Task 2's
-producer emits plugin and entity type nodes; later tasks add forms, services
-and events as further producers.
+producer emits plugin and entity type nodes, Task 3's the forms (a literal
+`getFormId()`, and an entity type's `form.<op>` handlers); later tasks add
+services and events as further producers.
 
 What a single file cannot settle is emitted as a *pending* edge: its
 `pending` attribute names the kind of fact, its `target_name` the thing to
@@ -53,6 +54,8 @@ _PLUGIN_DIR = "Plugin/"
 _ENTITY_KINDS = {"ContentEntityType": "content", "ConfigEntityType": "config"}
 #: Literal entity type attributes copied onto the node (spec §5.3).
 _ENTITY_LITERALS = ("bundle_entity_type", "base_table", "admin_permission")
+#: An entity type's handler names that are entity forms: `form.<op>`.
+_FORM_HANDLER = "form."
 
 
 def _empty() -> dict[str, Any]:
@@ -109,6 +112,8 @@ class _File:
     src_rel: str
     core_ids: set[str]
     stem: str
+    #: node id -> `source_location` as core emitted it.
+    core_lines: dict[str, str] = field(default_factory=dict)
     facts: list = field(default_factory=list)
     annotations: list = field(default_factory=list)
     attributed: list = field(default_factory=list)
@@ -175,6 +180,8 @@ def _read(path: Path, core_result: dict | None, registry: Any = None) -> _File |
     return _File(
         path=path, registry=registry, owner=owner, src_rel=src_rel,
         core_ids={n.get("id") for n in (core_result or {}).get("nodes") or ()},
+        core_lines={n.get("id"): str(n.get("source_location") or "")
+                    for n in (core_result or {}).get("nodes") or ()},
         stem=_file_stem(path), facts=facts, annotations=annotations, attributed=attributed,
     )
 
@@ -339,6 +346,68 @@ def _entity_type(f: _File, d: _Declared, kind: str, entity_type: str) -> None:
     if permission:
         f.add_edge(eid, permission_id(permission), "requires_permission", d.line,
                    target_name=permission)
+    for name, fqcn in handlers.items():
+        if name.startswith(_FORM_HANDLER):
+            _entity_form(f, entity_type, name[len(_FORM_HANDLER):], fqcn, d.line)
+
+
+# -- forms (spec §6.1) -----------------------------------------------------------------
+
+
+def form_id(form: str) -> str:
+    return make_id("drupal", "form", form)
+
+
+def entity_form_id(entity_type: str, operation: str) -> str:
+    return make_id("drupal", "form", "entity", entity_type, operation)
+
+
+def entity_form_pattern(entity_type: str, operation: str) -> str:
+    """The form ids an entity form answers to: `EntityForm::getFormId()` is
+    `<entity>[_<bundle>][_<op>]_form`, the `default` operation left out."""
+    if operation == "default":
+        return f"{entity_type}_*_form"
+    return f"{entity_type}_*_{operation}_form"
+
+
+def _entity_form(f: _File, entity_type: str, operation: str, fqcn: str, line: int) -> None:
+    """A `form.<op>` handler: its id is built at runtime, so the node is keyed
+    by entity type and operation, and its class binds in the resolver."""
+    if not operation or "." in operation:
+        return
+    fid = entity_form_id(entity_type, operation)
+    pattern = entity_form_pattern(entity_type, operation)
+    if f.add_node(fid, pattern, type="drupal_form", layer="hook", line=line, entity_form=True,
+                  pattern=pattern, entity_type=entity_type, operation=operation,
+                  class_name=fqcn):
+        f.add_pending_class(fid, "form_implemented_by", fqcn, line)
+
+
+def _forms(f: _File) -> None:
+    """A class whose `getFormId()` returns a literal is a `drupal_form`; a
+    computed id is legitimate and yields nothing (no candidate)."""
+    for facts in f.facts:
+        if not facts.form_id:
+            continue
+        name = _short(facts.fqcn)
+        implementation = f.class_node(name)
+        line = _class_line(f, name)
+        extra: dict[str, Any] = {"base_form_id": facts.base_form_id} if facts.base_form_id else {}
+        fid = form_id(facts.form_id)
+        if not f.add_node(fid, facts.form_id, type="drupal_form", layer="hook", line=line,
+                          form_id=facts.form_id, class_name=facts.fqcn, **extra):
+            continue
+        if implementation is not None:
+            f.add_edge(fid, implementation, "form_implemented_by", line)
+
+
+def _class_line(f: _File, name: str) -> int:
+    """The line core gave the class node, else 1."""
+    from graphify.extractors.base import _make_id
+
+    location = f.core_lines.get(_make_id(f.stem, name), "")
+    digits = location[1:] if location.startswith("L") else ""
+    return int(digits) if digits.isdigit() else 1
 
 
 def _plugins_and_entity_types(f: _File) -> None:
@@ -371,7 +440,7 @@ def _plugins_and_entity_types(f: _File) -> None:
 
 
 #: Every producer, run in order over one file's reading. Tasks 3-5 add theirs.
-_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types,)
+_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types, _forms)
 
 
 def _run(path: Path, core_result: dict | None, registry: Any = None) -> dict[str, Any]:
