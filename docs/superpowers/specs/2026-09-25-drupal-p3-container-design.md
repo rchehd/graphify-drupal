@@ -183,19 +183,26 @@ identical file apart from `created_at`.
 ### 6.3 Stamp and staleness
 
 `git_commit`, `git_dirty`, `composer_lock_sha` and `sources_sha` are computed
-by Python on the host, so a build can recompute them the same way.
-`sources_sha` is the sha256 of `(relative path, content sha256)` pairs over
-the custom files that shape the container: `*.info.yml`, `*.services.yml`,
-`*.routing.yml`, `*.module` and the other procedural suffixes, and every PHP
-file the registry knows as a plugin, a plugin manager, a service class, a
-`*ServiceProvider` or an event subscriber. It is taken from the current
-registry (P2a/P2b) and the boundary's `realm_of`, so only `custom` counts.
+by Python on the host at collection. A build recomputes only
+`composer_lock_sha` and `sources_sha` and runs no git: the two `git_*` fields
+are informational (the report shows `git_commit`).
+`sources_sha` is the sha256 of `(path, content sha256)` pairs, each path
+relative to the composer root (`install_map`, else the scan root) at
+collection and at build time alike, so an artifact collected at the composer
+root stays `fresh` for a scan of `web/`; a file outside it is `../`-relative,
+never absolute. The pairs cover the custom files that shape the container:
+`*.info.yml`, `*.services.yml`, `*.routing.yml`, `*.module` and the other
+procedural suffixes, and every PHP file the registry knows as a plugin, a
+plugin manager, a service class, a `*ServiceProvider` or an event subscriber.
+They are taken from the current registry (P2a/P2b) and the boundary's
+`realm_of`, so only `custom` counts.
 
 A build compares `composer_lock_sha` and `sources_sha` with what it recomputes:
 
 - equal → `fresh`;
 - different → `stale`, with reasons (`composer.lock changed`, `N container
-  source files changed`, with up to 10 paths);
+  source files changed`, with up to 10 paths; the full list of changed files
+  is kept for §8's `possibly_stale`);
 - the overlay is applied in both cases.
 
 `enabled_extensions_sha` is compared with the static `core.extension.yml` (when
@@ -363,8 +370,9 @@ that has none. Each record is:
 
 Only custom subjects are logged, plus boundary subjects already in `G`.
 `possibly_stale` is true for every record when the artifact is `stale` and the
-record's subject lives in a file among the stale reasons, or anywhere when
-`composer.lock` changed. Records are sorted by `(kind, subject)`.
+record's subject lives in one of the changed container source files (the full
+list, not the ten a reason names; compared relative to the composer root), or
+anywhere when `composer.lock` changed. Records are sorted by `(kind, subject)`.
 
 ## 9. Report
 

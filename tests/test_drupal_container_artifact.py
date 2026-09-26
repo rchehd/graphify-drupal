@@ -331,3 +331,91 @@ def test_compute_host_stamp_outside_git_has_none_commit(tmp_path):
     stamp = compute_host_stamp(root)
     assert stamp["git_commit"] is None
     assert stamp["git_dirty"] is False
+
+
+# -- final review: composer-root anchors, no git at build, the full changed list ----
+
+
+def _stamped(root: Path) -> Artifact:
+    return Artifact(data={**_valid_payload(), "stamp": compute_host_stamp(root)},
+                    path=root / "drupal-container.json")
+
+
+@pytest.mark.parametrize("with_registry", [False, True])
+def test_a_stamp_taken_at_the_composer_root_is_fresh_for_a_scan_of_web(
+        tmp_path, with_registry, _isolated_discovery_state):
+    """Finding 7: `sources` keys are relative to the composer root at both
+    collection and build time, whatever the scan root."""
+    from graphify.drupal import discovery
+
+    root = _site(tmp_path / "site")
+    if with_registry:
+        discovery.prepare_run(root, tmp_path / "collect")
+    artifact = _stamped(root)
+    assert all(k.startswith("web/") for k in artifact.stamp["sources"])
+    if with_registry:
+        discovery.prepare_run(root / "web", tmp_path / "build")
+
+    status, reasons = staleness(artifact, root / "web")
+    assert (status, reasons) == ("fresh", [])
+
+
+def test_a_source_outside_the_composer_root_is_never_stored_absolute(tmp_path):
+    from graphify.drupal.container import _sources_sha
+
+    anchor = tmp_path / "site"
+    anchor.mkdir()
+    outside = _touch(tmp_path, "elsewhere/x.info.yml")
+    _sha, hashes = _sources_sha(anchor, [outside])
+    assert list(hashes) == ["../elsewhere/x.info.yml"]
+
+
+def test_staleness_runs_no_git(tmp_path, monkeypatch):
+    """Finding 8: a build's staleness check uses neither `git_commit` nor
+    `git_dirty`, so it runs no git."""
+    from graphify.drupal import container
+
+    root = _site(tmp_path)
+    artifact = _stamped(root)
+
+    def _no_git(*_args, **_kwargs):
+        raise AssertionError("git ran during staleness")
+
+    monkeypatch.setattr(container, "_run_git", _no_git)
+    monkeypatch.setattr(container.subprocess, "run", _no_git)
+    assert staleness(artifact, root) == ("fresh", [])
+
+
+@pytest.mark.parametrize("scan", [".", "web"])
+def test_possibly_stale_holds_past_the_tenth_changed_file(tmp_path, scan):
+    """Finding 9: the reason shows 10 paths, but every changed file marks
+    its records `possibly_stale`."""
+    import networkx as nx
+
+    from graphify.drupal import divergence
+    from graphify.drupal.container import check_staleness
+    from graphify.drupal.container_overlay import OverlayResult
+
+    root = _site(tmp_path)
+    names = [f"m{i:02d}" for i in range(12)]
+    for name in names:
+        _touch(root, f"web/modules/custom/{name}/{name}.info.yml", f"name: {name}\ntype: module\n")
+    artifact = _stamped(root)
+    for name in names:
+        _touch(root, f"web/modules/custom/{name}/{name}.info.yml", f"name: {name}\ntype: module\n#\n")
+
+    status, reasons, changed = check_staleness(artifact, root / scan)
+    assert status == "stale" and len(changed) == 12
+    assert reasons == [f"12 container source files changed: {', '.join(sorted(changed)[:10])}"]
+
+    scan_root = (root / scan).resolve()
+    G = nx.Graph()
+    for name in names:
+        file = (root / f"web/modules/custom/{name}/{name}.info.yml").resolve()
+        G.add_node(f"drupal_extension_{name}", type="drupal_extension", realm="custom",
+                   runtime="absent", source_file=file.relative_to(scan_root).as_posix())
+    result = OverlayResult(status=status, reasons=reasons, stale_files=changed)
+    records = divergence.compute(G, result, artifact, root / scan)
+    stale = [r for r in records if r["kind"] == "static_only"]
+    assert len(stale) == 12
+    assert all(r["possibly_stale"] for r in stale)

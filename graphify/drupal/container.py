@@ -227,17 +227,36 @@ def container_sources(root: Path) -> list[Path]:
 
 # -- the host-computable half of the stamp -------------------------------------
 
-def _sources_sha(root: Path, sources: list[Path]) -> tuple[str, dict[str, str]]:
+def _composer_root(root: Path) -> Path:
+    """The composer root `root` belongs to (`install_map`), else `root`: what
+    `sources` keys are relative to, at collection and at build time alike,
+    so a stamp taken at the composer root holds for a scan of `web/`."""
+    imap = install_map(Path(root))
+    return Path(imap.project_root) if imap is not None else Path(root)
+
+
+def _sources_sha(anchor: Path, sources: list[Path]) -> tuple[str, dict[str, str]]:
+    """(sha256 over the pairs, `{relpath: content sha256}`), each path relative
+    to `anchor` (the composer root); one outside it is `../`-relative, never
+    absolute (spec S5.3)."""
     hashes: dict[str, str] = {}
+    try:
+        base = Path(anchor).resolve()
+    except (OSError, RuntimeError):
+        base = Path(anchor).absolute()
     for path in sources:
         try:
             content = path.read_bytes()
         except OSError:
             continue
         try:
-            relpath = path.relative_to(root).as_posix()
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            resolved = path.absolute()
+        try:
+            relpath = resolved.relative_to(base).as_posix()
         except ValueError:
-            relpath = path.as_posix()
+            relpath = Path(os.path.relpath(resolved, base)).as_posix()
         hashes[relpath] = hashlib.sha256(content).hexdigest()
 
     digest = hashlib.sha256()
@@ -280,31 +299,45 @@ def _composer_lock_sha(root: Path) -> str | None:
         return None
 
 
-def compute_host_stamp(root: Path) -> dict:
-    """The stamp fields Python can compute on the host: `git_commit`,
-    `git_dirty`, `composer_lock_sha`, `sources_sha`, and `sources` (the
-    `{relpath: content sha256}` map `staleness` diffs to name changed files).
-    Never carries an absolute path (spec S5.3)."""
+def _host_sources(root: Path) -> dict:
+    """The stamp fields a build recomputes: `composer_lock_sha`, `sources_sha`
+    and `sources`. No git (a build uses neither `git_*` field)."""
     root = Path(root)
-    sources = container_sources(root)
-    sources_sha, hashes = _sources_sha(root, sources)
+    sources_sha, hashes = _sources_sha(_composer_root(root), container_sources(root))
     return {
-        "git_commit": _git_commit(root),
-        "git_dirty": _git_dirty(root),
         "composer_lock_sha": _composer_lock_sha(root),
         "sources_sha": sources_sha,
         "sources": hashes,
     }
 
 
-def staleness(artifact: Artifact, root: Path) -> tuple[str, list[str]]:
-    """`("fresh", [])` when `artifact`'s stamp still matches the working tree
-    at `root`; else `("stale", reasons)`. Reasons are `"composer.lock
-    changed"` and `"N container source files changed: a, b, …"` (up to 10
-    paths), per spec S6.3."""
-    host = compute_host_stamp(root)
+def compute_host_stamp(root: Path) -> dict:
+    """The stamp fields Python can compute on the host: `git_commit`,
+    `git_dirty`, `composer_lock_sha`, `sources_sha`, and `sources` (the
+    `{relpath: content sha256}` map, relative to the composer root, that
+    `staleness` diffs to name changed files). Never carries an absolute path
+    (spec S5.3). Collection only: the git fields are informational."""
+    root = Path(root)
+    return {
+        "git_commit": _git_commit(root),
+        "git_dirty": _git_dirty(root),
+        **_host_sources(root),
+    }
+
+
+#: How many changed paths a stale reason names (spec S6.3); the full list is
+#: `check_staleness`'s third value.
+_REASON_PATHS = 10
+
+
+def check_staleness(artifact: Artifact, root: Path) -> tuple[str, list[str], list[str]]:
+    """`staleness`, plus every changed container source file (relative to the
+    composer root, sorted): the reason names only the first ten, and
+    `divergence` marks `possibly_stale` from the full list. Runs no git."""
+    host = _host_sources(root)
     old = artifact.stamp
     reasons: list[str] = []
+    changed: list[str] = []
 
     if old.get("composer_lock_sha") != host["composer_lock_sha"]:
         reasons.append("composer.lock changed")
@@ -316,10 +349,19 @@ def staleness(artifact: Artifact, root: Path) -> tuple[str, list[str]]:
             p for p in (old_sources.keys() | new_sources.keys())
             if old_sources.get(p) != new_sources.get(p)
         )
-        names = ", ".join(changed[:10])
+        names = ", ".join(changed[:_REASON_PATHS])
         reasons.append(f"{len(changed)} container source files changed: {names}")
 
-    return ("stale" if reasons else "fresh", reasons)
+    return ("stale" if reasons else "fresh", reasons, changed)
+
+
+def staleness(artifact: Artifact, root: Path) -> tuple[str, list[str]]:
+    """`("fresh", [])` when `artifact`'s stamp still matches the working tree
+    at `root`; else `("stale", reasons)`. Reasons are `"composer.lock
+    changed"` and `"N container source files changed: a, b, …"` (up to 10
+    paths), per spec S6.3."""
+    status, reasons, _changed = check_staleness(artifact, root)
+    return status, reasons
 
 
 # -- the collector and the command (spec S5, S10) ------------------------------

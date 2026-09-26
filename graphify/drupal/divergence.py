@@ -28,20 +28,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
 
-from graphify.drupal.container import Artifact
+from graphify.drupal.container import Artifact, _composer_root
 from graphify.drupal.container_overlay import RUNTIME_TYPES, OverlayResult
 
 DIVERGENCE_FILENAME = "drupal-divergence.json"
 
 _CORE_EXTENSION = "core.extension.yml"
 _COMPOSER_REASON = "composer.lock changed"
-_SOURCES_REASON = re.compile(r"^\d+ container source files changed: (.*)$")
 
 #: Node attributes a record shows of its subject.
 _SHOWN = ("label", "realm", "source_file", "class_name", "route_path")
@@ -222,24 +220,30 @@ def _extension_state(G: nx.Graph, artifact: Artifact, root: Path, scope: _Scope)
 
 
 def _stale_files(result: OverlayResult) -> tuple[bool, set[str]]:
-    """(every record, the files named) from a `stale` result's reasons."""
+    """(every record, the changed files) of a `stale` result: the full list
+    (`OverlayResult.stale_files`, relative to the composer root), not the ten
+    paths its reason shows."""
     if result.status != "stale":
         return False, set()
-    everything = _COMPOSER_REASON in result.reasons
-    files: set[str] = set()
-    for reason in result.reasons:
-        m = _SOURCES_REASON.match(reason)
-        if m:
-            files.update(p.strip() for p in m.group(1).split(",") if p.strip())
-    return everything, files
+    return _COMPOSER_REASON in result.reasons, set(result.stale_files)
 
 
-def _subject_file(G: nx.Graph, subject: str) -> str | None:
+def _subject_file(G: nx.Graph, subject: str, root: Path, composer_root: Path) -> str | None:
+    """The subject node's `source_file` (relative to the scan root) as the
+    stale files name it: relative to the composer root."""
     node = subject.split("->", 1)[0]
     if node not in G:
         return None
     source_file = G.nodes[node].get("source_file")
-    return Path(str(source_file)).as_posix() if source_file else None
+    if not source_file:
+        return None
+    path = Path(str(source_file))
+    if not path.is_absolute():
+        path = root / path
+    try:
+        return path.resolve().relative_to(composer_root).as_posix()
+    except (ValueError, OSError, RuntimeError):
+        return Path(str(source_file)).as_posix()
 
 
 def compute(G: nx.Graph, result: OverlayResult, artifact: Artifact, root: Path) -> list[dict]:
@@ -250,11 +254,13 @@ def compute(G: nx.Graph, result: OverlayResult, artifact: Artifact, root: Path) 
     records = (_static_only(G, scope) + _container_only(G, result, scope)
                + _conflicts(G, result) + _extension_state(G, artifact, root, scope))
     everything, files = _stale_files(result)
+    composer_root = _composer_root(root) if files else root
     for record in records:
         if everything:
             record["possibly_stale"] = True
         elif files:
-            record["possibly_stale"] = _subject_file(G, record["subject"]) in files
+            record["possibly_stale"] = _subject_file(
+                G, record["subject"], root, composer_root) in files
     return sorted(records, key=lambda r: (r["kind"], r["subject"],
                                           json.dumps(r, sort_keys=True, default=str)))
 

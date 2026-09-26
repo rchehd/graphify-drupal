@@ -52,7 +52,7 @@ from typing import Any
 import networkx as nx
 
 from graphify.drupal.boundary import included_realms, install_map, realm_of
-from graphify.drupal.container import Artifact, ArtifactError, load_artifact, staleness
+from graphify.drupal.container import Artifact, ArtifactError, check_staleness, load_artifact
 from graphify.drupal.discovery import type_id
 from graphify.drupal.hooks import hook_id, hook_impl_id
 from graphify.drupal.yaml_common import (
@@ -120,6 +120,9 @@ class OverlayResult:
     seen: dict[str, set[str]] = field(default_factory=lambda: {t: set() for t in RUNTIME_TYPES})
     #: The node ids `G` had before the facts were applied (after `undo`).
     static_ids: set[str] = field(default_factory=set)
+    #: Every changed container source file of a `stale` artifact, relative to
+    #: the composer root (`container.check_staleness`); `reasons` names ten.
+    stale_files: list[str] = field(default_factory=list)
 
 
 # -- undo -----------------------------------------------------------------------
@@ -1061,7 +1064,8 @@ class _Overlay:
 
 
 def apply(G: nx.Graph, artifact: Artifact | None, root: Path, *, status: str = "fresh",
-          reasons: list[str] | None = None, boundary_facts: bool = False) -> OverlayResult:
+          reasons: list[str] | None = None, boundary_facts: bool = False,
+          stale_files: list[str] | None = None) -> OverlayResult:
     """Lay `artifact` over `G` in place (spec S7). Undoes a previous overlay
     first; with no artifact, adds nothing (`unavailable`, or the `status`
     the caller already decided, such as `invalid`). Never raises: an internal
@@ -1080,7 +1084,7 @@ def apply(G: nx.Graph, artifact: Artifact | None, root: Path, *, status: str = "
             return OverlayResult(status="unavailable" if status == "fresh" else status,
                                  reasons=list(reasons or []))
         result = OverlayResult(status=status, reasons=list(reasons or []),
-                               static_ids=set(G.nodes))
+                               static_ids=set(G.nodes), stale_files=list(stale_files or []))
         _Overlay(G, artifact, Path(root), result).run()
     except Exception as exc:  # noqa: BLE001 -- the overlay never breaks a build
         undo(G)
@@ -1218,9 +1222,9 @@ def run_for_build(G: nx.Graph) -> OverlayResult | None:
             if artifact is None:
                 result = apply(G, None, root, boundary_facts=True)
             else:
-                status, reasons = staleness(artifact, root)
+                status, reasons, changed = check_staleness(artifact, root)
                 result = apply(G, artifact, root, status=status, reasons=reasons,
-                               boundary_facts=True)
+                               boundary_facts=True, stale_files=changed)
         if result.status == "error":
             _log_once("; ".join(result.reasons))
             artifact = None
