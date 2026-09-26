@@ -1034,6 +1034,30 @@ def _patch_build(build: ModuleType) -> None:
     _wrap(build, "dedupe_nodes", _raw_nodes)
     _wrap(build, "dedupe_edges", _raw_edges)
 
+    # `build_merge` prunes deleted and excluded files' nodes after the build
+    # (`build_from_json`, where the overlay ran): the divergence log and the
+    # report block are recomputed for the graph it returns (P3 final review,
+    # finding 5), so neither names a node the written graph does not have.
+    if not callable(getattr(build, "build_merge", None)):
+        raise DrupalSeamError(
+            "graphify.build.build_merge is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _merged(original):
+        def build_merge(*args, **kwargs):
+            from graphify.drupal.container_overlay import _last_build, refresh_after_prune
+
+            _last_build.clear()
+            G = original(*args, **kwargs)
+            refresh_after_prune(G)
+            return G
+        build_merge.__name__ = build_merge.__qualname__ = "build_merge"
+        build_merge.__doc__ = original.__doc__
+        return build_merge
+
+    _wrap(build, "build_merge", _merged)
+
 
 #: Non-empty while `run_for_build` runs (the build seam's re-entry guard).
 _overlaying: list[bool] = []

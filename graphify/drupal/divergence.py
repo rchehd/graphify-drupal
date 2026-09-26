@@ -103,7 +103,10 @@ def _conflicts(G: nx.Graph, result: OverlayResult) -> list[dict]:
         source = str(c.get("source"))
         # An edge's attribute conflict names the edge `u->v`.
         node = source.split("->", 1)[0]
-        node_type = G.nodes[node].get("type") if node in G else None
+        if node not in G:
+            # Pruned by core after the overlay ran (`build_merge`).
+            continue
+        node_type = G.nodes[node].get("type")
         relation = c.get("relation")
         records.append(_record("conflict", source, node_type,
                                {"relation": relation, "target": c.get("static_target")},

@@ -163,6 +163,7 @@ def test_extract_no_dedup_writes_the_graph_when_the_artifact_shrinks(tmp_path, c
     ("graphify.watch", "_check_shrink", "_patch_watch"),
     ("graphify.build", "dedupe_nodes", "_patch_build"),
     ("graphify.build", "dedupe_edges", "_patch_build"),
+    ("graphify.build", "build_merge", "_patch_build"),
 ])
 def test_the_seam_fails_loudly_without_a_shrink_symbol(monkeypatch, module, attr, patcher):
     import importlib
@@ -241,3 +242,39 @@ def test_update_no_cluster_follows_a_shrunk_artifact(tmp_path, change):
         assert not any("runtime" in n or "_overlay_attrs" in n for n in graph["nodes"])
     else:
         _assert_one_service_fewer(graph)
+
+
+# -- finding 5: the divergence log describes the graph core writes ----------------------
+
+
+def test_the_divergence_log_follows_core_s_prune_of_a_deleted_file(tmp_path):
+    """`build_merge` prunes a deleted file's nodes after `build_from_json`
+    (where the overlay runs): the log and the report block must not keep
+    records for what the prune removed."""
+    root = _container_site(tmp_path / "site")
+    artifact = _write(tmp_path / "artifact" / "drupal-container.json",
+                      _artifact_data(root, tmp_path / "stamp"))
+    out = root / "graphify-out"
+    proc = _run(["extract", str(root), "--code-only"], root, artifact)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    gone = service_id("foo.gone")
+    records = json.loads((out / "drupal-divergence.json").read_text(encoding="utf-8"))
+    assert gone in {r["subject"] for r in records}
+
+    (root / "web/modules/custom/foo/foo.services.yml").unlink()
+    proc = _run(["extract", str(root), "--code-only"], root, artifact)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    graph = _graph(out / "graph.json")
+    records = json.loads((out / "drupal-divergence.json").read_text(encoding="utf-8"))
+    assert gone not in _nodes(graph)
+    subjects = {r["subject"].split("->", 1)[0] for r in records}
+    assert gone not in subjects
+    assert subjects <= set(_nodes(graph)) | {r["subject"] for r in records
+                                            if r["kind"] == "extension_state"}
+    inventory = json.loads((out / "drupal-inventory.json").read_text(encoding="utf-8"))
+    counted = inventory["container"]["divergence"]
+    by_kind: dict[str, int] = {}
+    for r in records:
+        by_kind[r["kind"]] = by_kind.get(r["kind"], 0) + 1
+    assert counted == by_kind

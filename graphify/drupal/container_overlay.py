@@ -1246,4 +1246,33 @@ def run_for_build(G: nx.Graph) -> OverlayResult | None:
         _report(_summary(result, artifact, records), out)
     except Exception as exc:  # noqa: BLE001
         _log_once(f"{type(exc).__name__}: {exc}")
+    _last_build[:] = [(G, result, artifact, root, out)] if artifact is not None else []
     return result
+
+
+#: `[(G, result, artifact, root, out)]` of the last `run_for_build` that
+#: applied an artifact, for `refresh_after_prune`.
+_last_build: list[tuple] = []
+
+
+def refresh_after_prune(G: nx.Graph) -> None:
+    """The divergence log and the report block again, for `G` as core's
+    `build_merge` returns it: it prunes a deleted or excluded file's nodes
+    after `build_from_json`, where the overlay ran (spec S8). A no-op unless
+    the last overlay laid an artifact over this very graph. Never raises."""
+    from graphify.drupal import divergence
+
+    if not _last_build or _last_build[0][0] is not G:
+        return
+    _G, result, artifact, root, out = _last_build.pop()
+    try:
+        absent: dict[str, int] = {}
+        for _nid, data in G.nodes(data=True):
+            if data.get("type") in RUNTIME_TYPES and data.get("runtime") == "absent":
+                absent[data["type"]] = absent.get(data["type"], 0) + 1
+        result.runtime_absent = absent
+        records = divergence.compute(G, result, artifact, root)
+        divergence.write(records, out)
+        _report(_summary(result, artifact, records), out)
+    except Exception as exc:  # noqa: BLE001 -- the overlay never breaks a build
+        _log_once(f"{type(exc).__name__}: {exc}")

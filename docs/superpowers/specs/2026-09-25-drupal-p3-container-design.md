@@ -368,6 +368,12 @@ that has none. Each record is:
 | `conflict` | §7.5's one-target relations disagreeing |
 | `extension_state` | an extension enabled in one of `core.extension.yml` and the container but not the other |
 
+The log and the report block describe the graph core writes. An
+incremental `extract` (`build_merge`) prunes a deleted or excluded file's
+nodes after `build_from_json`, where the overlay runs, so the seam wraps
+`build.build_merge` and recomputes both for the graph it returns (a conflict
+whose subject was pruned is dropped, and `runtime_absent` is recounted).
+
 Only custom subjects are logged, plus boundary subjects already in `G`.
 `possibly_stale` is true for every record when the artifact is `stale` and the
 record's subject lives in one of the changed container source files (the full
@@ -417,7 +423,8 @@ raising `DrupalSeamError` otherwise:
 - `build.build_from_json`: the gated overlay (§7.1) runs on the returned graph;
 - `build._load_existing_graph`, `build.dedupe_nodes`/`build.dedupe_edges` and
   `watch._check_shrink`: the incremental baseline, the raw `--no-cluster`
-  write and core's shrink guards (§7.1).
+  write and core's shrink guards (§7.1); `build.build_merge`: the divergence
+  log after core's prune (§8).
 
 Core's help guard answers `graphify drupal container --help` with its generic
 line, so the command's usage is printed on a bad argument instead.
