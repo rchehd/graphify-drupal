@@ -728,6 +728,40 @@ def _patch_watch(watch: ModuleType) -> None:
     _wrap(watch, "_batch_triggers_rebuild", _triggers)
     _wrap(watch, "_has_non_code", _non_code)
 
+    # `update` and `watch` (`_rebuild_code`, clustered and `--no-cluster`)
+    # refuse a smaller graph unless every lost node belongs to a rebuilt
+    # source; an overlay-made node's `source_file` is the artifact (or a hook
+    # implementation's PHP file), which is none. The overlay's own nodes are
+    # left out of both counts in a Drupal run (P3 final review, finding 1):
+    # the overlay is re-laid on every build, so they are never a silent loss.
+    if not callable(getattr(watch, "_check_shrink", None)):
+        raise DrupalSeamError(
+            "graphify.watch._check_shrink is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _shrink(original):
+        def _check_shrink(force, existing_data, new_data, *args, **kwargs):
+            from graphify.drupal.discovery import current_run
+
+            if current_run() is not None:
+                existing_data = _without_overlay_nodes(existing_data)
+                new_data = _without_overlay_nodes(new_data)
+            return original(force, existing_data, new_data, *args, **kwargs)
+        return _check_shrink
+
+    _wrap(watch, "_check_shrink", _shrink)
+
+
+def _without_overlay_nodes(data):
+    """`data` (a graph.json dict) with the nodes the container overlay made left out."""
+    from graphify.drupal.container_overlay import overlay_made
+
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    if not isinstance(nodes, list) or not any(overlay_made(n) for n in nodes):
+        return data
+    return {**data, "nodes": [n for n in nodes if not overlay_made(n)]}
+
 
 def _co_declarers(graph_path: Path, root: Path) -> dict[str, set[str]]:
     """Each path in some node's `declared_in` in `graph_path` -> the other paths
@@ -922,9 +956,91 @@ def _patch_build(build: ModuleType) -> None:
 
     _wrap(build, "build_from_json", _overlaid)
 
+    # The baseline of an incremental merge (P3 final review, finding 1):
+    # `build_merge` (and the raw `merge_raw_extraction`) load graph.json
+    # through `_load_existing_graph`, by bare name. What the last overlay
+    # made is undone there, in a Drupal run, so the #479 guard of
+    # `extract --no-dedup` never reads an item the new artifact does not
+    # make again as a node "neither re-extracted nor pruned". The build that
+    # follows lays the current artifact (`build_from_json`, above).
+    if not callable(getattr(build, "_load_existing_graph", None)):
+        raise DrupalSeamError(
+            "graphify.build._load_existing_graph is missing — graphify core changed shape; "
+            "graphify/drupal/register.py must be updated"
+        )
+
+    def _baseline(original):
+        def _load_existing_graph(graph_path):
+            loaded = original(graph_path)
+            from graphify.drupal.discovery import current_run
+
+            if loaded is None or current_run() is None:
+                return loaded
+            from graphify.drupal.container_overlay import undo_records
+
+            nodes, edges, *rest = loaded
+            undo_records(nodes, edges)
+            return (nodes, edges, *rest)
+        _load_existing_graph.__name__ = _load_existing_graph.__qualname__ = "_load_existing_graph"
+        _load_existing_graph.__doc__ = original.__doc__
+        return _load_existing_graph
+
+    _wrap(build, "_load_existing_graph", _baseline)
+
+    # The raw write (P3 final review, finding 2): `extract --no-cluster`
+    # (cli) and `update`/`watch --no-cluster` (`watch._rebuild_code`) write
+    # the merged extraction without `build_from_json`. Both pass it through
+    # `dedupe_nodes` and then `dedupe_edges` just before, and nothing else in
+    # core calls either: the node list the first returns is remembered, and
+    # the second lays the overlay on both (`lay_on_records`).
+    for attr in ("dedupe_nodes", "dedupe_edges"):
+        if not callable(getattr(build, attr, None)):
+            raise DrupalSeamError(
+                f"graphify.build.{attr} is missing — graphify core changed shape; "
+                "graphify/drupal/register.py must be updated"
+            )
+
+    def _raw_nodes(original):
+        def dedupe_nodes(nodes):
+            result = original(nodes)
+            from graphify.drupal.discovery import current_run
+
+            _raw_pending[:] = [result] if current_run() is not None and not _overlaying else []
+            return result
+        dedupe_nodes.__name__ = dedupe_nodes.__qualname__ = "dedupe_nodes"
+        dedupe_nodes.__doc__ = original.__doc__
+        return dedupe_nodes
+
+    def _raw_edges(original):
+        def dedupe_edges(edges):
+            result = original(edges)
+            if not _raw_pending:
+                return result
+            nodes = _raw_pending.pop()
+            from graphify.drupal.discovery import current_run
+
+            if current_run() is None or _overlaying:
+                return result
+            from graphify.drupal.container_overlay import lay_on_records
+
+            try:
+                return lay_on_records(nodes, result, build.build_from_json)
+            except Exception:  # noqa: BLE001 -- the overlay never breaks a build
+                return result
+        dedupe_edges.__name__ = dedupe_edges.__qualname__ = "dedupe_edges"
+        dedupe_edges.__doc__ = original.__doc__
+        return dedupe_edges
+
+    _wrap(build, "dedupe_nodes", _raw_nodes)
+    _wrap(build, "dedupe_edges", _raw_edges)
+
 
 #: Non-empty while `run_for_build` runs (the build seam's re-entry guard).
 _overlaying: list[bool] = []
+
+#: The node list the last `dedupe_nodes` returned in a Drupal run, until the
+#: `dedupe_edges` that follows it on a raw write takes it.
+_raw_pending: list[list] = []
 
 
 _PATCHERS = {

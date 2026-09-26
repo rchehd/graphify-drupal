@@ -216,6 +216,30 @@ build is current in the process: `discovery.prepare_run` has set a registry for
 a root. It runs once per build, guarded against re-entry. `query`, `path` and
 the other readers call `build_from_json` without a run and are untouched.
 
+The raw `--no-cluster` write (`extract --no-cluster` in `cli`, `update` and
+`watch` with `--no-cluster` in `watch._rebuild_code`) serialises the merged
+extraction without `build_from_json`. Both paths pass it through
+`build.dedupe_nodes` and then `build.dedupe_edges`, which nothing else in core
+calls, so the seam wraps that pair: the second undoes a previous overlay on
+the lists, builds a throw-away undirected graph from copies of them through
+`build_from_json` (the seam, so the whole step runs: artifact, staleness,
+boundary facts, divergence log, report block) and carries back what the
+overlay did: the nodes and edges it made, and the keys `_overlay_attrs` names
+on every other record. One limitation stays: an incremental `extract
+--no-cluster` with no changed file exits before that pair ("no incremental
+changes detected"), so an artifact-only change reaches a `--no-cluster` graph
+with the next run that changes a file (a clustered build always lays it).
+
+Core's shrink guards never count what the overlay made as a lost node (the
+next overlay makes it again, or the artifact no longer has it). `update` and
+`watch` compare node counts in `watch._check_shrink`; its wrapper leaves nodes
+carrying `_overlay` or `_overlay_file` out of both graphs in a Drupal run.
+`build_merge` (and `merge_raw_extraction`) load the baseline through
+`build._load_existing_graph`; its wrapper undoes the previous overlay on the
+loaded lists (the same rule as §7.2), so `extract --no-dedup`'s #479 guard
+compares static with static. Without either, a removed artifact, or one with
+a service fewer, made `update` refuse the write and `extract --no-dedup` fail.
+
 ### 7.2 Undo first
 
 Before applying, the overlay removes what a previous overlay left in `G`

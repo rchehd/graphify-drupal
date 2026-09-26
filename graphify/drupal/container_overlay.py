@@ -32,6 +32,9 @@ and `subscribers`.
 `run_for_build` is what the build seam calls on every graph core builds while
 a Drupal run is current (spec S7.1): artifact, staleness, `apply`, the
 boundary facts, the divergence log and the report's inventory block.
+`undo_records` is `undo` on graph.json's lists (the baseline core loads for
+an incremental merge), and `lay_on_records` runs the whole step for a raw
+`--no-cluster` write, which builds no graph.
 
 A `drupal_hook_impl` node the overlay makes has its implementation's PHP file
 as `source_file` on purpose, as P2b's would: when core re-extracts that file it
@@ -179,6 +182,16 @@ def undo(G: nx.Graph) -> None:
     multi = G.is_multigraph()
     edges = list(G.edges(keys=True, data=True)) if multi else [
         (u, v, None, d) for u, v, d in G.edges(data=True)]
+    removed, drop = _undo_items(edges, G.nodes(data=True))
+    G.remove_edges_from([(u, v, k) if multi else (u, v) for u, v, k in removed])
+    G.remove_nodes_from(drop)
+
+
+def _undo_items(edges, nodes) -> tuple[set, list]:
+    """`undo`'s rule over `(u, v, key, data)` edges and `(id, data)` nodes:
+    strips every item in place and returns what to remove, `({(u, v, key)},
+    [node id])`. The nodes are walked after the edges (a node's hand-over
+    depends on the edges that survive)."""
     removed: set = set()
     static_files: dict[str, list[tuple[str, str]]] = {}
     for u, v, k, data in edges:
@@ -191,10 +204,9 @@ def undo(G: nx.Graph) -> None:
         where = (str(data.get("source_file") or ""), str(data.get("source_location") or "L1"))
         static_files.setdefault(u, []).append(where)
         static_files.setdefault(v, []).append(where)
-    G.remove_edges_from([(u, v, k) if multi else (u, v) for u, v, k in removed])
 
     drop = []
-    for nid, data in G.nodes(data=True):
+    for nid, data in nodes:
         _strip(data)
         if not data.get(_OVERLAY):
             continue
@@ -204,7 +216,90 @@ def undo(G: nx.Graph) -> None:
         if _owned(data):
             data["source_file"], data["source_location"] = min(static_files[nid])
         _hand_over(data)
-    G.remove_nodes_from(drop)
+    return removed, drop
+
+
+def undo_records(nodes: list, edges: list) -> None:
+    """`undo` on graph.json's lists (`nodes`, and `links`/`edges` with
+    `source`/`target`), in place: what core loads as the baseline of an
+    incremental merge (`build._load_existing_graph`) or carries into a raw
+    `--no-cluster` write. Non-dict entries are left alone."""
+    edge_items = [(e.get("source"), e.get("target"), i, e)
+                  for i, e in enumerate(edges) if isinstance(e, dict)]
+    node_items = [(n.get("id"), n) for n in nodes if isinstance(n, dict)]
+    removed, drop = _undo_items(edge_items, node_items)
+    if removed:
+        gone = {k for _u, _v, k in removed}
+        edges[:] = [e for i, e in enumerate(edges) if i not in gone]
+    if drop:
+        dropped = set(drop)
+        nodes[:] = [n for n in nodes if not (isinstance(n, dict) and n.get("id") in dropped)]
+
+
+#: What `lay_on_records` copies back beside the keys `_overlay_attrs` names.
+_MARKERS = (_ATTRS, _PREV, _SET)
+#: `build_from_json`'s own bookkeeping on an edge; never part of a raw record.
+_BUILD_EDGE_KEYS = frozenset({"_src", "_tgt"})
+
+
+def lay_on_records(nodes: list, edges: list, build_from_json) -> list:
+    """The overlay for a raw write (`extract`/`update --no-cluster`), which
+    serialises the merged extraction without building a graph (spec S7.1).
+
+    Undoes a previous overlay on the lists (`undo_records`; `nodes` in place),
+    builds a throw-away graph from copies of them through `build_from_json`
+    (the seam, so `run_for_build` runs: artifact, staleness, the boundary
+    facts, the divergence log, the report block), and carries what the
+    overlay did back: the nodes and edges it made are appended, and on every
+    other record the keys `_overlay_attrs` names (with the undo markers) are
+    copied over. Returns the new edge list. The throw-away graph is
+    undirected, as `extract` builds by default."""
+    undo_records(nodes, edges)
+    G = build_from_json({"nodes": [dict(n) if isinstance(n, dict) else n for n in nodes],
+                         "edges": [dict(e) if isinstance(e, dict) else e for e in edges]})
+    by_id = {n.get("id"): n for n in nodes if isinstance(n, dict)}
+    for nid, data in G.nodes(data=True):
+        record = by_id.get(nid)
+        if record is None:
+            if data.get(_OVERLAY):
+                nodes.append({"id": nid, **data})
+            continue
+        _copy_touched(data, record)
+
+    out = list(edges)
+    by_key = {(e.get("source"), e.get("target"), e.get("relation")): e
+              for e in edges if isinstance(e, dict)}
+    for u, v, data in G.edges(data=True):
+        src, tgt = data.get("_src", u), data.get("_tgt", v)
+        if data.get("origin") == ORIGIN and _owned(data):
+            out.append({"source": src, "target": tgt,
+                        **{k: val for k, val in data.items() if k not in _BUILD_EDGE_KEYS}})
+            continue
+        record = by_key.get((src, tgt, data.get("relation")))
+        if record is not None:
+            _copy_touched(data, record)
+    return out
+
+
+def _copy_touched(data: dict, record: dict) -> None:
+    """The keys the overlay wrote on `data` (a graph item), copied onto `record`."""
+    touched = data.get(_ATTRS)
+    if not touched:
+        return
+    for key in touched:
+        if key in data:
+            record[key] = data[key]
+        else:
+            record.pop(key, None)
+    for key in _MARKERS:
+        if key in data:
+            record[key] = data[key]
+
+
+def overlay_made(node: dict) -> bool:
+    """A graph.json node the overlay created and still owns: what `undo`
+    may drop, so never a loss core's shrink guards should count."""
+    return isinstance(node, dict) and (bool(node.get(_OVERLAY)) or _OWN_FILE in node)
 
 
 # -- binding --------------------------------------------------------------------
