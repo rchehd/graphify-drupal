@@ -565,10 +565,14 @@ With the artifact, 40 of the 48 own plugin nodes are `runtime: present` and
 
 - eca_custom's 3 actions (`redirect_to_webform`, `task_create_action`,
   `task_update_action`), each under both `action` and `eca.action`: 6 nodes.
-  eca_custom is enabled, but the container lists none of them. Its
-  `src/Hook/PluginInfoHooks.php` implements `action_info_alter` (a
-  container-only hook implementation in the divergence log), which removes
-  them at runtime.
+  The artifact's `action` and `eca.action` lists (88 definitions each) do
+  not hold them. It lists them only under `views_bulk_operations_action`,
+  with `provider: core`: eca_custom's `PluginInfoHooks::actionInfoAlter()` (a
+  container-only hook implementation in the divergence log) relabels them and
+  sets their provider to `core`. The static graph cannot tell why the two
+  lists lack them, so `absent` is recorded as the container says, never
+  corrected. The three reach the graph through the container as
+  `views_bulk_operations_action` plugins.
 - the deriver's base id `eca_custom_webform_submission`. The container lists
   only the derivative `…:insert`, which the overlay adds as its own node.
 - `webform_integrations_email_smtp` under the mailsystem type. The artifact
