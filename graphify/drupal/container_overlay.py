@@ -72,6 +72,7 @@ from graphify.drupal.yaml_common import (
     tag_id,
 )
 from graphify.drupal.yaml_extract import extension_id
+from graphify.drupal.yaml_links import LINK_FAMILIES
 from graphify.ids import make_id
 
 ORIGIN = "container"
@@ -102,14 +103,6 @@ _EDGE_RESERVED = frozenset({
 
 #: Drupal 11.1+'s stand-in class for a procedural hook implementation.
 _PROCEDURAL_CALL = "Drupal\\Core\\Extension\\ProceduralCall"
-
-#: P1's links families (`yaml_links`): `yaml_name` -> (link kind, node type).
-_LINK_FAMILIES = {
-    "links.menu": ("menu_link", "drupal_menu_link"),
-    "links.task": ("local_task", "drupal_local_task"),
-    "links.action": ("local_action", "drupal_local_action"),
-    "links.contextual": ("contextual_link", "drupal_contextual_link"),
-}
 
 _PERMISSION_SPLIT = re.compile(r"[+,]")
 _PSR4 = re.compile(r"^Drupal\\([A-Za-z0-9_]+)\\(.+)$")
@@ -266,21 +259,60 @@ _MARKERS = (_ATTRS, _PREV, _SET)
 _BUILD_EDGE_KEYS = frozenset({"_src", "_tgt"})
 
 
-def lay_on_records(nodes: list, edges: list, build_from_json) -> list:
+def _needs_overlay(nodes: list) -> bool:
+    """Whether a raw write's overlay pass (`lay_on_records`) has anything to
+    apply: a boundary stub already in the records (the registry's facts are
+    re-applied to it on every build, artifact or not), or a container
+    artifact for the current run. Without either, the throw-away
+    `build_from_json` this function otherwise builds on every Drupal
+    `--no-cluster` write changes nothing (`apply` with no artifact and no
+    boundary stub adds no node, no edge, no attribute)."""
+    from graphify.drupal.container import ArtifactError, load_artifact
+    from graphify.drupal.discovery import current_run
+
+    if any(isinstance(n, dict) and n.get("boundary") for n in nodes):
+        return True
+    run = current_run()
+    if run is None:
+        return False
+    root, _out = run
+    try:
+        return load_artifact(root) is not None
+    except ArtifactError:
+        # Present but broken: still worth a pass, so the `invalid` status
+        # reaches the divergence log and the report block.
+        return True
+
+
+def lay_on_records(nodes: list, edges: list, build_from_json, *, directed: bool = False) -> list:
     """The overlay for a raw write (`extract`/`update --no-cluster`), which
     serialises the merged extraction without building a graph (spec S7.1).
 
-    Undoes a previous overlay on the lists (`undo_records`; `nodes` in place),
-    builds a throw-away graph from copies of them through `build_from_json`
-    (the seam, so `run_for_build` runs: artifact, staleness, the boundary
-    facts, the divergence log, the report block), and carries what the
-    overlay did back: the nodes and edges it made are appended, and on every
-    other record the keys `_overlay_attrs` names (with the undo markers) are
-    copied over. Returns the new edge list. The throw-away graph is
-    undirected, as `extract` builds by default."""
+    Undoes a previous overlay on the lists (`undo_records`; `nodes` in place).
+    With no artifact for the current run and no boundary stub already in
+    `nodes`, that is the whole step: nothing else here would change one
+    (`_needs_overlay`), so the throw-away build below -- and the registry
+    lookups, the artifact staleness check and the divergence/report writes it
+    would otherwise re-run for nothing on every such write -- is skipped.
+
+    Otherwise builds a throw-away graph from copies of the lists through
+    `build_from_json` (the seam, so `run_for_build` runs: artifact,
+    staleness, the boundary facts, the divergence log, the report block), and
+    carries what the overlay did back: the nodes and edges it made are
+    appended, and on every other record the keys `_overlay_attrs` names (with
+    the undo markers) are copied over. Returns the new edge list.
+
+    `directed` must be the direction the write's own graph carries (or will
+    carry): the throw-away graph is thrown away, but `_Overlay.edge`'s
+    single-target conflict check reads `G.is_directed()` to walk a node's
+    outgoing edges only, and an undirected throw-away graph over a directed
+    write's records would see a reverse-direction edge as the same pair."""
     undo_records(nodes, edges)
+    if not _needs_overlay(nodes):
+        return edges
     G = build_from_json({"nodes": [dict(n) if isinstance(n, dict) else n for n in nodes],
-                         "edges": [dict(e) if isinstance(e, dict) else e for e in edges]})
+                         "edges": [dict(e) if isinstance(e, dict) else e for e in edges]},
+                        directed=directed)
     by_id = {n.get("id"): n for n in nodes if isinstance(n, dict)}
     for nid, data in G.nodes(data=True):
         record = by_id.get(nid)
@@ -978,9 +1010,9 @@ class _Overlay:
         family (`menu.link` from `*.links.menu.yml`, ...) is P1's link node,
         so a static link is confirmed rather than doubled."""
         t = self.registry.types.get(plugin_type) if self.registry is not None else None
-        link = _LINK_FAMILIES.get(t.yaml_name) if t is not None else None
+        link = LINK_FAMILIES.get(t.yaml_name) if t is not None else None
         if link is not None:
-            kind, node_type = link
+            kind, node_type, _declares = link
             return link_id(kind, name), node_type, "routing"
         return plugin_id(plugin_type, name), "drupal_plugin", "plugin"
 
@@ -1363,6 +1395,20 @@ def run_for_build(G: nx.Graph) -> OverlayResult | None:
 _last_build: list[tuple] = []
 
 
+def _recount_edges(G: nx.Graph) -> dict[str, int]:
+    """`{"confirmed": n, "container_only": n}` from `G`'s surviving edges: a
+    prune can drop an overlay-confirmed or overlay-only edge along with the
+    node it named, and the counts `apply` took before the prune would then
+    name more edges than the written graph has."""
+    counts = {"confirmed": 0, "container_only": 0}
+    for _u, _v, data in G.edges(data=True):
+        if data.get("confirmed_by") == ORIGIN:
+            counts["confirmed"] += 1
+        elif data.get("origin") == ORIGIN:
+            counts["container_only"] += 1
+    return counts
+
+
 def refresh_after_prune(G: nx.Graph) -> None:
     """The divergence log and the report block again, for `G` as core's
     `build_merge` returns it: it prunes a deleted or excluded file's nodes
@@ -1379,6 +1425,7 @@ def refresh_after_prune(G: nx.Graph) -> None:
             if data.get("type") in RUNTIME_TYPES and data.get("runtime") == "absent":
                 absent[data["type"]] = absent.get(data["type"], 0) + 1
         result.runtime_absent = absent
+        result.edges.update(_recount_edges(G))
         records = divergence.compute(G, result, artifact, root)
         divergence.write(records, out)
         _report(_summary(result, artifact, records), out)

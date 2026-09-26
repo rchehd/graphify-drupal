@@ -10,11 +10,12 @@ import networkx as nx
 import pytest
 
 from graphify.build import build_from_json
-from graphify.drupal import boundary
+from graphify.drupal import boundary, discovery
 from graphify.drupal.container import Artifact
 from graphify.drupal.container_overlay import ORIGIN, _Binder, apply, undo
 from graphify.drupal.yaml_common import parameter_id, permission_id, route_id, service_id
 from graphify.drupal.yaml_extract import extension_id
+from tests.test_drupal_discovery import _site
 from tests.test_drupal_discovery_seam import _isolated_discovery_state  # noqa: F401
 
 FOO = "web/modules/custom/foo"
@@ -635,3 +636,181 @@ def test_a_graph_overlaid_before_the_ownership_marker_still_undoes(tmp_path):
         data.pop("_overlay_file", None)
     undo(G)
     assert _dump(G) == _dump(static)
+
+
+# -- P3's deferred minors (spec S11) ---------------------------------------------
+
+
+def _single_extension_site(tmp_path: Path) -> Path:
+    """The cheapest tree `prepare_run` still recognises: a scan root that
+    directly holds a `*.info.yml` (spec `discovery.prepare_run`'s docstring)."""
+    root = tmp_path / "site"
+    root.mkdir(parents=True)
+    (root / "foo.info.yml").write_text("name: Foo\ntype: module\n", encoding="utf-8")
+    return root
+
+
+def test_lay_on_records_skips_the_throw_away_build_without_artifact_or_boundary(tmp_path):
+    """Item 1: `lay_on_records` builds a throw-away graph on every Drupal
+    `--no-cluster` write. With no container artifact for the run and no
+    boundary stub already in the records, `apply` would add nothing anyway
+    (`test_no_artifact_marks_nothing`), so the build itself is skipped."""
+    from graphify.drupal.container_overlay import lay_on_records
+
+    root = _single_extension_site(tmp_path)
+    discovery.prepare_run(root, tmp_path / "scratch")
+    assert discovery.current_run() is not None
+    assert not (root / "drupal-container.json").exists()
+
+    calls: list[dict] = []
+
+    def fake_build_from_json(extraction, **kwargs):
+        calls.append(kwargs)
+        return nx.Graph()
+
+    edges = [{"source": "a", "target": "b", "relation": "calls"}]
+    out = lay_on_records([{"id": "x", "type": "drupal_service"}], list(edges), fake_build_from_json)
+    assert calls == []
+    assert out == edges
+
+    # A boundary stub already in the records: the pass still runs (the
+    # registry's facts must be re-applied to it) even with no artifact.
+    stub_nodes = [{"id": "x", "type": "drupal_service", "boundary": True}]
+    lay_on_records(stub_nodes, [], fake_build_from_json)
+    assert len(calls) == 1
+
+
+def test_lay_on_records_runs_with_no_boundary_stub_when_an_artifact_exists(tmp_path):
+    root = _single_extension_site(tmp_path)
+    (root / "drupal-container.json").write_text(
+        json.dumps({"schema_version": 1, "services": [], "aliases": {}, "routes": [],
+                    "extensions": [], "hooks": {}, "plugins": {}, "subscribers": {},
+                    "errors": [], "stamp": {}}),
+        encoding="utf-8")
+    discovery.prepare_run(root, tmp_path / "scratch")
+
+    from graphify.drupal.container_overlay import lay_on_records
+
+    calls: list[dict] = []
+
+    def fake_build_from_json(extraction, **kwargs):
+        calls.append(kwargs)
+        return nx.Graph()
+
+    lay_on_records([{"id": "x", "type": "drupal_service"}], [], fake_build_from_json)
+    assert len(calls) == 1
+
+
+def test_lay_on_records_honours_directed(tmp_path):
+    """Item 2: the raw `--no-cluster` overlay used to build its throw-away
+    graph undirected regardless of the write's own direction. The throw-away
+    graph's directedness must match, or `_Overlay.edge`'s single-target
+    conflict check (which reads `G.is_directed()`) reads a reverse-direction
+    edge as the same pair."""
+    from graphify.drupal.container_overlay import lay_on_records
+
+    root = _single_extension_site(tmp_path)
+    (root / "drupal-container.json").write_text(
+        json.dumps({"schema_version": 1, "services": [], "aliases": {}, "routes": [],
+                    "extensions": [], "hooks": {}, "plugins": {}, "subscribers": {},
+                    "errors": [], "stamp": {}}),
+        encoding="utf-8")
+    discovery.prepare_run(root, tmp_path / "scratch")
+
+    captured: dict = {}
+
+    def fake_build_from_json(extraction, *, directed=False, **kwargs):
+        captured["directed"] = directed
+        return nx.DiGraph() if directed else nx.Graph()
+
+    lay_on_records([{"id": "x", "type": "drupal_service"}], [], fake_build_from_json, directed=True)
+    assert captured["directed"] is True
+
+    captured.clear()
+    lay_on_records([{"id": "x", "type": "drupal_service"}], [], fake_build_from_json, directed=False)
+    assert captured["directed"] is False
+
+
+def test_link_families_is_shared_between_yaml_links_and_the_overlay(tmp_path):
+    """Item 5: `container_overlay` used to keep its own copy of P1's
+    links-family table, `yaml_name -> (kind, node type)`; the two must never
+    drift apart, so the overlay reads `yaml_links`'s own table."""
+    from graphify.drupal import container_overlay, yaml_links
+
+    assert container_overlay.LINK_FAMILIES is yaml_links.LINK_FAMILIES
+    assert yaml_links.LINK_FAMILIES["links.menu"][:2] == ("menu_link", "drupal_menu_link")
+
+
+def test_refresh_after_prune_recounts_result_edges(tmp_path):
+    """Item 4: `refresh_after_prune` recomputes `runtime_absent` for the graph
+    `build_merge` prunes, but left `result.edges` (`confirmed`/
+    `container_only`) as `apply` counted them before the prune -- stale once a
+    pruned node took an overlay edge down with it."""
+    from graphify.drupal import container_overlay as co
+
+    G = _graph(tmp_path)
+    result = apply(G, _artifact(tmp_path), tmp_path)
+    before_confirmed, before_only = result.edges["confirmed"], result.edges["container_only"]
+    assert before_confirmed and before_only
+
+    # A confirmed edge and a container-only edge, each on a node about to be pruned.
+    confirmed_edge = next((u, v) for u, v, d in G.edges(data=True) if d.get("confirmed_by") == ORIGIN)
+    only_edge = next((u, v) for u, v, d in G.edges(data=True)
+                     if d.get("origin") == ORIGIN and "confirmed_by" not in d)
+    G.remove_node(confirmed_edge[1])
+    G.remove_node(only_edge[1])
+
+    co._last_build[:] = [(G, result, _artifact(tmp_path), tmp_path, tmp_path / "out")]
+    co.refresh_after_prune(G)
+
+    live_confirmed = sum(1 for _u, _v, d in G.edges(data=True) if d.get("confirmed_by") == ORIGIN)
+    live_only = sum(1 for _u, _v, d in G.edges(data=True)
+                    if d.get("origin") == ORIGIN and "confirmed_by" not in d)
+    assert result.edges["confirmed"] == live_confirmed < before_confirmed
+    assert result.edges["container_only"] == live_only < before_only
+
+
+def test_the_realm_memo_caches_by_path(tmp_path, monkeypatch):
+    """Item 6: `_Overlay.realm` memoises `realm_of` per path (`self._realms`);
+    a coverage gap left it with no unit test. The fixture's artifact asks the
+    same extension's (and the same file's) realm from several facts, so a
+    working memo must call the underlying `realm_of` at most once per
+    distinct path."""
+    from graphify.drupal import container_overlay as co
+
+    calls: list[str] = []
+    original = co.realm_of
+
+    def counting(path):
+        calls.append(str(path))
+        return original(path)
+
+    monkeypatch.setattr(co, "realm_of", counting)
+
+    G = _graph(tmp_path)
+    apply(G, _artifact(tmp_path), tmp_path)
+
+    assert calls, "the overlay never asked realm_of anything"
+    assert len(calls) == len(set(calls))
+
+
+def test_divergence_subject_file_resolves_both_sides(tmp_path):
+    """Item 3: `_subject_file` resolved the subject's path (symlinks
+    followed) but compared it with an unresolved composer root, so a root
+    reached through a symlink never matched and every subject was silently
+    treated as not `possibly_stale`."""
+    from graphify.drupal.divergence import _subject_file
+
+    real = tmp_path / "real"
+    (real / "web/modules/custom/foo").mkdir(parents=True)
+    (real / "web/modules/custom/foo/foo.module").write_text("<?php\n", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    scan_root = link / "web"                 # the scan root: unresolved, symlinked
+    composer_root = link                     # `_composer_root`'s own, unresolved
+
+    G = nx.Graph()
+    G.add_node("n1", source_file="modules/custom/foo/foo.module")
+
+    assert _subject_file(G, "n1", scan_root, composer_root) == "web/modules/custom/foo/foo.module"

@@ -233,7 +233,13 @@ def _stale_files(result: OverlayResult) -> tuple[bool, set[str]]:
 
 def _subject_file(G: nx.Graph, subject: str, root: Path, composer_root: Path) -> str | None:
     """The subject node's `source_file` (relative to the scan root) as the
-    stale files name it: relative to the composer root."""
+    stale files name it: relative to the composer root.
+
+    Both sides are resolved before the comparison: `path` always is (symlinks
+    followed), and `composer_root` must be too, or a root reached through a
+    symlink (a `tmp_path` under a symlinked `/tmp`, a symlinked vendor
+    checkout) never matches, and every subject is wrongly reported as not
+    `possibly_stale`."""
     node = subject.split("->", 1)[0]
     if node not in G:
         return None
@@ -244,7 +250,7 @@ def _subject_file(G: nx.Graph, subject: str, root: Path, composer_root: Path) ->
     if not path.is_absolute():
         path = root / path
     try:
-        return path.resolve().relative_to(composer_root).as_posix()
+        return path.resolve().relative_to(Path(composer_root).resolve()).as_posix()
     except (ValueError, OSError, RuntimeError):
         return Path(str(source_file)).as_posix()
 

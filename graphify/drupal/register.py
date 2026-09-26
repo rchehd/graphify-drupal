@@ -493,6 +493,22 @@ def _absolute(path, base: Path | None) -> Path:
     return p.resolve()
 
 
+def _existing_graph_directed(out: Path) -> bool:
+    """The `directed` flag `<out>/graph.json` already carries, else `False` --
+    the same flag `watch`'s own `--no-cluster` path inherits (#2342) before
+    writing a fresh one. `lay_on_records`'s throw-away graph must agree: an
+    undirected one over a directed write's records would let its
+    single-target conflict check (`_Overlay.edge`, which reads
+    `G.is_directed()`) see a reverse-direction edge as the same pair."""
+    import json
+
+    try:
+        data = json.loads((Path(out) / "graph.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(data.get("directed", False)) if isinstance(data, dict) else False
+
+
 def _registry_widening(paths: list, context: list[dict], anchor) -> list[Path]:
     """The `force_miss()` files an incremental batch must add (spec §5.5).
 
@@ -1048,12 +1064,14 @@ def _patch_build(build: ModuleType) -> None:
             nodes = _raw_pending.pop()
             from graphify.drupal.discovery import current_run
 
-            if current_run() is None or _overlaying:
+            run = current_run()
+            if run is None or _overlaying:
                 return result
             from graphify.drupal.container_overlay import lay_on_records
 
             try:
-                return lay_on_records(nodes, result, build.build_from_json)
+                return lay_on_records(nodes, result, build.build_from_json,
+                                      directed=_existing_graph_directed(run[1]))
             except Exception:  # noqa: BLE001 -- the overlay never breaks a build
                 return result
         dedupe_edges.__name__ = dedupe_edges.__qualname__ = "dedupe_edges"

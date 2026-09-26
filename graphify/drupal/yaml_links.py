@@ -23,6 +23,17 @@ from graphify.drupal.yaml_common import (
 )
 from graphify.drupal.yaml_extract import extension_id
 
+#: The four `*.links.*.yml` families: `yaml_name` -> `(link kind, node type,
+#: declares relation)`. The one place both this module's own extractors and
+#: `container_overlay` (P3's raw-container plugin binding, spec S7) read the
+#: family shape from, so the two never drift apart.
+LINK_FAMILIES: dict[str, tuple[str, str, str]] = {
+    "links.menu": ("menu_link", "drupal_menu_link", "declares_menu_link"),
+    "links.task": ("local_task", "drupal_local_task", "declares_local_task"),
+    "links.action": ("local_action", "drupal_local_action", "declares_local_action"),
+    "links.contextual": ("contextual_link", "drupal_contextual_link", "declares_contextual_link"),
+}
+
 
 def _extract_links(path: Path, kind: str, node_type: str, declares: str, family: str) -> dict[str, Any]:
     data, error = load_drupal_yaml(path)
@@ -105,21 +116,20 @@ def _extract_links(path: Path, kind: str, node_type: str, declares: str, family:
 
 
 def extract_drupal_menu_links(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "menu_link", "drupal_menu_link", "declares_menu_link",
-                          "links.menu")
+    kind, node_type, declares = LINK_FAMILIES["links.menu"]
+    return _extract_links(path, kind, node_type, declares, "links.menu")
 
 
 def extract_drupal_local_tasks(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "local_task", "drupal_local_task", "declares_local_task",
-                          "links.task")
+    kind, node_type, declares = LINK_FAMILIES["links.task"]
+    return _extract_links(path, kind, node_type, declares, "links.task")
 
 
 def extract_drupal_local_actions(path: Path) -> dict[str, Any]:
-    return _extract_links(path, "local_action", "drupal_local_action", "declares_local_action",
-                          "links.action")
+    kind, node_type, declares = LINK_FAMILIES["links.action"]
+    return _extract_links(path, kind, node_type, declares, "links.action")
 
 
 def extract_drupal_contextual_links(path: Path) -> dict[str, Any]:
-    return _extract_links(
-        path, "contextual_link", "drupal_contextual_link", "declares_contextual_link",
-        "links.contextual")
+    kind, node_type, declares = LINK_FAMILIES["links.contextual"]
+    return _extract_links(path, kind, node_type, declares, "links.contextual")
