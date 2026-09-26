@@ -19,6 +19,7 @@ YAML file is simply not counted toward `yaml_plugins`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ from graphify.drupal.boundary import boundary_dir, install_map
 from graphify.drupal.config_stores import in_config_directory
 from graphify.drupal.discovery import Registry
 from graphify.drupal.families import is_drupal_file
+from graphify.drupal.fingerprint import drupal_fingerprint
 from graphify.drupal.hooks import find_hook_candidates, is_procedural_file
 from graphify.drupal.php_semantics import find_php_candidates
 from graphify.drupal.yaml_common import load_drupal_yaml
@@ -249,10 +251,14 @@ def _hook_candidates(registry: Registry, detected: set[str], root: Path) -> list
 _PHP_CANDIDATES_FILENAME = "drupal-php-candidates.json"
 
 
-def _registry_digest(registry: Registry) -> str:
-    import hashlib
-
-    return hashlib.sha1(json.dumps(registry.to_json(), sort_keys=True).encode("utf-8")).hexdigest()
+def _cache_digest(registry: Registry) -> str:
+    """What every cached entry was read against: this package's code (the
+    fingerprint core's AST cache is namespaced with, see
+    `register._patch_cache`) and the whole registry."""
+    digest = hashlib.sha1(drupal_fingerprint().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(json.dumps(registry.to_json(), sort_keys=True).encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _stat_key(path: Path) -> list[int] | None:
@@ -260,7 +266,7 @@ def _stat_key(path: Path) -> list[int] | None:
         st = os.stat(path)
     except OSError:
         return None
-    return [st.st_mtime_ns, st.st_size]
+    return [st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino]
 
 
 def _php_candidates(registry: Registry, detected: set[str], root: Path,
@@ -273,9 +279,10 @@ def _php_candidates(registry: Registry, detected: set[str], root: Path,
     Parsing every custom PHP file on each `detect()` costs about half a
     second on the reference corpus, so with a `cache_dir` a file's entries
     are kept in `<cache_dir>/drupal-php-candidates.json`, keyed by its
-    mtime and size and valid only for the registry they were read against
-    (a digest of all of it): a changed registry reads every file again."""
-    digest = _registry_digest(registry) if cache_dir is not None else ""
+    mtime, ctime, size and inode, and valid only for the code and the
+    registry they were read against (`_cache_digest`): a changed registry
+    or an edited extractor reads every file again."""
+    digest = _cache_digest(registry) if cache_dir is not None else ""
     cached: dict[str, Any] = {}
     if cache_dir is not None:
         try:
@@ -449,8 +456,9 @@ def graph_counts(graph: Any) -> dict[str, Any]:
                 counts["calls_container" if e.get("origin") == "container" else "calls_bound"] += 1
             elif relation in _P4_RELATIONS:
                 counts[relation] += 1
-    except Exception:
-        pass
+    except Exception as exc:
+        # Recorded, so the report can tell a failed count from a zero.
+        counts["counts_error"] = f"{type(exc).__name__}: {exc}"
     counts["plugins"] = dict(sorted(counts["plugins"].items()))
     counts["uses_service"] = dict(sorted(counts["uses_service"].items()))
     return counts
@@ -478,6 +486,8 @@ def _render_graph_counts(counts: dict) -> list[str]:
              f"| calls bound (static) | {counts.get('calls_bound', 0)} |",
              f"| calls bound (container) | {counts.get('calls_container', 0)} |"]
     lines += [f"| {r} | {counts.get(r, 0)} |" for r in _P4_RELATIONS]
+    if counts.get("counts_error"):
+        lines += ["", f"counts incomplete: {counts['counts_error']}"]
     return lines
 
 
@@ -509,8 +519,10 @@ def _counts(counts: object, order: tuple[str, ...] = ()) -> str:
 def render_section(inventory: dict) -> str:
     """Markdown "Drupal coverage" section appended to `GRAPH_REPORT.md`.
 
-    The graph's P4 counts (`graph_counts`) render when the inventory carries
-    them under `graph` (the report seam adds them). Tolerant of a missing key or an inventory with nothing in it: every list
+    The graph's P4 counts (`graph_counts`) render when the inventory
+    carries them under `graph` (the report seam adds them).
+
+    Tolerant of a missing key or an inventory with nothing in it: every list
     renders as "none" and every summary count as 0, rather than raising.
     """
     inventory = inventory or {}

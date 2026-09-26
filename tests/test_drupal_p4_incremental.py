@@ -487,3 +487,92 @@ def test_only_a_binding_change_forces_the_hook_files(tmp_path):
 
     (root / BAR / "src/Form/BarSettingsForm.php").unlink()
     assert hooks in affected_files(plain, build_registry(root))
+
+
+def test_an_edited_extractor_reads_every_php_candidate_again(tmp_path, monkeypatch):
+    """The cache is namespaced by this package's code, as core's AST cache is."""
+    import shutil
+
+    from graphify.drupal import fingerprint
+    from graphify.drupal import inventory as inv
+    from graphify.drupal.discovery import build_registry
+
+    package = tmp_path / "package"
+    package.mkdir()
+    for source in Path(fingerprint.__file__).parent.glob("*.py"):
+        shutil.copy(source, package / source.name)
+    monkeypatch.setattr(inv, "drupal_fingerprint", lambda: fingerprint.drupal_fingerprint(package))
+
+    root = _plugin_site(tmp_path / "site")
+    registry = build_registry(root)
+    detected = {p.as_posix() for p in root.rglob("*.php")}
+    reads: list[str] = []
+    real = inv.find_php_candidates
+    monkeypatch.setattr(inv, "find_php_candidates",
+                        lambda path, registry=None: reads.append(Path(path).name) or real(path, registry))
+    cache = tmp_path / "out"
+    inv.build_inventory(registry, detected, root, cache)
+    reads.clear()
+    inv.build_inventory(registry, detected, root, cache)
+    assert reads == []
+
+    semantics = package / "php_semantics.py"
+    semantics.write_text(semantics.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
+    inv.build_inventory(registry, detected, root, cache)
+    assert len(reads) == len(detected)
+
+
+def test_a_failed_graph_count_is_reported_not_zeroed():
+    from graphify.drupal.inventory import graph_counts, render_section
+
+    class Broken:
+        @property
+        def nodes(self):
+            raise RuntimeError("boom")
+
+    counts = graph_counts(Broken())
+    assert counts["counts_error"] == "RuntimeError: boom"
+    assert "counts incomplete:" in render_section({"graph": counts})
+    assert "counts_error" not in graph_counts({"nodes": [], "links": []})
+
+
+ONLY_SUBSCRIBER = r"""<?php
+
+namespace Drupal\foo\EventSubscriber;
+
+use Drupal\bar\BarEvents;
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+
+class OnlySubscriber implements EventSubscriberInterface {
+
+  public static function getSubscribedEvents(): array {
+    return [BarEvents::SAVE => 'onSave'];
+  }
+
+}
+"""
+
+
+def test_a_subscriber_known_only_as_an_unresolved_event_binds_once_the_constant_exists(tmp_path):
+    """No `subscribes_to_event` edge names this file in the previous graph:
+    only its `unresolved_event` candidate can bring it back."""
+    from tests.test_drupal_discovery import _site
+
+    root = _site(tmp_path / "site", {
+        f"{BAR}/bar.info.yml": "name: Bar\ntype: module\n",
+        "web/modules/custom/foo/foo.info.yml": "name: Foo\ntype: module\n",
+        "web/modules/custom/foo/src/EventSubscriber/OnlySubscriber.php": ONLY_SUBSCRIBER,
+    })
+    out = tmp_path / "out"
+    first, _ = _extract(root, out)
+    subscriber = _node(first, "src/EventSubscriber/OnlySubscriber.php", "OnlySubscriber")
+    assert _targets(first, subscriber, "subscribes_to_event") == set()
+    inventory = json.loads((out / "graphify-out" / "drupal-inventory.json").read_text(encoding="utf-8"))
+    assert [c["kind"] for c in inventory["php_candidates"]] == ["unresolved_event"]
+
+    _write(root / BAR / "src/BarEvents.php",
+           "<?php\n\nnamespace Drupal\\bar;\n\nfinal class BarEvents {\n\n"
+           "  const SAVE = 'bar.save';\n\n}\n")
+    second, _ = _extract(root, out)
+
+    assert _targets(second, subscriber, "subscribes_to_event") == {event_id("bar.save")}

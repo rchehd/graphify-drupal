@@ -257,6 +257,8 @@ def _type_view(t: Any) -> tuple[str, str, str, str]:
 def _plugin_type_files(previous: Any, current: Any) -> set[str]:
     """P4 spec §5.2: a class is a plugin of the learned type whose `subdir`
     it sits in; a changed type forces the custom classes of both subdirs."""
+    # Broad on purpose: a generic subdir (`Plugin/`) forces every class under
+    # it, since which class a type claims is decided per file at extraction.
     changed = _changed(previous.types, current.types, _type_view)
     subdirs = {t.subdir.strip("/") for r in (previous, current) for key, t in r.types.items()
                if key in changed and t.subdir}
