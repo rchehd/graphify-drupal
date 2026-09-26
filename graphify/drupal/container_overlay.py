@@ -29,6 +29,13 @@ It maps `services`, `aliases`, `routes`, `extensions`, `hooks` (P2b's
 implementation shape, plus each implementation's `runtime_order`), `plugins`
 and `subscribers`.
 
+A container hook with a variable name (`form_x_alter`, `node_presave`)
+implements its declared pattern hook (`hooks.declared_hook_of`), as the
+static implementation does. The overlay may bind a procedural function the
+static pass leaves an ambiguous `foo_bar_baz` candidate (vocabulary §5.5):
+the container names the implementing module, so only the entity type / op
+split is left to read, never the module one.
+
 `run_for_build` is what the build seam calls on every graph core builds while
 a Drupal run is current (spec S7.1): artifact, staleness, `apply`, the
 boundary facts, the divergence log and the report's inventory block.
@@ -1033,15 +1040,24 @@ class _Overlay:
         """`subscribes_to_event` from each custom subscriber class bound in
         `G`. The event node is made by its first custom subscriber, in that
         subscriber's realm: an event is where custom code listens, never a
-        boundary stub."""
+        boundary stub.
+
+        A class's listeners for one event are one edge (one relation per
+        pair), grouped before the edge is made, and shaped as the static
+        `getSubscribedEvents()` edge is (`php_semantics._events`): `method`
+        comma-joined in dispatch order (`php_semantics.listener_order`),
+        `priority` for one listener, `priorities` for several."""
+        from graphify.drupal.php_semantics import listener_order
+
         for event, entries in (self.data.get("subscribers") or {}).items():
             if not isinstance(entries, list):
                 continue
+            grouped: dict[str, list[tuple[str, Any]]] = {}
             for s in entries:
                 listener = s.get("callable") if isinstance(s, dict) else None
                 if not isinstance(listener, str) or "::" not in listener:
                     continue
-                cls = listener.lstrip("\\").split("::", 1)[0]
+                cls, method = listener.lstrip("\\").split("::", 1)
                 # The edge's subject is the class, so its own file wins: an
                 # inherited listener (`RouteSubscriberBase::onAlterRoutes`) is
                 # declared in a core file, which would make every custom route
@@ -1058,9 +1074,17 @@ class _Overlay:
                 eid = self.ensure(make_id("drupal", "event", event), type="drupal_event", layer="di",
                                   label=event, realm=realm)
                 self.applied("subscribers")
-                priority = s.get("priority")
-                self.edge(source, eid, "subscribes_to_event",
-                          **({"priority": priority} if priority is not None else {}))
+                grouped.setdefault(source, []).append((method, s.get("priority")))
+            for source, listeners in grouped.items():
+                ordered = listener_order(listeners)
+                extra: dict[str, Any] = {"method": ",".join(m for m, _p in ordered)}
+                priorities = [p for _m, p in ordered]
+                if len(priorities) == 1:
+                    if priorities[0] is not None:
+                        extra["priority"] = priorities[0]
+                elif all(p is not None for p in priorities):
+                    extra["priorities"] = priorities
+                self.edge(source, make_id("drupal", "event", event), "subscribes_to_event", **extra)
 
     # -- service calls (P4 spec §7.4) --
 

@@ -225,7 +225,7 @@ class _Binding:
     is about."""
     declared: str                                  # "form_FORM_ID_alter", "ENTITY_TYPE_<op>"
     relation: str                                  # "alters_form" | "hooks_entity_type"
-    targets: tuple[tuple[str, str, str], ...]      # (node id, target_name, confidence)
+    targets: tuple[tuple[str, str, str], ...]      # (node id, target_name, bundle or "")
     attrs: tuple[tuple[str, str], ...] = ()        # impl node attributes
 
 
@@ -275,6 +275,7 @@ def _classify(name: str, registry: Any) -> tuple[str, str]:
 # -- variable hooks bound (P4 spec §6.2-§6.3) -----------------------------------------
 
 FORM_ALTER = "form_FORM_ID_alter"
+FORM_BASE_ALTER = "form_BASE_FORM_ID_alter"
 _FORM_ALTER_PATTERN = hook_pattern(FORM_ALTER)
 _FORM_ALTER_NAME = re.compile(r"form_(.+)_alter")
 ENTITY_TYPE_PREFIX = "ENTITY_TYPE_"
@@ -299,47 +300,61 @@ def _entity_type_ops(registry: Any) -> frozenset[str]:
     return cached
 
 
-def _entity_form_regex(pattern: str) -> "re.Pattern[str]":
-    """`php_semantics.entity_form_pattern`'s `_*` is the optional `_<bundle>`
-    of `EntityForm::getFormId()` (`<entity>[_<bundle>][_<op>]_form`)."""
-    return re.compile("(?:_.+)?".join(re.escape(part) for part in pattern.split("_*")))
+def _form_targets(x: str, registry: Any) -> tuple[tuple[tuple[str, str, str], ...], bool]:
+    """`(targets, through a base form id)` of `form_<x>_alter`, each target
+    `(node id, target_name, bundle)`, in this order (P4 spec §6.2):
 
+    1. a custom form whose literal `getFormId()` is `x`;
+    2. every custom form whose `getBaseFormId()` is `x` (base);
+    3. the registry's boundary form whose literal id is `x`;
+    4. every boundary form whose `getBaseFormId()` is `x` (base), and none
+       when no class of that base has a literal form id -- a base id is never
+       a form node of its own;
+    5. `x == <t>_form`: `EntityForm::getBaseFormId()` of entity type `t`,
+       every entity form of `t` (base);
+    6. `x` exactly an entity form id `EntityForm::getFormId()` builds:
+       `<t>[_<op>]_form` for a `t` with no `bundle` key, `<t>_<bundle>[_<op>]_form`
+       for a bundle a config file proves (`Registry.entity_bundles`); every
+       such reading (two readings of one id are two forms Drupal alters).
 
-def _form_targets(x: str, registry: Any) -> tuple[tuple[str, str, str], ...]:
-    """The form(s) `form_<x>_alter` alters: a custom form whose literal
-    `getFormId()` is `x`, else every custom form whose `getBaseFormId()` is
-    `x`, else the registry's boundary form `x`, else the one entity form
-    whose pattern matches `x` most literally (`INFERRED`: the bundle is a
-    runtime value). Empty when nothing matches or two entity forms tie."""
+    Empty targets when nothing matches: no bundle is guessed."""
     from graphify.drupal.php_semantics import entity_form_id, entity_form_operations, \
         entity_form_pattern, form_id
 
     facts = [f for f in (registry.class_facts or {}).values() if isinstance(f, dict)]
     if any(f.get("form_id") == x for f in facts):
-        return ((form_id(x), x, "EXTRACTED"),)
+        return ((form_id(x), x, ""),), False
     based = sorted({f["form_id"] for f in facts
                     if f.get("base_form_id") == x and isinstance(f.get("form_id"), str) and f["form_id"]})
     if based:
-        return tuple((form_id(i), i, "EXTRACTED") for i in based)
-    if x in (registry.forms or {}):
-        return ((form_id(x), x, "EXTRACTED"),)
-    matches: list[tuple[int, str, str]] = []
-    for entity_type in registry.entity_types or {}:
-        if not x.startswith(entity_type + "_"):
+        return tuple((form_id(i), i, "") for i in based), True
+    members = (getattr(registry, "base_forms", None) or {}).get(x) or []
+    forms = registry.forms or {}
+    # `forms` holds base ids too (custom over boundary, a literal over a base
+    # id on one side): `x` is a literal id when its class is no member of base `x`.
+    if x in forms and tuple(forms[x])[1:2] not in {(m[2],) for m in members}:
+        return ((form_id(x), x, ""),), False
+    if members:
+        literal = sorted({m[0] for m in members if m[0]})
+        return tuple((form_id(i), i, "") for i in literal), True
+    types = registry.entity_types or {}
+    if x.endswith("_form") and x[:-len("_form")] in types:
+        t = x[:-len("_form")]
+        ops = entity_form_operations(registry, t)
+        if ops:
+            return tuple((entity_form_id(t, op), entity_form_pattern(t, op), "") for op in ops), True
+    bundles = getattr(registry, "entity_bundles", None) or {}
+    found: list[tuple[str, str, str]] = []
+    for t in types:
+        if not x.startswith(t + "_"):
             continue
-        for op in entity_form_operations(registry, entity_type):
-            pattern = entity_form_pattern(entity_type, op)
-            if _entity_form_regex(pattern).fullmatch(x):
-                literal = len(pattern.replace("_*", ""))
-                matches.append((literal, entity_form_id(entity_type, op), pattern))
-    if not matches:
-        return ()
-    best = max(m[0] for m in matches)
-    winners = {(nid, pattern) for literal, nid, pattern in matches if literal == best}
-    if len(winners) != 1:
-        return ()
-    nid, pattern = next(iter(winners))
-    return ((nid, pattern, "INFERRED"),)
+        for op in entity_form_operations(registry, t):
+            tail = "_form" if op == "default" else f"_{op}_form"
+            for bundle in (bundles[t] if t in bundles else [""]):
+                built = t + (f"_{bundle}" if bundle else "") + tail
+                if built == x:
+                    found.append((entity_form_id(t, op), entity_form_pattern(t, op), bundle))
+    return tuple(sorted(set(found))), False
 
 
 def _entity_split(name: str, module: str, registry: Any, function: str) -> tuple[str, str] | None:
@@ -378,10 +393,12 @@ def _bind(pattern: str, name: str, module: str, registry: Any,
         if match is None:
             return None
         x = match.group(1)
-        targets = _form_targets(x, registry)
+        targets, base = _form_targets(x, registry)
         if not targets:
             return _UNBOUND_FORM, x
-        return _Binding(FORM_ALTER, "alters_form", targets, (("form_id", x),))
+        # Drupal invokes `form_<base>_alter` as `hook_form_BASE_FORM_ID_alter`.
+        declared = FORM_BASE_ALTER if base and FORM_BASE_ALTER in registry.hooks else FORM_ALTER
+        return _Binding(declared, "alters_form", targets, (("form_id", x),))
     ops = _entity_type_ops(registry)
     if not (pattern.startswith("*_") and pattern[2:] in ops):
         return None
@@ -390,7 +407,7 @@ def _bind(pattern: str, name: str, module: str, registry: Any,
         return None
     entity_type, op = split
     return _Binding(ENTITY_TYPE_PREFIX + op, "hooks_entity_type",
-                    ((entity_type_id(entity_type), entity_type, "EXTRACTED"),),
+                    ((entity_type_id(entity_type), entity_type, ""),),
                     (("entity_type", entity_type), ("operation", op)))
 
 
@@ -404,6 +421,9 @@ def declared_hook_of(registry: Any, module: str, name: str) -> str:
             return ""
         kind, pattern = _classify(name, registry)
         bound = _bind(pattern, name, module, registry) if kind == "variable" else None
+        if isinstance(bound, tuple):
+            # An unbound form alter still implements `form_FORM_ID_alter`.
+            return FORM_ALTER
         return bound.declared if isinstance(bound, _Binding) else ""
     except Exception:
         return ""
@@ -626,9 +646,9 @@ def _extract_hook_implementations(path: Path, core_result: dict) -> dict[str, An
             add_edge(extension_id(impl.module), hook_id(implemented), "implements_hook", impl.line,
                      owner=impl.module, target_name=implemented)
         if impl.binding is not None:
-            for target, target_name, confidence in impl.binding.targets:
+            for target, target_name, bundle in impl.binding.targets:
                 add_edge(impl_id, target, impl.binding.relation, impl.line,
-                         target_name=target_name, confidence=confidence)
+                         target_name=target_name, **({"bundle": bundle} if bundle else {}))
         if impl.function:
             target = _make_id(stem, impl.function)
         else:

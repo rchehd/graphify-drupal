@@ -200,20 +200,44 @@ true` and `pattern: "<entity>_*_<op>_form"`, plus `form_implemented_by` to
 the handler class.
 
 The registry learns boundary forms (`getFormId()` literals in core/contrib
-classes) as a map form_id → class. They become stubs only as targets of
-custom facts.
+classes) as a map form_id → class, and base form ids (`getBaseFormId()`
+literals) as a separate map base id → the forms of that base. A form becomes a
+stub only as the target of a custom fact; a base id is never a form node of
+its own.
+
+An entity form's `pattern` is a label, never a matcher. `EntityForm::getFormId()`
+builds `<entity>[_<bundle>][_<op>]_form` (the bundle only for an entity type
+with a `bundle` entity key, the op left out for `default`), and
+`getBaseFormId()` is `<entity>_form` for every operation. The registry learns,
+per entity type, its `form.<op>` operations and, for an entity type with a
+`bundle` key, the bundle ids its bundle entity type's config files prove:
+`<provider>.<config_prefix>.<bundle>.yml` in a sync store or a
+`config/install|optional` directory, read by file name only (amended in P4
+Task 5 fix round 1).
 
 ### 6.2 `form_FORM_ID_alter`
 
 For an implementation of hook `form_<x>_alter` (P2b `variable` candidate,
-`pattern: form_*_alter`), resolve `<x>` against custom forms, then boundary
-forms, by `form_id` or `base_form_id`, then against entity-form patterns:
+`pattern: form_*_alter`), resolve `<x>`, first match wins:
 
-- a match gives `alters_form` (hook_impl → form);
-- the hook `form_FORM_ID_alter` becomes the `implements_hook` target, so the
-  implementation is no longer a candidate;
-- no match gives an `unbound_form` candidate (`module`, `form_id`, `file`,
-  `line`).
+1. a custom form whose `form_id` is `x`;
+2. every custom form whose `base_form_id` is `x`;
+3. the boundary form whose literal id is `x`;
+4. every boundary form whose base id is `x` (none known: no match);
+5. `x == <t>_form`: every entity form of entity type `t` (its base form id);
+6. every entity form whose id `EntityForm::getFormId()` builds equals `x`
+   exactly: `<t>[_<op>]_form` for a `t` without a bundle key,
+   `<t>_<bundle>[_<op>]_form` only for a bundle the registry proves (§6.1).
+   No bundle is guessed, and nothing here is `INFERRED`.
+
+- a match gives `alters_form` (hook_impl → form), `EXTRACTED`, with `bundle`
+  when a proven bundle was read;
+- the `implements_hook` target is `form_BASE_FORM_ID_alter` when the match
+  came through a base form id (2, 4, 5) and the registry declares it, else
+  `form_FORM_ID_alter`, so the implementation is no longer a candidate;
+- no match gives an `unbound_form` candidate (`module`, `name`, `form_id`,
+  `file`, `line`). It still implements `form_FORM_ID_alter` for the P3
+  overlay, which never makes a hook node of the concrete name.
 
 The `drupal_hook_impl` node is created as P2b creates it for a declared hook.
 

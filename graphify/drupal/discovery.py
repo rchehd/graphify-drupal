@@ -107,6 +107,17 @@ class Registry:
     #: `HookCollectorPass::registerHookServices` registers each as an
     #: autowired service whose id is its FQCN (P4 §7.3 rule 3b). Sorted.
     hook_services: list[str] = field(default_factory=list)
+    #: base form id -> `[form id, provider, class FQCN]` of every class whose
+    #: `getBaseFormId()` returns it (form id "" when `getFormId()` is not a
+    #: literal), custom and boundary, sorted (P4 §6.2).
+    base_forms: dict[str, list[list[str]]] = field(default_factory=dict)
+    #: entity type id -> its `form.<op>` handler operations, source order (P4 §6.2).
+    entity_forms: dict[str, list[str]] = field(default_factory=dict)
+    #: entity type id with a `bundle` entity key -> the bundle ids a config
+    #: file `<provider>.<config_prefix>.<bundle>.yml` of its bundle entity type
+    #: proves, in a sync, `config/install` or `config/optional` store, from file
+    #: names only; sorted (P4 §6.2). An entity type absent here has no bundle key.
+    entity_bundles: dict[str, list[str]] = field(default_factory=dict)
 
     def by_yaml_name(self) -> dict[str, PluginType]:
         """Non-deferred types that read `<ext>.<yaml_name>.yml` files."""
@@ -136,6 +147,9 @@ class Registry:
             "service_aliases": dict(self.service_aliases),
             "service_wiring": {k: _wiring(v) for k, v in self.service_wiring.items()},
             "hook_services": list(self.hook_services),
+            "base_forms": {k: [list(e) for e in v] for k, v in self.base_forms.items()},
+            "entity_forms": {k: list(v) for k, v in self.entity_forms.items()},
+            "entity_bundles": {k: list(v) for k, v in self.entity_bundles.items()},
         }
 
     @classmethod
@@ -158,6 +172,13 @@ class Registry:
             service_aliases={str(k): str(v) for k, v in (data.get("service_aliases") or {}).items()},
             service_wiring={str(k): _wiring(v) for k, v in (data.get("service_wiring") or {}).items()},
             hook_services=[str(c) for c in data.get("hook_services") or []],
+            base_forms={str(k): [[str(x) for x in e] for e in v if isinstance(e, list) and len(e) == 3]
+                        for k, v in (data.get("base_forms") or {}).items() if isinstance(v, list)},
+            entity_forms={str(k): [str(x) for x in v]
+                          for k, v in (data.get("entity_forms") or {}).items() if isinstance(v, list)},
+            entity_bundles={str(k): [str(x) for x in v]
+                            for k, v in (data.get("entity_bundles") or {}).items()
+                            if isinstance(v, list)},
         )
 
 
@@ -325,6 +346,9 @@ class _Walk:
     extension_info: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: Every `.php` file but `*.api.php`, for the P4 maps (`_learn_php`).
     php: list[Path] = field(default_factory=list)
+    #: `.yml` file names of every config store the walk passes: a sync store
+    #: (holds `core.extension.yml`) or `config/install|optional` (P4 §6.2).
+    config_names: set[str] = field(default_factory=set)
 
 
 def _walk(base: Path, core_dir: Path | None,
@@ -359,6 +383,9 @@ def _walk(base: Path, core_dir: Path | None,
                     _read_extension_type(directory / info_name), directory.as_posix())
         is_core_dir = core_dir is not None and directory == core_dir
         in_src = "src" in Path(dirpath[len(str(base)):]).parts
+        if (directory.name in ("install", "optional") and directory.parent.name == "config") \
+                or "core.extension.yml" in names:
+            found.config_names.update(n for n in names if n.endswith(".yml"))
         for name in names:
             path = directory / name
             if name.endswith(_SERVICES_SUFFIX):
@@ -843,6 +870,7 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
                 pattern=hook_pattern(name),
             )
 
+    walk.config_names |= _sync_config_names(scan_root, base)
     php = _learn_php(builder, walk, is_ignored, where)
 
     return Registry(
@@ -886,6 +914,68 @@ _ENTITY_TYPE_ANNOTATION_CLASSES = frozenset({
 })
 
 
+def _sync_config_names(scan_root: Path, base: Path) -> set[str]:
+    """`.yml` names of the sync stores outside the walked web root: the ones
+    `config_stores` finds one or two levels below the scan root (a
+    `core.extension.yml` marker) and the `.graphifyrc` `drupal.config.sync`
+    directories. File names only, never content. Never raises."""
+    from graphify.drupal.config_stores import _markers_under, _rc_sync_dirs
+
+    names: set[str] = set()
+    try:
+        dirs = set(_markers_under(scan_root)) | set(_rc_sync_dirs(scan_root))
+    except Exception:
+        return names
+    for directory in dirs:
+        try:
+            if Path(directory).resolve().is_relative_to(base):
+                continue            # the walk saw it
+            with os.scandir(directory) as entries:
+                names.update(e.name for e in entries if e.name.endswith(".yml") and e.is_file())
+        except OSError:
+            continue
+    return names
+
+
+def _entity_facts(attributed: list, annotations: list) -> list[tuple[str, str, dict]]:
+    """`(entity type id, class FQCN, values)` per entity type declaration,
+    through `php_semantics`' own reading of attributes and annotations."""
+    from graphify.drupal.php_semantics import _declarations_of, _entity_kind
+
+    out: list[tuple[str, str, dict]] = []
+    for d in _declarations_of(attributed, annotations):
+        entity_id = d.values.get("id")
+        kind = _entity_kind(d)
+        if kind and isinstance(entity_id, str) and entity_id:
+            out.append((entity_id, d.class_fqcn, {**d.values, "_kind": kind}))
+    return out
+
+
+def _entity_bundles(facts: dict[str, tuple[str, dict]], config_names: set[str]) -> dict[str, list[str]]:
+    """Every entity type with a `bundle` entity key -> its proven bundle ids:
+    the names `<provider>.<config_prefix>.<bundle>.yml` of its bundle entity
+    type (`config_prefix` defaults to the id, as `ConfigEntityType` does)."""
+    out: dict[str, list[str]] = {}
+    for entity_id, (_owner, values) in facts.items():
+        keys = values.get("entity_keys")
+        if not (isinstance(keys, dict) and isinstance(keys.get("bundle"), str) and keys["bundle"]):
+            continue
+        bundles: set[str] = set()
+        bundle_type = values.get("bundle_entity_type")
+        found = facts.get(bundle_type) if isinstance(bundle_type, str) else None
+        if found is not None and found[0] and found[1].get("_kind") == "config":
+            prefix = found[1].get("config_prefix")
+            prefix = prefix if isinstance(prefix, str) and prefix else bundle_type
+            head = f"{found[0]}.{prefix}."
+            for name in config_names:
+                if name.startswith(head) and name.endswith(".yml"):
+                    bundle = name[len(head):-len(".yml")]
+                    if bundle and "." not in bundle:
+                        bundles.add(bundle)
+        out[entity_id] = sorted(bundles)
+    return out
+
+
 def _learn_php(builder: _Builder, walk: _Walk,
                is_ignored: Callable[[Path], bool] | None,
                where: _DirectoryFacts | None = None) -> dict[str, dict]:
@@ -906,6 +996,9 @@ def _learn_php(builder: _Builder, walk: _Walk,
     base_forms: tuple[dict, dict] = ({}, {})
     event_constants: dict[str, str] = {}
     hook_services: set[str] = set()
+    base_members: dict[str, set[tuple[str, str, str]]] = {}
+    #: entity type id -> (provider, attribute/annotation values), per side.
+    entity_values: tuple[dict, dict] = ({}, {})
 
     for path in walk.php:
         try:
@@ -931,6 +1024,7 @@ def _learn_php(builder: _Builder, walk: _Walk,
                 forms[side].setdefault(f.form_id, (owner, f.fqcn))
             if f.base_form_id:
                 base_forms[side].setdefault(f.base_form_id, (owner, f.fqcn))
+                base_members.setdefault(f.base_form_id, set()).add((f.form_id, owner, f.fqcn))
             if f.fqcn.rsplit("\\", 1)[-1].endswith("Events"):
                 for name, value in f.constants.items():
                     event_constants.setdefault(f"{f.fqcn}::{name}", value)
@@ -940,6 +1034,8 @@ def _learn_php(builder: _Builder, walk: _Walk,
                 if any(a.name == HOOK_ATTRIBUTE for a in cls.attributes) \
                         or any(a.name == HOOK_ATTRIBUTE for m in cls.methods for a in m.attributes):
                     hook_services.add(cls.fqcn)
+        for entity_id, _fqcn, values in _entity_facts(attributed, annotations):
+            entity_values[side].setdefault(entity_id, (owner, values))
         for cls in attributed:
             for attr in cls.attributes:
                 if attr.name not in _ENTITY_TYPE_ATTRIBUTES:
@@ -958,8 +1054,14 @@ def _learn_php(builder: _Builder, walk: _Walk,
             if isinstance(entity_id, str) and entity_id:
                 entity_types[side].setdefault(entity_id, (owner, fqcn))
 
+    from graphify.drupal.php_semantics import entity_form_ops_of
+
+    values = {**entity_values[0], **entity_values[1]}
     return {
         "class_facts": class_facts,
+        "base_forms": {k: [list(e) for e in sorted(v)] for k, v in sorted(base_members.items())},
+        "entity_forms": {k: ops for k, (_o, v) in values.items() if (ops := entity_form_ops_of(v))},
+        "entity_bundles": _entity_bundles(values, walk.config_names),
         "entity_types": {**entity_types[0], **entity_types[1]},
         # Later wins: custom over boundary for any key (literal or base id),
         # and within one side a literal form id over a base form id.

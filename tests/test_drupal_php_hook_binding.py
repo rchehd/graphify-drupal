@@ -48,13 +48,14 @@ function hook_cron() {
 """
 
 
-def _entity(namespace: str, cls: str, entity_type: str, forms: dict[str, str] | None = None) -> str:
+def _entity(namespace: str, cls: str, entity_type: str, forms: dict[str, str] | None = None,
+            extra: str = "", kind: str = "ContentEntityType") -> str:
     handlers = ""
     if forms:
         inner = ", ".join(f'"{op}" => "{fqcn}"' for op, fqcn in forms.items())
         handlers = f',\n  handlers: ["form" => [{inner}]]'
-    return (f"<?php\nnamespace {namespace};\n\nuse Drupal\\Core\\Entity\\Attribute\\ContentEntityType;\n\n"
-            f'#[ContentEntityType(\n  id: "{entity_type}"{handlers},\n)]\n'
+    return (f"<?php\nnamespace {namespace};\n\nuse Drupal\\Core\\Entity\\Attribute\\{kind};\n\n"
+            f'#[{kind}(\n  id: "{entity_type}"{handlers}{extra},\n)]\n'
             f"class {cls} {{\n}}\n")
 
 
@@ -88,7 +89,7 @@ class FooHooks {
   public function unknownAlter(&$form) {
   }
 
-  #[Hook('form_foo_article_edit_form_alter')]
+  #[Hook('form_foo_edit_form_alter')]
   public function entityFormAlter(&$form) {
   }
 
@@ -106,6 +107,26 @@ class FooHooks {
 
   #[Hook('widget_insert')]
   public function widgetInsert($widget) {
+  }
+
+  #[Hook('form_foo_form_alter')]
+  public function fooBaseFormAlter(&$form) {
+  }
+
+  #[Hook('form_node_article_edit_form_alter')]
+  public function articleEditAlter(&$form) {
+  }
+
+  #[Hook('form_node_blog_form_alter')]
+  public function blogAlter(&$form) {
+  }
+
+  #[Hook('form_bar_base_alter')]
+  public function barBaseAlter(&$form) {
+  }
+
+  #[Hook('form_bar_computed_base_alter')]
+  public function barComputedAlter(&$form) {
   }
 
 }
@@ -147,7 +168,8 @@ class FooSubscriber implements EventSubscriberInterface {
       'foo.literal' => 'onLiteral',
       BarEvents::SAVE => ['onSave', 50],
       NopeEvents::GONE => 'onGone',
-      'foo.many' => [['first', 10], ['second', -5]],
+      'foo.many' => [['second', -5], ['first', 10]],
+      'foo.bad' => $this->callback,
     ];
   }
 
@@ -189,7 +211,24 @@ def _binding_site(root: Path) -> Path:
         f"{NODE}/node.info.yml": "name: Node\ntype: module\n",
         f"{NODE}/src/Entity/Node.php": _entity(
             "Drupal\\node\\Entity", "Node", "node",
-            {"default": "Drupal\\node\\NodeForm", "edit": "Drupal\\node\\NodeForm"}),
+            {"default": "Drupal\\node\\NodeForm", "edit": "Drupal\\node\\NodeForm"},
+            ',\n  entity_keys: ["id" => "nid", "bundle" => "type"],\n  bundle_entity_type: "node_type"'),
+        f"{NODE}/src/Entity/NodeType.php": _entity(
+            "Drupal\\node\\Entity", "NodeType", "node_type", None, ',\n  config_prefix: "type"',
+            kind="ConfigEntityType"),
+        # Bundles are proven by config file names only: a sync store outside
+        # the web root and a module's `config/optional`.
+        "config/sync/core.extension.yml": "module: {}\n",
+        "config/sync/node.type.article.yml": "",
+        f"{BAR}/config/optional/node.type.page.yml": "",
+        f"{BAR}/src/Form/BarOneForm.php": _form("Drupal\\bar\\Form", "BarOneForm", "bar_one",
+                                                "bar_base"),
+        f"{BAR}/src/Form/BarTwoForm.php": _form("Drupal\\bar\\Form", "BarTwoForm", "bar_two",
+                                                "bar_base"),
+        f"{BAR}/src/Form/BarComputedForm.php": (
+            "<?php\nnamespace Drupal\\bar\\Form;\n\nclass BarComputedForm {\n"
+            "  public function getFormId() {\n    return 'bar_' . $this->x;\n  }\n"
+            "  public function getBaseFormId() {\n    return 'bar_computed_base';\n  }\n}\n"),
         f"{BAR}/bar.info.yml": "name: Bar\ntype: module\n",
         f"{BAR}/src/Form/BarSettingsForm.php": _form("Drupal\\bar\\Form", "BarSettingsForm",
                                                      "bar_settings"),
@@ -209,6 +248,11 @@ def _binding_site(root: Path) -> Path:
         f"{FOO}/src/EventSubscriber/BazSubscriber.php": BAZ_SUBSCRIBER,
         f"{FOO_BAR}/foo_bar.info.yml": "name: Foo bar\ntype: module\n",
         f"{FOO_BAR}/foo_bar.module": FOO_BAR_MODULE,
+        # The brief's case: `foo_bar_insert()` in foo.module reads as module
+        # `foo` + entity type `bar` (which module foo_bar makes), or module
+        # `foo_bar` + hook `insert` (no entity type): one split.
+        f"{FOO}/foo.module": "<?php\n\nfunction foo_bar_insert($bar) {\n}\n",
+        f"{FOO_BAR}/src/Entity/Bar.php": _entity("Drupal\\foo_bar\\Entity", "Bar", "bar"),
         f"{FOO_BAR}/src/Entity/Item.php": _entity("Drupal\\foo_bar\\Entity", "Item", "item"),
         f"{FOO_BAR}/src/Entity/Thing.php": _entity("Drupal\\foo_bar\\Entity", "Thing", "thing"),
         # `foo_bar_thing_insert()` also reads as module `foo`, entity type `bar_thing`.
@@ -287,13 +331,22 @@ def test_a_custom_form_alter_is_bound_to_the_form(tmp_path):
     assert (alter["confidence"], alter["target_name"]) == ("EXTRACTED", "foo_plain")
 
 
+def _alters(result: dict, impl: str) -> dict[str, dict]:
+    return {e["target"]: e for e in result["edges"]
+            if e["relation"] == "alters_form" and e["source"] == impl}
+
+
 def test_a_base_form_alter_alters_every_form_of_that_base(tmp_path):
     root = _binding_site(tmp_path)
     prepare_run(root)
     result, _core = _hooks_result(root)
     impl = hook_impl_id("foo", "form_foo_base_alter")
-    assert {t for s, r, t in _rel(result["edges"]) if s == impl and r == "alters_form"} == {
-        form_id("foo_based"), form_id("foo_other")}
+    assert set(_alters(result, impl)) == {form_id("foo_based"), form_id("foo_other")}
+    # Drupal invokes it as `hook_form_BASE_FORM_ID_alter`.
+    node = next(n for n in result["nodes"] if n["id"] == impl)
+    assert node["declared_hook"] == "form_BASE_FORM_ID_alter"
+    assert (extension_id("foo"), "implements_hook", hook_id("form_BASE_FORM_ID_alter")) in \
+        _rel(result["edges"])
 
 
 def test_a_boundary_form_alter_targets_the_boundary_form(tmp_path):
@@ -301,22 +354,43 @@ def test_a_boundary_form_alter_targets_the_boundary_form(tmp_path):
     prepare_run(root)
     result, _core = _hooks_result(root)
     impl = hook_impl_id("foo", "form_bar_settings_alter")
-    assert (impl, "alters_form", form_id("bar_settings")) in _rel(result["edges"])
+    assert set(_alters(result, impl)) == {form_id("bar_settings")}
+    # A boundary base id alters every boundary form of that base, never a
+    # form node of the base id itself.
+    base = hook_impl_id("foo", "form_bar_base_alter")
+    assert set(_alters(result, base)) == {form_id("bar_one"), form_id("bar_two")}
+    assert not [e for e in result["edges"] if e["target"] == form_id("bar_base")]
+    assert next(n for n in result["nodes"] if n["id"] == base)["declared_hook"] == \
+        "form_BASE_FORM_ID_alter"
 
 
-def test_an_entity_form_alter_is_bound_by_the_entity_form_pattern(tmp_path):
+def test_entity_form_alters_bind_only_to_forms_drupal_builds(tmp_path):
     root = _binding_site(tmp_path)
-    prepare_run(root)
+    registry = prepare_run(root)
     result, _core = _hooks_result(root)
-    edges = {e["source"]: e for e in result["edges"] if e["relation"] == "alters_form"}
-    # `foo_article_edit_form` reads as the `edit` form of bundle `article`,
-    # or the `default` form of a bundle `article_edit`: the more literal wins.
-    custom = edges[hook_impl_id("foo", "form_foo_article_edit_form_alter")]
-    assert (custom["target"], custom["target_name"], custom["confidence"]) == (
-        entity_form_id("foo", "edit"), "foo_*_edit_form", "INFERRED")
-    # `node_form`, the base form id of every node entity form: a boundary entity type's.
-    node = edges[hook_impl_id("foo", "form_node_form_alter")]
-    assert (node["target"], node["target_name"]) == (entity_form_id("node", "default"), "node_*_form")
+    assert registry.entity_bundles == {"node": ["article", "page"]}
+    assert registry.entity_forms["node"] == ["default", "edit"]
+    # `foo` has no bundle key: `foo_edit_form` is exactly its `edit` form.
+    edit = _alters(result, hook_impl_id("foo", "form_foo_edit_form_alter"))
+    assert {k: (e["target_name"], e["confidence"], e.get("bundle")) for k, e in edit.items()} == {
+        entity_form_id("foo", "edit"): ("foo_*_edit_form", "EXTRACTED", None)}
+    # `<t>_form` is `EntityForm::getBaseFormId()`: every entity form of `t`.
+    for impl, t in ((hook_impl_id("foo", "form_foo_form_alter"), "foo"),
+                    (hook_impl_id("foo", "form_node_form_alter"), "node")):
+        alters = _alters(result, impl)
+        assert set(alters) == {entity_form_id(t, "default"), entity_form_id(t, "edit")}, t
+        assert {e["confidence"] for e in alters.values()} == {"EXTRACTED"}
+        assert next(n for n in result["nodes"] if n["id"] == impl)["declared_hook"] == \
+            "form_BASE_FORM_ID_alter"
+    # `node` has a bundle key: `article` is proven by `node.type.article.yml`.
+    article = _alters(result, hook_impl_id("foo", "form_node_article_edit_form_alter"))
+    assert {k: (e["confidence"], e["bundle"]) for k, e in article.items()} == {
+        entity_form_id("node", "edit"): ("EXTRACTED", "article")}
+    assert next(n for n in result["nodes"]
+                if n["id"] == hook_impl_id("foo", "form_node_article_edit_form_alter")
+                )["declared_hook"] == "form_FORM_ID_alter"
+    # No `node.type.blog.yml`: the bundle is not guessed.
+    assert hook_impl_id("foo", "form_node_blog_form_alter") not in {n["id"] for n in result["nodes"]}
 
 
 def test_an_unknown_form_is_an_unbound_form_candidate(tmp_path):
@@ -326,8 +400,13 @@ def test_an_unknown_form_is_an_unbound_form_candidate(tmp_path):
     path = root / FOO / "src/Hook/FooHooks.php"
     assert hook_impl_id("foo", "form_nobody_knows_alter") not in {n["id"] for n in result["nodes"]}
     unbound = [c for c in result["hook_candidates"] if c["kind"] == "unbound_form"]
-    assert unbound == [{"kind": "unbound_form", "module": "foo", "name": "form_nobody_knows_alter",
-                        "form_id": "nobody_knows", "file": str(path), "line": 21}]
+    assert unbound == [
+        {"kind": "unbound_form", "module": "foo", "name": name, "form_id": form, "file": str(path),
+         "line": line}
+        for name, form, line in (("form_nobody_knows_alter", "nobody_knows", 21),
+                                 ("form_node_blog_form_alter", "node_blog_form", 53),
+                                 # A base id no class with a literal form id carries.
+                                 ("form_bar_computed_base_alter", "bar_computed_base", 61))]
     # The inventory reads the same decision.
     assert [c for c in find_hook_candidates(path, registry)
             if c["name"].startswith("form_")] == unbound
@@ -358,7 +437,8 @@ def test_entity_type_hooks_are_bound_to_the_entity_type(tmp_path):
         "file": str(root / FOO / "src/Hook/FooHooks.php"), "line": 41}]
     # Bound variable hooks left the candidates.
     assert sorted(c["name"] for c in result["hook_candidates"]) == [
-        "form_nobody_knows_alter", "widget_insert"]
+        "form_bar_computed_base_alter", "form_nobody_knows_alter", "form_node_blog_form_alter",
+        "widget_insert"]
 
 
 def test_a_procedural_hook_splits_only_when_modules_and_entity_types_agree(tmp_path):
@@ -379,9 +459,15 @@ def test_a_procedural_hook_splits_only_when_modules_and_entity_types_agree(tmp_p
     # `foo_bar_thing_insert`: `foo_bar` + `thing` and `foo` + `bar_thing` both
     # read -- ambiguous, so it stays the candidate.
     assert hook_impl_id("foo_bar", "thing_insert") not in {n["id"] for n in result["nodes"]}
-    candidates = [c for c in result["hook_candidates"]]
+    candidates = result["hook_candidates"]
     assert [(c["kind"], c["name"]) for c in candidates] == [("variable", "thing_insert")]
     assert find_hook_candidates(path, registry) == candidates
+    # The brief's `foo_bar_insert()` in foo.module: module `foo`, entity type `bar`.
+    foo_path = root / FOO / "foo.module"
+    foo = extract_hook_implementations(foo_path, _core_php(foo_path))
+    assert (hook_impl_id("foo", "bar_insert"), "hooks_entity_type", entity_type_id("bar")) in \
+        _rel(foo["edges"])
+    assert foo["hook_candidates"] == []
     # A procedural form alter binds too.
     assert (hook_impl_id("foo_bar", "form_foo_plain_alter"), "alters_form",
             form_id("foo_plain")) in rel
@@ -408,11 +494,16 @@ def test_subscribed_events_from_literal_and_constant_keys(tmp_path):
     save = edges[event_id("bar.save")]
     assert (save["method"], save["priority"], save["target_name"]) == ("onSave", 50, "bar.save")
     many = edges[event_id("foo.many")]
+    # Dispatch order, highest priority first, as the container lists them.
     assert (many["method"], many["priorities"]) == ("first,second", [10, -5])
     assert "priority" not in many
     expected = [{"kind": "unresolved_event", "module": "foo",
                  "class": "Drupal\\foo\\EventSubscriber\\FooSubscriber",
-                 "event": "NopeEvents::GONE", "method": "onGone", "file": str(path), "line": 15}]
+                 "event": "NopeEvents::GONE", "method": "onGone", "file": str(path), "line": 15},
+                # A value naming no readable listener is not dropped silently.
+                {"kind": "unresolved_event", "module": "foo",
+                 "class": "Drupal\\foo\\EventSubscriber\\FooSubscriber",
+                 "event": "'foo.bad'", "method": "", "file": str(path), "line": 17}]
     assert result["php_candidates"] == expected
     assert find_php_candidates(path, registry) == expected
 
@@ -482,12 +573,15 @@ def test_the_inventory_lists_what_stays_unbound(tmp_path):
     detected = {str(p) for p in root.rglob("*") if p.is_file()}
     inventory = build_inventory(registry, detected, root)
     assert [(c["kind"], c["name"]) for c in inventory["hook_candidates"]] == [
+        ("unbound_form", "form_bar_computed_base_alter"),
         ("unbound_form", "form_nobody_knows_alter"),
+        ("unbound_form", "form_node_blog_form_alter"),
         ("variable", "widget_insert"),
         ("variable", "thing_insert"),
     ]
     assert [(c["kind"], c["event"]) for c in inventory["php_candidates"]
-            if c["kind"] == "unresolved_event"] == [("unresolved_event", "NopeEvents::GONE")]
+            if c["kind"] == "unresolved_event"] == [("unresolved_event", "NopeEvents::GONE"),
+                                                   ("unresolved_event", "'foo.bad'")]
 
 
 # -- the P3 overlay ----------------------------------------------------------------------
@@ -510,6 +604,13 @@ def _artifact(root: Path):
                  "file": f"{FOO_BAR}/foo_bar.module"}],
             "node_presave": [{"module": "foo", "callable": "Drupal\\foo\\Hook\\FooHooks::nodePresave",
                               "file": hooks_file}],
+            "form_node_form_alter": [
+                {"module": "foo", "callable": "Drupal\\foo\\Hook\\FooHooks::nodeFormAlter",
+                 "file": hooks_file}],
+            # Unbound statically: still `form_FORM_ID_alter`, never its own hook node.
+            "form_nobody_knows_alter": [
+                {"module": "foo", "callable": "Drupal\\foo\\Hook\\FooHooks::unknownAlter",
+                 "file": hooks_file}],
         },
         "plugins": {},
         "subscribers": {
@@ -519,6 +620,12 @@ def _artifact(root: Path):
             "bar.save": [
                 {"callable": "Drupal\\foo\\EventSubscriber\\FooSubscriber::onSave",
                  "file": f"{FOO}/src/EventSubscriber/FooSubscriber.php", "priority": 50}],
+            # Two listeners of one class: one edge, as the static side has it.
+            "foo.many": [
+                {"callable": "Drupal\\foo\\EventSubscriber\\FooSubscriber::first",
+                 "file": f"{FOO}/src/EventSubscriber/FooSubscriber.php", "priority": 10},
+                {"callable": "Drupal\\foo\\EventSubscriber\\FooSubscriber::second",
+                 "file": f"{FOO}/src/EventSubscriber/FooSubscriber.php", "priority": -5}],
         },
         "stamp": {}, "errors": [],
     }
@@ -550,13 +657,18 @@ def test_the_overlay_confirms_bound_hooks_and_subscribers(tmp_path):
     for u, v in ((extension_id("foo"), hook_id("form_FORM_ID_alter")),
                  (extension_id("foo"), hook_id("ENTITY_TYPE_presave")),
                  (extension_id("foo_bar"), hook_id("form_FORM_ID_alter")),
+                 (extension_id("foo"), hook_id("form_BASE_FORM_ID_alter")),
                  (subscriber, event_id("foo.literal")),
-                 (subscriber, event_id("bar.save"))):
+                 (subscriber, event_id("bar.save")),
+                 (subscriber, event_id("foo.many"))):
         data = G.edges[u, v]
         assert data["confirmed_by"] == ORIGIN and "origin" not in data, (u, v)
     # The container's concrete names meet the declared hook, never a hook of their own.
-    assert hook_id("form_foo_plain_alter") not in G
-    assert hook_id("node_presave") not in G
+    for concrete in ("form_foo_plain_alter", "node_presave", "form_node_form_alter",
+                     "form_nobody_knows_alter"):
+        assert hook_id(concrete) not in G, concrete
+    many = G.edges[subscriber, event_id("foo.many")]
+    assert (many["method"], many["priorities"]) == ("first,second", [10, -5])
 
     once = _dump(G)
     apply(G, _artifact(root), root)

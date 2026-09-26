@@ -695,7 +695,8 @@ def test_the_p4_maps_round_trip_through_json(tmp_path):
     data = json.loads(json.dumps(registry.to_json()))
     again = Registry.from_json(data)
 
-    for name in ("shortcuts", "class_facts", "entity_types", "forms", "event_constants"):
+    for name in ("shortcuts", "class_facts", "entity_types", "forms", "event_constants",
+                 "base_forms", "entity_forms", "entity_bundles"):
         assert getattr(again, name) == getattr(registry, name), name
     assert again.to_json() == registry.to_json()
 

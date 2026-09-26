@@ -405,52 +405,21 @@ def entity_form_pattern(entity_type: str, operation: str) -> str:
     return f"{entity_type}_*_{operation}_form"
 
 
-_ENTITY_FORM_OPS_ATTR = "_drupal_entity_form_ops"
+def entity_form_ops_of(values: dict) -> list[str]:
+    """The `form.<op>` operations of an entity type's attribute or annotation
+    values, source order: the operations `_entity_form` makes nodes for."""
+    ops: list[str] = []
+    for name in _handlers(values.get("handlers")):
+        op = name[len(_FORM_HANDLER):] if name.startswith(_FORM_HANDLER) else ""
+        if op and "." not in op and op not in ops:
+            ops.append(op)
+    return ops
 
 
 def entity_form_operations(registry: Any, entity_type: str) -> tuple[str, ...]:
     """The `form.<op>` operations entity type `entity_type` declares, custom
-    or boundary: its class (the registry's `entity_types`) re-read on first
-    use and cached on the registry object. The same reading as the per-file
-    extractor's entity forms (`_entity_form`). Empty when the class file is
-    unknown or unreadable; never raises."""
-    cache = getattr(registry, _ENTITY_FORM_OPS_ATTR, None)
-    if cache is None:
-        cache = {}
-        try:
-            setattr(registry, _ENTITY_FORM_OPS_ATTR, cache)
-        except Exception:
-            pass
-    found = cache.get(entity_type)
-    if found is None:
-        try:
-            found = cache[entity_type] = _read_entity_form_operations(registry, entity_type)
-        except Exception:
-            found = cache[entity_type] = ()
-    return found
-
-
-def _read_entity_form_operations(registry: Any, entity_type: str) -> tuple[str, ...]:
-    from graphify.drupal.php_classes import read_class_semantics
-    from graphify.drupal.resolvers import _class_file
-
-    entry = (registry.entity_types or {}).get(entity_type)
-    if not entry or len(entry) < 2:
-        return ()
-    fqcn = str(entry[1])
-    file = _class_file(registry, fqcn)
-    if not file:
-        return ()
-    _facts, annotations, attributed = read_class_semantics(Path(file))
-    ops: list[str] = []
-    for d in _declarations_of(attributed, annotations):
-        if d.class_fqcn != fqcn or d.values.get("id") != entity_type or not _entity_kind(d):
-            continue
-        for name in _handlers(d.values.get("handlers")):
-            op = name[len(_FORM_HANDLER):] if name.startswith(_FORM_HANDLER) else ""
-            if op and "." not in op and op not in ops:
-                ops.append(op)
-    return tuple(ops)
+    or boundary, as the registry learned them (`Registry.entity_forms`)."""
+    return tuple((getattr(registry, "entity_forms", None) or {}).get(entity_type) or ())
 
 
 def _entity_form(f: _File, entity_type: str, operation: str, fqcn: str, line: int) -> None:
@@ -651,6 +620,17 @@ def event_id(name: str) -> str:
     return make_id("drupal", "event", name)
 
 
+def listener_order(listeners: Any) -> list[tuple[str, Any]]:
+    """`(method, priority)` listeners in dispatch order -- highest priority
+    first, ties in the order given -- when every priority is known; as given
+    otherwise. The static edge and the P3 overlay order `method` and
+    `priorities` this one way, so the two meet."""
+    listeners = list(listeners)
+    if all(isinstance(p, int) for _m, p in listeners):
+        listeners.sort(key=lambda item: -item[1])
+    return listeners
+
+
 def _events(f: _File) -> None:
     """`subscribes_to_event` (class -> `drupal_event`) for each key of a
     class's `getSubscribedEvents()` that is a string literal or a class
@@ -664,15 +644,17 @@ def _events(f: _File) -> None:
     constants = f.registry.event_constants or {}
     for key in f.events:
         name = key.event or constants.get(key.constant, "")
-        methods = [m for m, _p in key.listeners]
-        if not name:
+        listeners = listener_order(key.listeners)
+        methods = [m for m, _p in listeners]
+        if not name or not methods:
+            # An unresolvable key, or a value naming no readable listener.
             f.candidate(_UNRESOLVED_EVENT, key.line, **{
                 "class": key.fqcn, "event": key.raw, "method": ",".join(methods)})
             continue
         source = f.class_node(key.class_name)
-        if source is None or not methods:
+        if source is None:
             continue
-        priorities = [p for _m, p in key.listeners]
+        priorities = [p for _m, p in listeners]
         extra: dict[str, Any] = {"method": ",".join(methods)}
         if len(priorities) == 1:
             if priorities[0] is not None:
