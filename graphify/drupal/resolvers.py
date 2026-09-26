@@ -31,6 +31,9 @@ _RESOLVABLE: dict[str, tuple[str, str]] = {
     "depends_on_module": ("drupal_extension", "extension"),
     "base_theme": ("drupal_extension", "extension"),
     "injects_service": ("drupal_service", "di"),
+    # A service custom PHP reaches (P4 spec §7.1) that no `*.services.yml`
+    # in the graph declares: a core/contrib service, or a missing one.
+    "uses_service": ("drupal_service", "di"),
     "decorates": ("drupal_service", "di"),
     "parent_service": ("drupal_service", "di"),
     "injects_parameter": ("drupal_parameter", "di"),
@@ -506,6 +509,111 @@ def bind_route_forms(all_nodes: list[dict], all_edges: list[dict]) -> None:
         })
 
 
+#: The attributes a pending `calls` edge carries only until it is bound.
+_CALL_FACTS = ("method", "class", "property")
+
+
+def _service_of(registry: Any, edge: dict) -> str:
+    from graphify.drupal.php_semantics import PENDING, PENDING_PROPERTY_CALL
+    from graphify.drupal.php_services import property_service
+
+    if edge.get(PENDING) == PENDING_PROPERTY_CALL:
+        return property_service(registry, str(edge.get("class") or ""),
+                                str(edge.get("property") or ""))[0]
+    return str(edge.get("service") or "")
+
+
+def service_class_chain(registry: Any, sid: str) -> list[str]:
+    """The class of service `sid` and its custom ancestors: where a method
+    call on the service is looked for, nearest first (spec §7.4)."""
+    from graphify.drupal.php_services import class_chain, service_class
+
+    cls = service_class(registry, sid)
+    if not cls:
+        return []
+    return [cls] + [f.fqcn for f in class_chain(registry, cls)[1:]]
+
+
+def method_node(chain: list[str], method: str, class_node: Any, known: Any) -> str | None:
+    """The method node `method` of the first class in `chain` that has one,
+    walking `extends` only while each class is a node of the graph
+    (`class_node(fqcn)`): never a method of a boundary class."""
+    from graphify.extractors.base import _make_id
+
+    for fqcn in chain:
+        nid = class_node(fqcn)
+        if nid is None:
+            return None
+        mid = _make_id(nid, method)
+        if mid in known:
+            return mid
+    return None
+
+
+def bind_service_calls(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """Bind each pending `calls` edge (`php_semantics.PENDING_SERVICE_CALL`,
+    `PENDING_PROPERTY_CALL`) to the method node of the service's class
+    (spec §7.4), in place, as `bind_pending` does. A property call's service
+    comes from §7.3's rules (`php_services.property_service`).
+
+    A call whose service has no class in the graph -- a boundary class, a
+    class the static map does not know, a method the class lacks -- stays
+    pending (the seam drops it) and leaves its method on the `uses_service`
+    edge that carries it (`carrier`, same file): `methods`, and, for the P3
+    overlay, `_pending_calls: [[caller, method], ...]`, which the overlay
+    binds when the container gives the service a class inside the graph.
+    The carrier is the caller's own edge for a direct receiver or a local,
+    and the class's `create()` edge (`via: create`) for a property: the
+    caller's class, through core's `method` edge. Never an id kept in an
+    attribute at extraction: core rewrites only `source`/`target` when it
+    re-roots ids."""
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.php_semantics import PENDING, PENDING_PROPERTY_CALL, PENDING_SERVICE_CALL
+    from graphify.drupal.yaml_common import service_id
+
+    pending = [e for e in all_edges if e.get(PENDING) in (PENDING_SERVICE_CALL, PENDING_PROPERTY_CALL)
+               and isinstance(e.get("method"), str)]
+    if not pending:
+        return
+    registry = current_registry()
+    services = [(_service_of(registry, e), e) for e in pending]
+    chains = {sid: service_class_chain(registry, sid) for sid, _e in services if sid}
+    classes = _class_nodes(all_nodes, registry, {c for chain in chains.values() for c in chain})
+    known = {n.get("id") for n in all_nodes}
+    taken = {(e.get("source"), e.get("target")) for e in all_edges if PENDING not in e}
+    carriers = {(e.get("source"), e.get("target")): e for e in all_edges
+                if e.get("relation") == "uses_service" and PENDING not in e}
+    owners: dict[str, str] | None = None
+    for sid, e in services:
+        if not sid:
+            continue
+        method = e["method"]
+        target = method_node(chains.get(sid, []), method, classes.get, known)
+        if target is not None:
+            if (e.get("source"), target) in taken:
+                continue
+            taken.add((e.get("source"), target))
+            e["target"] = target
+            e["service"] = sid
+            for key in (PENDING, *_CALL_FACTS):
+                e.pop(key, None)
+            continue
+        carrier_source = e.get("source")
+        if e.get(PENDING) == PENDING_PROPERTY_CALL:
+            if owners is None:
+                owners = {m.get("target"): m.get("source") for m in all_edges
+                          if m.get("relation") == "method"}
+            carrier_source = owners.get(carrier_source)
+        carrier = carriers.get((carrier_source, service_id(sid)))
+        if carrier is None:
+            continue
+        carrier["methods"] = sorted({*(carrier.get("methods") or ()), method})
+        waiting = [list(c) for c in carrier.get("_pending_calls") or ()]
+        if [e.get("source"), method] not in waiting:
+            waiting.append([e.get("source"), method])
+            carrier["_pending_calls"] = sorted(waiting)
+
+
 def drop_pending(result: Any) -> Any:
     """`result` without the edges still pending after the resolvers ran:
     no `pending` edge reaches graph.json (spec §4)."""
@@ -535,6 +643,7 @@ def resolve_missing_targets(
     from graphify.drupal.yaml_common import config_id
 
     bind_pending(all_nodes, all_edges)
+    bind_service_calls(all_nodes, all_edges)
     bind_route_forms(all_nodes, all_edges)
     _retarget_domain_overrides(all_nodes, all_edges)
     _draw_schema_for(all_nodes, all_edges)

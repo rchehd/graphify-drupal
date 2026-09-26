@@ -439,45 +439,69 @@ def read_php_calls(path: Path, names: "frozenset[str]") -> list[PhpCall]:
 
 
 _MEMBER_CALLS = ("member_call_expression", "nullsafe_member_call_expression")
+_CLOSURES = ("anonymous_function", "anonymous_function_creation_expression")
+
+
+@dataclass(frozen=True)
+class _Scope:
+    """Where a node sits: the nearest enclosing named function or method (a
+    closure or arrow function does not change it, P2b spec §5.3), and the
+    variable frame -- the innermost function, method or closure node, whose
+    locals are its own (an arrow function shares its parent's)."""
+    function: str = ""
+    class_name: str = ""
+    method: str = ""
+    frame: int = 0
+    #: Inside `create()`: its first parameter's name (the container).
+    container: str = ""
+
+
+def _walk_scoped(node: "tree_sitter.Node", scope: _Scope, visit) -> None:
+    """Call `visit(child, scope)` on every named node below `node`, in source
+    order, each with the scope it sits in. A function, method or class
+    declaration is visited with its own scope and only its body is walked;
+    a closure gets its own frame."""
+    for child in node.named_children:
+        kind = child.type
+        if kind in ("function_definition", "method_declaration", "class_declaration"):
+            name = _text(child.child_by_field_name("name"))
+            if kind == "class_declaration":
+                inner = _Scope(class_name=name, frame=child.id)
+            elif kind == "function_definition":
+                inner = _Scope(function=name, frame=child.id)
+            else:
+                first = _params(child, "", {})[:1] if name == "create" else ()
+                inner = _Scope(class_name=scope.class_name, method=name, frame=child.id,
+                               container=first[0].name if first else "")
+            visit(child, inner)
+            body = child.child_by_field_name("body")
+            if body is not None:
+                _walk_scoped(body, inner, visit)
+            continue
+        if kind in _CLOSURES:
+            inner = _Scope(scope.function, scope.class_name, scope.method, child.id, scope.container)
+            visit(child, inner)
+            _walk_scoped(child, inner, visit)
+            continue
+        visit(child, scope)
+        _walk_scoped(child, scope, visit)
 
 
 def _collect_calls(
     node: "tree_sitter.Node", names: "frozenset[str]",
     function: str, class_name: str, method: str, out: list[PhpCall],
 ) -> None:
-    # Closures and arrow functions are not matched below, so they fall through
-    # to the last branch and their calls stay attributed to the enclosing
-    # named function or method (spec §5.3).
-    for child in node.named_children:
-        if child.type == "function_definition":
-            name = _text(child.child_by_field_name("name"))
-            body = child.child_by_field_name("body")
-            if body is not None:
-                _collect_calls(body, names, name, "", "", out)
-            continue
-        if child.type == "class_declaration":
-            name = _text(child.child_by_field_name("name"))
-            body = child.child_by_field_name("body")
-            if body is not None:
-                _collect_calls(body, names, "", name, "", out)
-            continue
-        if child.type == "method_declaration":
-            name = _text(child.child_by_field_name("name"))
-            body = child.child_by_field_name("body")
-            if body is not None:
-                _collect_calls(body, names, "", class_name, name, out)
-            continue
-        if child.type in _MEMBER_CALLS:
-            name_node = child.child_by_field_name("name")
-            call_name = _text(name_node)
-            if call_name in names:
-                args_node = child.child_by_field_name("arguments")
-                out.append(PhpCall(call_name, child.start_point[0] + 1,
-                                   _build_call_args(args_node), function, class_name, method,
-                                   _text(child.child_by_field_name("object"))))
-            _collect_calls(child, names, function, class_name, method, out)
-            continue
-        _collect_calls(child, names, function, class_name, method, out)
+    def visit(child: "tree_sitter.Node", scope: _Scope) -> None:
+        if child.type not in _MEMBER_CALLS:
+            return
+        call_name = _text(child.child_by_field_name("name"))
+        if call_name in names:
+            out.append(PhpCall(call_name, child.start_point[0] + 1,
+                               _build_call_args(child.child_by_field_name("arguments")),
+                               scope.function, scope.class_name, scope.method,
+                               _text(child.child_by_field_name("object"))))
+
+    _walk_scoped(node, _Scope(function, class_name, method), visit)
 
 
 def _build_call_args(args_node: "tree_sitter.Node | None") -> tuple[CallArg, ...]:
@@ -1299,17 +1323,25 @@ def read_class_semantics(
     from one parse -- the registry's walk reads hundreds of files. `source`
     is the file's bytes when the caller already read them. A class whose
     facts cannot be read drops out of all three; never raises."""
+    try:
+        parsed = _parse(path, source)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        return [], [], []
+    return _class_semantics(parsed[1], Path(path).as_posix())
+
+
+def _class_semantics(
+    root: "tree_sitter.Node", file: str,
+) -> tuple[list[ClassFacts], list[tuple[str, Annotation]], list[AttributedClass]]:
     facts: list[ClassFacts] = []
     annotations: list[tuple[str, Annotation]] = []
     attributed: list[AttributedClass] = []
     try:
-        parsed = _parse(path, source)
-        if parsed is None:
-            return facts, annotations, attributed
-        found = _classes(parsed[1])
+        found = _classes(root)
     except Exception:
         return facts, annotations, attributed
-    file = Path(path).as_posix()
     for class_node, namespace, uses in found:
         try:
             one_facts = _class_facts(class_node, namespace, uses, file)
@@ -1323,3 +1355,226 @@ def read_class_semantics(
         if one_attributed is not None:
             attributed.append(one_attributed)
     return facts, annotations, attributed
+
+
+# -- service use (spec §7.1, §7.4) --
+
+
+@dataclass(frozen=True)
+class ServiceUse:
+    """One place custom code reaches a service (spec §7.1)."""
+    via: str         # "service" (`\Drupal::service('x')`) | "shortcut" (`\Drupal::name()`) |
+                     # "create" (`$container->get('x')` inside `create()`)
+    name: str        # service/create: the literal id, "" when not a literal; shortcut: the method
+    raw: str         # the id argument's verbatim source text ("" for a shortcut)
+    line: int
+    function: str    # enclosing top-level function, "" inside a class
+    class_name: str  # enclosing class (short name), "" when none
+    method: str      # enclosing method, "" when none
+
+
+@dataclass(frozen=True)
+class ServiceCall:
+    """`R->name(...)` on a receiver that names a service (spec §7.4)."""
+    name: str        # the called method
+    line: int
+    function: str
+    class_name: str
+    method: str
+    receiver: str    # "service" | "shortcut" | "property"
+    target: str      # the literal service id | the `\Drupal::` method | the property
+    local: str = ""  # the local variable the receiver was assigned to, "" when direct
+
+
+def _is_drupal(scope_node: "tree_sitter.Node | None", namespace: str, uses: dict[str, str]) -> bool:
+    text = _text(scope_node)
+    return bool(text) and resolve_name(text, namespace, uses) == "Drupal"
+
+
+def _first_literal(args_node: "tree_sitter.Node | None") -> tuple[str, str, bool]:
+    """`(literal, raw text, present)` of a call's first positional argument."""
+    values = _positional(args_node)
+    if not values:
+        return "", "", False
+    value = values[0]
+    return (_literal_string(value) or "") if value is not None else "", _text(value), True
+
+
+class _Sites:
+    """`read_service_sites`' visitor: service uses as they come, receiver
+    calls on locals settled once every assignment in the file is counted."""
+
+    def __init__(self) -> None:
+        self.namespace = ""
+        self.uses: dict[str, str] = {}
+        self.found_uses: list[ServiceUse] = []
+        self.calls: list[ServiceCall] = []
+        #: (frame, variable) -> how often it is written / what it was assigned.
+        self.writes: dict[tuple[int, str], int] = {}
+        self.sources: dict[tuple[int, str], tuple[str, str]] = {}
+        self.local_calls: list[tuple[tuple[int, str], str, int, _Scope]] = []
+
+    def receiver(self, node: "tree_sitter.Node | None") -> tuple[str, str] | None:
+        """`(kind, target)` when `node` names a service (spec §7.4), else None."""
+        while node is not None and node.type == "parenthesized_expression" and node.named_children:
+            node = node.named_children[0]
+        if node is None:
+            return None
+        if node.type == "scoped_call_expression" \
+                and _is_drupal(node.child_by_field_name("scope"), self.namespace, self.uses):
+            name = _text(node.child_by_field_name("name"))
+            if name == "service":
+                literal, _raw, _present = _first_literal(node.child_by_field_name("arguments"))
+                return ("service", literal) if literal else None
+            return ("shortcut", name) if name else None
+        if node.type in ("member_access_expression", "nullsafe_member_access_expression") \
+                and _text(node.child_by_field_name("object")) == "$this":
+            prop = node.child_by_field_name("name")
+            if prop is not None and prop.type == "name":
+                return "property", _text(prop)
+        return None
+
+    def write(self, scope: _Scope, node: "tree_sitter.Node | None") -> None:
+        """Every variable in `node` (a bare `$v`, a `list(...)`, a parameter
+        list) counts as written in `scope`'s frame."""
+        if node is None:
+            return
+        for found in _walk_scope(node):
+            name = _variable(found)
+            if name and name != "this":
+                key = (scope.frame, name)
+                self.writes[key] = self.writes.get(key, 0) + 1
+
+    def visit(self, node: "tree_sitter.Node", scope: _Scope) -> None:
+        kind = node.type
+        if kind == "namespace_definition":
+            self.namespace = _text(node.child_by_field_name("name"))
+        elif kind == "namespace_use_declaration":
+            _collect_use_decl(node, self.uses)
+        elif kind in ("function_definition", "method_declaration") or kind in _CLOSURES:
+            self.write(scope, node.child_by_field_name("parameters"))
+            for child in node.named_children:
+                if child.type == "anonymous_function_use_clause":
+                    self.write(scope, child)
+        elif kind == "scoped_call_expression":
+            self.drupal_call(node, scope)
+        elif kind in _MEMBER_CALLS:
+            self.member_call(node, scope)
+        elif kind == "assignment_expression":
+            left = node.child_by_field_name("left")
+            name = _variable(left)
+            if name:
+                key = (scope.frame, name)
+                self.writes[key] = self.writes.get(key, 0) + 1
+                found = self.receiver(node.child_by_field_name("right"))
+                if found is not None:
+                    self.sources[key] = found
+            elif left is not None and left.type in ("list_literal", "array_creation_expression"):
+                self.write(scope, left)
+        elif kind in ("augmented_assignment_expression", "reference_assignment_expression"):
+            self.write(scope, node.child_by_field_name("left"))
+        elif kind == "foreach_statement":
+            # `foreach ($items as $k => $v)`: everything but the iterated
+            # expression and the body is a written variable.
+            for child in node.named_children[1:]:
+                if child.type not in ("compound_statement", "colon_block") \
+                        and not child.type.endswith("_statement"):
+                    self.write(scope, child)
+        elif kind in ("global_declaration", "function_static_declaration", "catch_clause"):
+            self.write(scope, node if kind != "catch_clause"
+                       else node.child_by_field_name("name"))
+
+    def drupal_call(self, node: "tree_sitter.Node", scope: _Scope) -> None:
+        if not _is_drupal(node.child_by_field_name("scope"), self.namespace, self.uses):
+            return
+        name = _text(node.child_by_field_name("name"))
+        line = node.start_point[0] + 1
+        if name == "service":
+            literal, raw, present = _first_literal(node.child_by_field_name("arguments"))
+            if present:
+                self.found_uses.append(ServiceUse("service", literal, raw, line, scope.function,
+                                                  scope.class_name, scope.method))
+        elif name:
+            self.found_uses.append(ServiceUse("shortcut", name, "", line, scope.function,
+                                              scope.class_name, scope.method))
+
+    def member_call(self, node: "tree_sitter.Node", scope: _Scope) -> None:
+        name = _text(node.child_by_field_name("name"))
+        obj = node.child_by_field_name("object")
+        line = node.start_point[0] + 1
+        if not name:
+            return
+        if scope.container and scope.method == "create" and name == "get" \
+                and _variable(obj) == scope.container:
+            literal, raw, present = _first_literal(node.child_by_field_name("arguments"))
+            if present:
+                self.found_uses.append(ServiceUse("create", literal, raw, line, scope.function,
+                                                  scope.class_name, scope.method))
+            return
+        found = self.receiver(obj)
+        if found is not None:
+            self.calls.append(ServiceCall(name, line, scope.function, scope.class_name,
+                                          scope.method, *found))
+            return
+        variable = _variable(obj)
+        if variable and variable != "this":
+            self.local_calls.append(((scope.frame, variable), name, line, scope))
+
+    def finish(self) -> tuple[list[ServiceUse], list[ServiceCall]]:
+        for key, name, line, scope in self.local_calls:
+            found = self.sources.get(key)
+            if found is not None and self.writes.get(key) == 1:
+                self.calls.append(ServiceCall(name, line, scope.function, scope.class_name,
+                                              scope.method, *found, local=key[1]))
+        self.calls.sort(key=lambda c: c.line)
+        return self.found_uses, self.calls
+
+
+def _service_sites(root: "tree_sitter.Node") -> tuple[list[ServiceUse], list[ServiceCall]]:
+    sites = _Sites()
+    _walk_scoped(root, _Scope(), sites.visit)
+    return sites.finish()
+
+
+def read_service_sites(path: Path, source: bytes | None = None,
+                       ) -> tuple[list[ServiceUse], list[ServiceCall]]:
+    """Every service use (`\\Drupal::service()`, any `\\Drupal::name()` --
+    the caller keeps the shortcuts it knows --, `$container->get()` in
+    `create()`) and every method call on a receiver naming a service: one of
+    those, `$this->p`, or a local assigned exactly once in its function from
+    one of them (spec §7.4). A chained call past the first is not one.
+    Never raises: bad input yields nothing."""
+    try:
+        parsed = _parse(path, source)
+        if parsed is None:
+            return [], []
+        return _service_sites(parsed[1])
+    except Exception:
+        return [], []
+
+
+@dataclass(frozen=True)
+class FileSemantics:
+    """`read_class_semantics` plus `read_service_sites`, from one parse."""
+    facts: list[ClassFacts]
+    annotations: list[tuple[str, Annotation]]
+    attributed: list[AttributedClass]
+    service_uses: list[ServiceUse]
+    service_calls: list[ServiceCall]
+
+
+def read_file_semantics(path: Path) -> FileSemantics:
+    """What the per-file extractor reads (P4 spec §4), from one parse. Never raises."""
+    try:
+        parsed = _parse(path)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        return FileSemantics([], [], [], [], [])
+    facts, annotations, attributed = _class_semantics(parsed[1], Path(path).as_posix())
+    root = parsed[1]
+    try:
+        uses, calls = _service_sites(root)
+    except Exception:
+        uses, calls = [], []
+    return FileSemantics(facts, annotations, attributed, uses, calls)

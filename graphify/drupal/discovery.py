@@ -91,6 +91,11 @@ class Registry:
     forms: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: "Fqcn::NAME" -> event name, the string constants of classes named `*Events` (P4 §8).
     event_constants: dict[str, str] = field(default_factory=dict)
+    #: alias -> the service id it names (`x: '@y'`, `x: {alias: y}`), every `*.services.yml`.
+    service_aliases: dict[str, str] = field(default_factory=dict)
+    #: custom service id -> `{"arguments": [service id or "" per position], "autowire": bool}`
+    #: (P4 §7.3 rules 2 and 3).
+    service_wiring: dict[str, dict] = field(default_factory=dict)
 
     def by_yaml_name(self) -> dict[str, PluginType]:
         """Non-deferred types that read `<ext>.<yaml_name>.yml` files."""
@@ -117,6 +122,8 @@ class Registry:
             "entity_types": {k: list(v) for k, v in self.entity_types.items()},
             "forms": {k: list(v) for k, v in self.forms.items()},
             "event_constants": dict(self.event_constants),
+            "service_aliases": dict(self.service_aliases),
+            "service_wiring": {k: _wiring(v) for k, v in self.service_wiring.items()},
         }
 
     @classmethod
@@ -136,7 +143,16 @@ class Registry:
             entity_types={k: tuple(v) for k, v in (data.get("entity_types") or {}).items()},
             forms={k: tuple(v) for k, v in (data.get("forms") or {}).items()},
             event_constants=dict(data.get("event_constants") or {}),
+            service_aliases={str(k): str(v) for k, v in (data.get("service_aliases") or {}).items()},
+            service_wiring={str(k): _wiring(v) for k, v in (data.get("service_wiring") or {}).items()},
         )
+
+
+def _wiring(data: Any) -> dict:
+    """A `service_wiring` entry in its one shape (JSON round trip, old files)."""
+    data = data if isinstance(data, dict) else {}
+    return {"arguments": [str(a) if isinstance(a, str) else "" for a in data.get("arguments") or []],
+            "autowire": data.get("autowire") is True}
 
 
 def type_id(plugin_type: str) -> str:
@@ -365,6 +381,9 @@ class _Builder:
         self.hooks: dict[str, HookDecl] = {}
         #: service id -> (class, provider extension); every service `_read_services` reaches.
         self.services: dict[str, tuple[str, str]] = {}
+        #: alias -> service id, and custom service id -> wiring (`Registry`'s maps).
+        self.aliases: dict[str, str] = {}
+        self.wiring: dict[str, dict] = {}
         self._classes: dict[str, tuple[Path, PhpClass] | None] = {}
         self._reaches: dict[str, bool] = {}
         self._noted: set[tuple[str, str, str]] = set()
@@ -619,8 +638,23 @@ def _load_services_yaml(path: Path) -> tuple[dict | None, str | None]:
     return (data, None) if isinstance(data, dict) else (None, None)
 
 
-def _read_services(builder: _Builder, path: Path) -> set[str]:
-    """Register the manager services one file declares; return every class it reached."""
+def _argument_ids(arguments: Any) -> list[str]:
+    """Per position of a positional `arguments:` list, the service id of a
+    `'@x'` / `'@?x'` reference, else "" (P4 §7.3 rule 2). A keyed map
+    (named arguments) says nothing positional: an empty list."""
+    if not isinstance(arguments, list):
+        return []
+    out: list[str] = []
+    for arg in arguments:
+        ref = arg[1:] if isinstance(arg, str) and arg.startswith("@") and not arg.startswith("@@") else ""
+        out.append(ref[1:] if ref.startswith("?") else ref)
+    return out
+
+
+def _read_services(builder: _Builder, path: Path, custom: bool = False) -> set[str]:
+    """Register the manager services one file declares; return every class it
+    reached. Aliases are kept from every file, and each service's wiring
+    (`arguments:`, `autowire`) from a `custom` one (P4 §7.3)."""
     reached: set[str] = set()
     data, error = _load_services_yaml(path)
     if error:
@@ -630,17 +664,33 @@ def _read_services(builder: _Builder, path: Path) -> set[str]:
     if not isinstance(services, dict):
         return reached
     stem = path.name[: -len(_SERVICES_SUFFIX)]
+    defaults = services.get("_defaults")
+    autowire_default = isinstance(defaults, dict) and defaults.get("autowire") is True
     for raw_sid, definition in services.items():
         sid = str(raw_sid)
-        if sid in _RESERVED_SERVICE_KEYS or isinstance(definition, str):
+        if sid in _RESERVED_SERVICE_KEYS:
             continue
-        if isinstance(definition, dict) and ("alias" in definition or definition.get("abstract") is True):
+        if isinstance(definition, str):
+            if definition.startswith("@") and len(definition) > 1:
+                builder.aliases.setdefault(sid, definition[1:])
+            continue
+        if isinstance(definition, dict) and "alias" in definition:
+            alias = definition.get("alias")
+            if isinstance(alias, str) and alias.lstrip("@"):
+                builder.aliases.setdefault(sid, alias.lstrip("@"))
+            continue
+        if isinstance(definition, dict) and definition.get("abstract") is True:
             continue
         if definition is not None and not isinstance(definition, dict):
             continue
         fqcn = _service_class(sid, services)
         if fqcn:
             builder.services.setdefault(sid, (fqcn, stem))
+            if custom and sid not in builder.wiring:
+                definition = definition or {}
+                autowire = definition.get("autowire", autowire_default)
+                builder.wiring[sid] = {"arguments": _argument_ids(definition.get("arguments")),
+                                       "autowire": autowire is True}
         if not fqcn.startswith("Drupal\\"):
             continue
         found = builder.lookup(fqcn)
@@ -740,9 +790,10 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
     if web_root is None:
         builder.note("", "", "no_drupal_core")
 
+    where = _DirectoryFacts(builder)
     reached: set[str] = set()
     for path in walk.services:
-        reached |= _read_services(builder, path)
+        reached |= _read_services(builder, path, where.of(path)[1])
     swapped: list[tuple[Path, str]] = []
     for path in walk.providers:
         swapped.extend((path, fqcn) for fqcn in _read_provider(builder, path))
@@ -779,7 +830,7 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
                 pattern=hook_pattern(name),
             )
 
-    php = _learn_php(builder, walk, is_ignored)
+    php = _learn_php(builder, walk, is_ignored, where)
 
     return Registry(
         web_root=web_root.as_posix() if web_root is not None else None,
@@ -792,6 +843,8 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
         extension_info=walk.extension_info,
         shortcuts=read_drupal_shortcuts(web_root / "core" / "lib" / "Drupal.php")
         if web_root is not None else {},
+        service_aliases=builder.aliases,
+        service_wiring=builder.wiring,
         **php,
     )
 
@@ -821,7 +874,8 @@ _ENTITY_TYPE_ANNOTATION_CLASSES = frozenset({
 
 
 def _learn_php(builder: _Builder, walk: _Walk,
-               is_ignored: Callable[[Path], bool] | None) -> dict[str, dict]:
+               is_ignored: Callable[[Path], bool] | None,
+               where: _DirectoryFacts | None = None) -> dict[str, dict]:
     """The P4 maps, from one read of each `.php` file the walk found.
 
     A file is parsed only when a cheap text precheck matches: `getFormId`,
@@ -832,7 +886,7 @@ def _learn_php(builder: _Builder, walk: _Walk,
     a boundary one with the same key -- for forms whether either is a literal
     or a base form id -- and, on one side, a literal form id wins over a base
     form id. Never raises."""
-    where = _DirectoryFacts(builder)
+    where = where if where is not None else _DirectoryFacts(builder)
     class_facts: dict[str, dict] = {}
     entity_types: tuple[dict, dict] = ({}, {})     # (boundary, custom)
     forms: tuple[dict, dict] = ({}, {})

@@ -246,14 +246,16 @@ def _hook_candidates(registry: Registry, detected: set[str], root: Path) -> list
 
 
 def _php_candidates(registry: Registry, detected: set[str], root: Path) -> list[dict[str, Any]]:
-    """Every `php_candidates` entry (P4 spec §10) of the detected PHP files,
-    `file` relative to `root`: read from the full file list, like
-    `_hook_candidates`, with the extractor's own `find_php_candidates`."""
+    """Every `php_candidates` entry (P4 spec §10) of the detected PHP and
+    procedural files (services are used in both), `file` relative to
+    `root`: read from the full file list, like `_hook_candidates`, with the
+    extractor's own `find_php_candidates`."""
     found: list[dict[str, Any]] = []
     for p in sorted(detected):
-        if not p.endswith(".php"):
+        path = Path(p)
+        if path.suffix != ".php" and not is_procedural_file(path):
             continue
-        for entry in find_php_candidates(Path(p), registry):
+        for entry in find_php_candidates(path, registry):
             found.append({**entry, "file": _relative(entry["file"], root)})
     found.sort(key=lambda e: (e["kind"], e["module"], e["file"], e["line"]))
     return found

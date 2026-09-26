@@ -1056,6 +1056,58 @@ class _Overlay:
                 self.edge(source, eid, "subscribes_to_event",
                           **({"priority": priority} if priority is not None else {}))
 
+    # -- service calls (P4 spec §7.4) --
+
+    def container_class(self, sid: str) -> str:
+        """The class the container gives service `sid`, aliases followed."""
+        seen = {sid}
+        aliases = self.data.get("aliases") or {}
+        while sid in aliases and aliases[sid] not in seen and len(seen) < 16:
+            sid = aliases[sid]
+            seen.add(sid)
+        return ((self.services.get(sid) or {}).get("class") or "").lstrip("\\")
+
+    def service_calls_pass(self) -> None:
+        """`calls` for what the resolver could not bind statically: each
+        `uses_service` edge's `_pending_calls` (`[caller, method]`, written by
+        `resolvers.bind_service_calls`) is bound to the method of the class
+        the container gives the service, when that class differs from the
+        static one and is a class node of the graph (walking `extends` among
+        custom classes). The edges are the overlay's own (`origin:
+        container`); the static edge is never touched."""
+        from graphify.drupal.php_services import class_chain, service_class
+
+        for u, v, data in list(self.G.edges(data=True)):
+            waiting = data.get("_pending_calls")
+            if data.get("relation") != "uses_service" or not isinstance(waiting, list):
+                continue
+            sid = data.get("target_name")
+            if not isinstance(sid, str) or not sid:
+                continue
+            cls = self.container_class(sid)
+            if not cls or cls == service_class(self.registry, sid):
+                continue
+            chain = [cls] + [f.fqcn for f in class_chain(self.registry, cls)[1:]]
+            for entry in waiting:
+                if not (isinstance(entry, list) and len(entry) == 2):
+                    continue
+                caller, method = entry
+                if not isinstance(caller, str) or caller not in self.G:
+                    continue
+                self.count("service_calls", True)
+                target = None
+                for c in chain:
+                    file = self.class_file(c)
+                    if self.binder.php_node(file, c) is None:
+                        break
+                    target = self.binder.php_node(file, f"{_short(c)}::{method}")
+                    if target is not None:
+                        break
+                if target is None:
+                    continue
+                self.applied("service_calls")
+                self.edge(caller, target, "calls", service=sid)
+
     # -- runtime --
 
     def runtime(self) -> None:
@@ -1085,6 +1137,7 @@ class _Overlay:
             self.plugins_pass(phase)
         self.subscribers_pass()
         self.aliases_pass()
+        self.service_calls_pass()
         self.runtime()
 
 

@@ -48,8 +48,15 @@ from graphify.ids import make_id
 PENDING = "pending"
 #: `pending` value: the target is the class node named by `target_name` (a FQCN).
 PENDING_CLASS = "class"
+#: `pending` values of a `calls` edge (spec §7.4): the method `method` of the
+#: class of service `service`, or of the service property `property` of
+#: class `class` holds (spec §7.3).
+PENDING_SERVICE_CALL = "service_call"
+PENDING_PROPERTY_CALL = "property_call"
 
 _UNKNOWN_PLUGIN_TYPE = "unknown_plugin_type"
+_NON_LITERAL_SERVICE = "non_literal_service"
+_UNRESOLVED_RECEIVER = "unresolved_receiver"
 _PLUGIN_DIR = "Plugin/"
 _ENTITY_KINDS = {"ContentEntityType": "content", "ConfigEntityType": "config"}
 #: Literal entity type attributes copied onto the node (spec §5.3).
@@ -90,17 +97,35 @@ def _src_relative(path: Path, registry: Any) -> tuple[str, str]:
     return (owner, posix[len(prefix):]) if posix.startswith(prefix) else ("", "")
 
 
+def _where(path: Path, registry: Any) -> tuple[str, str]:
+    """`(owner, path relative to <extension>/src/)` of a semantics file: a
+    `.php` under an extension's `src/`, or an extension's procedural file
+    (`<ext>.module`, `.install`, ..., whose `src` part is ""); `("", "")`
+    for any other file."""
+    from graphify.drupal.hooks import PROCEDURAL_SUFFIXES, procedural_extension
+
+    if path.suffix == ".php":
+        return _src_relative(path.absolute(), registry) if "/src/" in path.as_posix() else ("", "")
+    if path.suffix in PROCEDURAL_SUFFIXES:
+        return procedural_extension(path), ""
+    return "", ""
+
+
 def is_semantics_file(path: Path) -> bool:
-    """A `.php` file under `<extension>/src/` of an extension the current
-    registry knows. False without a registry, so a non-Drupal run pays one
-    substring test per PHP file."""
+    """A `.php` file under `<extension>/src/`, or an extension's procedural
+    file (services are used there too, spec §7.1), of an extension the
+    current registry knows. False without a registry, so a non-Drupal run
+    pays one substring test per PHP file."""
+    from graphify.drupal.hooks import PROCEDURAL_SUFFIXES
+
     path = Path(path)
-    if path.suffix != ".php" or "/src/" not in path.as_posix():
+    if not ((path.suffix == ".php" and "/src/" in path.as_posix())
+            or path.suffix in PROCEDURAL_SUFFIXES):
         return False
     from graphify.drupal.discovery import current_registry
 
     registry = current_registry()
-    return registry is not None and bool(_src_relative(path.absolute(), registry)[0])
+    return registry is not None and bool(_where(path, registry)[0])
 
 
 @dataclass
@@ -117,6 +142,8 @@ class _File:
     facts: list = field(default_factory=list)
     annotations: list = field(default_factory=list)
     attributed: list = field(default_factory=list)
+    service_uses: list = field(default_factory=list)
+    service_calls: list = field(default_factory=list)
     nodes: list[dict[str, Any]] = field(default_factory=list)
     edges: list[dict[str, Any]] = field(default_factory=list)
     candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -163,26 +190,26 @@ class _File:
 
 def _read(path: Path, core_result: dict | None, registry: Any = None) -> _File | None:
     from graphify.drupal.discovery import current_registry
-    from graphify.drupal.php_classes import read_class_semantics
+    from graphify.drupal.php_classes import read_file_semantics
     from graphify.extractors.base import _file_stem
 
     path = Path(path)
-    if path.suffix != ".php" or "/src/" not in path.as_posix():
-        return None
     if registry is None:
         registry = current_registry()
     if registry is None:
         return None
-    owner, src_rel = _src_relative(path.absolute(), registry)
+    owner, src_rel = _where(path, registry)
     if not owner:
         return None
-    facts, annotations, attributed = read_class_semantics(path)
+    read = read_file_semantics(path)
     return _File(
         path=path, registry=registry, owner=owner, src_rel=src_rel,
         core_ids={n.get("id") for n in (core_result or {}).get("nodes") or ()},
         core_lines={n.get("id"): str(n.get("source_location") or "")
                     for n in (core_result or {}).get("nodes") or ()},
-        stem=_file_stem(path), facts=facts, annotations=annotations, attributed=attributed,
+        stem=_file_stem(path), facts=read.facts, annotations=read.annotations,
+        attributed=read.attributed, service_uses=read.service_uses,
+        service_calls=read.service_calls,
     )
 
 
@@ -385,7 +412,10 @@ def _entity_form(f: _File, entity_type: str, operation: str, fqcn: str, line: in
 
 def _forms(f: _File) -> None:
     """A class whose `getFormId()` returns a literal is a `drupal_form`; a
-    computed id is legitimate and yields nothing (no candidate)."""
+    computed id is legitimate and yields nothing (no candidate). Only a
+    class under `src/`: a procedural file's is no form Drupal loads."""
+    if not f.src_rel:
+        return
     for facts in f.facts:
         if not facts.form_id:
             continue
@@ -411,6 +441,8 @@ def _class_line(f: _File, name: str) -> int:
 
 
 def _plugins_and_entity_types(f: _File) -> None:
+    if not f.src_rel:
+        return
     types = _types(f.registry)
     attribute_classes = {t.attribute_class for t in f.registry.types.values() if t.attribute_class}
     annotation_shorts = {_short(t.annotation_class) for t in f.registry.types.values()
@@ -439,8 +471,93 @@ def _plugins_and_entity_types(f: _File) -> None:
             })
 
 
+# -- services (spec §7) ----------------------------------------------------------------
+
+
+def pending_call_id(*parts: str) -> str:
+    """The placeholder target of a pending `calls` edge: one per source and
+    (service, method) or (class, property, method), so one ordered pair."""
+    return make_id("drupal", "pending", "call", *parts)
+
+
+def _caller(f: _File, site: Any) -> str | None:
+    """The node core emitted for the function or method enclosing `site`."""
+    from graphify.extractors.base import _make_id
+
+    if site.function:
+        nid = _make_id(f.stem, site.function)
+    elif site.class_name and site.method:
+        nid = _make_id(_make_id(f.stem, site.class_name), site.method)
+    else:
+        return None
+    return nid if nid in f.core_ids else None
+
+
+def _caller_name(site: Any) -> str:
+    if site.function:
+        return site.function
+    return f"{site.class_name}::{site.method}" if site.class_name else ""
+
+
+def _services(f: _File) -> None:
+    """`uses_service` from each of spec §7.1's three forms, and a pending
+    `calls` edge for each method call on a receiver naming a service (§7.4):
+    `service_call` when the service is known here, `property_call` for
+    `$this->p`, which the resolver settles with §7.3's rules. A non-literal
+    service id is a `non_literal_service` candidate; a call on a property
+    no rule resolves is an `unresolved_receiver` candidate when the
+    property's declared type is one a known service answers to."""
+    from graphify.drupal.php_services import is_service_type, property_service, resolve_alias
+    from graphify.drupal.yaml_common import service_id
+
+    registry = f.registry
+    shortcuts = registry.shortcuts or {}
+    for use in f.service_uses:
+        sid = shortcuts.get(use.name, "") if use.via == "shortcut" else use.name
+        if use.via == "shortcut" and not sid:
+            continue
+        if not sid:
+            f.candidate(_NON_LITERAL_SERVICE, use.line, via=use.via, argument=use.raw,
+                        caller=_caller_name(use))
+            continue
+        source = f.class_node(use.class_name) if use.via == "create" else _caller(f, use)
+        if source is None:
+            continue
+        target = resolve_alias(registry, sid)
+        extra: dict[str, Any] = {"alias": sid} if target != sid else {}
+        if use.via == "shortcut":
+            extra["shortcut"] = use.name
+        f.add_edge(source, service_id(target), "uses_service", use.line, via=use.via,
+                   target_name=target, **extra)
+
+    classes = {_short(facts.fqcn): facts.fqcn for facts in f.facts}
+    for call in f.service_calls:
+        source = _caller(f, call)
+        if call.receiver == "property":
+            fqcn = classes.get(call.class_name)
+            if not fqcn:
+                continue
+            service, declared = property_service(registry, fqcn, call.target)
+            if not service and declared and is_service_type(registry, declared):
+                f.candidate(_UNRESOLVED_RECEIVER, call.line, **{
+                    "class": fqcn, "property": call.target, "type": declared,
+                    "method": call.name})
+            if source is None:
+                continue
+            f.add_edge(source, pending_call_id(fqcn, call.target, call.name), "calls", call.line,
+                       **{PENDING: PENDING_PROPERTY_CALL, "class": fqcn}, property=call.target,
+                       method=call.name)
+            continue
+        sid = call.target if call.receiver == "service" else shortcuts.get(call.target, "")
+        if not sid or source is None:
+            continue
+        sid = resolve_alias(registry, sid)
+        f.add_edge(source, pending_call_id(sid, call.name), "calls", call.line,
+                   **{PENDING: PENDING_SERVICE_CALL}, service=sid, method=call.name)
+
+
 #: Every producer, run in order over one file's reading. Tasks 3-5 add theirs.
-_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types, _forms)
+_PRODUCERS: tuple[Callable[[_File], None], ...] = (_plugins_and_entity_types, _forms, _services)
 
 
 def _run(path: Path, core_result: dict | None, registry: Any = None) -> dict[str, Any]:

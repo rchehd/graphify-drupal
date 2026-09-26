@@ -589,7 +589,8 @@ def test_corpus_plugins_and_entity_types(tmp_path):
                 plugins[n["plugin_type"]] += 1
             elif n["type"] == "drupal_entity_type":
                 entity_types.add(n["label"])
-        candidates += result["php_candidates"]
+        # The service candidates (P4 Task 4) are counted in test_drupal_php_services.
+        candidates += [c for c in result["php_candidates"] if c["kind"] == "unknown_plugin_type"]
     assert entity_types == {
         "system", "task", "task_workflow", "webform_integration", "webform_integration_lim",
         "webform_integration_result", "webform_integrations_log", "webform_integrations_token"}
