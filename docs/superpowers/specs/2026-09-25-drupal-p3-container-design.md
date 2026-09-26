@@ -616,9 +616,45 @@ link stubs named as parents.
 
 Timings: full build with the artifact 10.8 s, unchanged rerun 8.5 s, static
 10.8 s (P2b measured 7.5 s / 6.9 s; the static build without an artifact
-takes as long as the one with it, so the difference is not the overlay). `run_for_build` on the built graph (artifact load, staleness,
-`apply`, divergence log, report block): **0.60 s** (0.31 s of it the staleness
+takes as long as the one with it, so the difference is not the overlay).
+`run_for_build` on the built graph (artifact load, staleness, `apply`,
+divergence log, report block): **0.60 s** (0.31 s of it the staleness
 `sources_sha`), under §12's 1 s.
+
+The rise over P2b, attributed (final review, 2026-09-26). P2b's head
+(`33ff0db`, a git worktree) and P3's, on the same FormsRemote commit
+(`60b010db`), same machine, no artifact, `extract --code-only --out
+<scratch>`, interleaved, three runs each:
+
+| head | full build | unchanged rerun |
+|---|---|---|
+| P2b `33ff0db` | 10.97 / 10.50 / 10.39 s (mean 10.62) | 7.19 / 7.13 / 7.76 s (mean 7.36) |
+| P3 (fix wave) | 10.82 / 10.86 / 10.61 s (mean 10.76) | 7.39 / 7.29 / 7.42 s (mean 7.37) |
+
+P2b's own code now takes 10.6 s / 7.4 s: the rise from 7.5 s / 6.9 s is the
+corpus (FormsRemote moved from P2b's closing commit to `9f933cdb` and
+`60b010db`, "Update webform module") and the machine's state, not P3. P3's
+extra is +0.14 s full, +0.01 s rerun, within the run-to-run spread (0.6 s).
+cProfile of a static P3 build names it: the overlay step with no artifact
+(`run_for_build`: boundary facts through `resolvers._BoundaryIndex.facts`,
+660 stubs on a full build, 330 on a rerun, and `undo`) 0.19 s full /
+0.36 s rerun under the profiler; the artifact check in `classify_file`
+0.01 s; the rerun's baseline undo in `_load_existing_graph` 0.08 s;
+`_invokes_hook_files` runs only when the boundary moved (0.001 s). Nothing
+there is worth reducing.
+
+With the artifact, `run_for_build` measures 0.91–1.04 s on the same machine
+today at P3's pre-review head (`d8d11e4`), so the 0.60 s above does not
+reproduce; the fix wave measured 0.93–1.02 s, and 0.83–0.97 s after the
+staleness check stopped asking `realm_of` for boundary services' class
+files (`container._registry_extra_files`). Most of the rest is `realm_of`
+over the artifact's ~4,000 files (memoised per overlay, §15.4) and the
+staleness walk. Re-measured with the fix wave: every count in this section
+is unchanged (4,946 / 10,724; confirmed 492, container-only 329,
+pair_taken 86, conflict 0; the per-source table; `runtime: absent` service
+9, extension 2; divergences 78 / 11 / 7 / 0; 121 overlay-made nodes), and
+the overlay's `source_file` for this out-of-root artifact is now
+`container://drupal-container.json` (§15.5).
 
 Second run: `incremental summary: 1142 files cached/unchanged, 2
 re-extracted, 0 deleted` — core's two never-stamped re-queues, as in P2b
