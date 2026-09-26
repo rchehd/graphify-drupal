@@ -222,9 +222,9 @@ declaration says so. (As built in P3 the record is GRAPH_REPORT's
 "Drupal coverage" → "### Container" block, `status: unavailable` followed by
 the vocabulary §7 list, since `graph.audit.json` is P7's; the same block
 reports `fresh`, `stale (reasons)`, `invalid (reason)` and `error (message)`.
-Differences between the two sources go to `<out>/drupal-divergence.json`.) An agent holding a static-only graph must know it is
-holding half. Silent degradation reproduces the exact failure this project
-exists to prevent.
+Differences between the two sources go to `<out>/drupal-divergence.json`.)
+An agent holding a static-only graph must know it is holding half. Silent
+degradation reproduces the exact failure this project exists to prevent.
 
 ---
 

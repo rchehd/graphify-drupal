@@ -404,12 +404,16 @@ parallel taxonomy.
 | `subscribes_to_event` | PHP class → event | `getSubscribedEvents()`; `priority` attribute |
 
 From P3 the container overlay emits or confirms `declares_service`,
-`service_implemented_by`, `injects_service`, `injects_parameter`, `decorates`
-and `subscribes_to_event` (from the event dispatcher's listeners: the class of
+`service_implemented_by`, `injects_service`, `injects_parameter` and
+`subscribes_to_event` (from the event dispatcher's listeners: the class of
 a custom listener object, bound by its own file, so a `RouteSubscriberBase`
-subclass is custom). `tagged_as` stays static-only: a live Drupal 11
-container's runtime dump (`OptimizedPhpArrayDumper`) carries no tags, and
-`decorates` comes only from the `<id>.inner` argument naming.
+subclass is custom). `tagged_as` and `decorates` stay static-only on a live
+Drupal 11 container: its runtime dump (`OptimizedPhpArrayDumper`) carries no
+tags, and the only `decorates` signal the collector reads, an `<id>.inner`
+argument, is never visible there (private ids are hashed to
+`private__<hash>`, P3 spec §15.5). The overlay maps a `decorates` fact when
+an artifact carries one (a collector reading another dumper); on FormsRemote
+none does.
 
 ### 4.3 Routing and access
 

@@ -128,7 +128,7 @@ Python strips them, so the artifact never carries a machine path.
 
 | Key | API | Fields |
 |---|---|---|
-| `services` | `\Drupal::service('kernel')->getCachedContainerDefinition()`; each `services[id]` is `unserialize()`d | `id`, `class`, `file`, `arguments` (only `@service` references and `%parameter%` names, walked recursively), `tags` (`[{name, attributes}]`, scalar attributes only), `decorates`, `provider` (the first `\Drupal\<ext>\` namespace segment, when it is an installed extension) |
+| `services` | `\Drupal::service('kernel')->getCachedContainerDefinition()`; each `services[id]` is `unserialize()`d | `id`, `class`, `file`, `arguments` (only `@service` references and `%parameter%` names, walked recursively), `tags` (`[{name, attributes}]`, scalar attributes only; always `[]` from a live D11 container, so `tagged_as` is static-only), `decorates` (from an `<id>.inner` argument; never set on a live D11 container, whose private ids are hashed, so `decorates` is static-only too, §15.5), `provider` (the first `\Drupal\<ext>\` namespace segment, when it is an installed extension) |
 | `aliases` | the same definition's `aliases` | `{alias: target}` |
 | `routes` | `\Drupal::service('router.route_provider')->getAllRoutes()` | `name`, `path`, `defaults` keys `_controller`, `_form`, `_entity_form`, `_entity_list`, `_entity_view`, `_title_callback`; `requirements` keys `_permission`, `_custom_access`, `_entity_access`, `_access_*`; `provider` via the route's `_module`/controller namespace when determinable |
 | `extensions` | `\Drupal::service('extension.list.module')`, `…theme`, `…profile`, `getList()` plus `getAllInstalledInfo()` | `name`, `type`, `path`, `status`, `weight`, `dependencies` |
@@ -281,8 +281,8 @@ The vocabulary's relations, nothing new:
 |---|---|
 | service → class | `service_implemented_by` |
 | argument `@x` / `%p%` | `injects_service` / `injects_parameter` |
-| tag | `tagged_as`, scalar tag attributes on the edge |
-| `decorates` | `decorates` |
+| tag | `tagged_as`, scalar tag attributes on the edge (static-only on a live D11 container: no tags, §5.2) |
+| `decorates` | `decorates` (static-only on a live D11 container, §5.2, §15.5) |
 | alias | `aliases: [...]` on the target service node |
 | service provider module | `declares_service` |
 | route | `declares_route`, `routes_to` (→ method, else class), `routes_to_form`, `requires_permission`, `access_checked_by` |
@@ -461,9 +461,10 @@ On the fixtures:
   with `subprocess` mocked;
 - the collector's output contract: synthetic artifacts are built inside the
   tests (the allow-list admits only `tests/test_drupal_*.py`, so there is no
-  fixture directory); a corpus test, skipped without the corpus and a
-  running ddev, collects from FormsRemote into `tmp_path` and validates the
-  schema;
+  fixture directory); the corpus tests never run drush: they read an
+  artifact collected from FormsRemote, named by `DRUPAL_CONTAINER_ARTIFACT`
+  (skipped without it or without the corpus), validate its schema and lay it
+  over a build;
 - seam: removing either wrapped symbol raises `DrupalSeamError`;
 - §11's two tests.
 
