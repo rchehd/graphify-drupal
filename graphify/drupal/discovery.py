@@ -813,6 +813,11 @@ _ENTITY_TYPE_ATTRIBUTES = frozenset({
 #: matches `@ContentEntityType` without a `use` (none of the corpus's 62
 #: annotated entity classes imports it).
 _ENTITY_TYPE_ANNOTATIONS = frozenset({"ContentEntityType", "ConfigEntityType"})
+#: ... but an annotation whose name a `use` (or a leading `\\`) fixes must be one of these (spec §5.1).
+_ENTITY_TYPE_ANNOTATION_CLASSES = frozenset({
+    "Drupal\\Core\\Entity\\Annotation\\ContentEntityType",
+    "Drupal\\Core\\Entity\\Annotation\\ConfigEntityType",
+})
 
 
 def _learn_php(builder: _Builder, walk: _Walk,
@@ -824,8 +829,9 @@ def _learn_php(builder: _Builder, walk: _Walk,
     custom extension -- any class (spec §7.2 records every custom class).
     `is_ignored` is asked only about those files, after the precheck, so an
     ignored file may be read but never contributes. A custom entry wins over
-    a boundary one with the same key, and a literal form id over a base form
-    id. Never raises."""
+    a boundary one with the same key -- for forms whether either is a literal
+    or a base form id -- and, on one side, a literal form id wins over a base
+    form id. Never raises."""
     where = _DirectoryFacts(builder)
     class_facts: dict[str, dict] = {}
     entity_types: tuple[dict, dict] = ({}, {})     # (boundary, custom)
@@ -870,7 +876,9 @@ def _learn_php(builder: _Builder, walk: _Walk,
                 if entity_id:
                     entity_types[side].setdefault(entity_id, (owner, cls.fqcn))
         for fqcn, annotation in annotations:
-            if annotation.name.rsplit("\\", 1)[-1] not in _ENTITY_TYPE_ANNOTATIONS:
+            if annotation.short not in _ENTITY_TYPE_ANNOTATIONS:
+                continue
+            if annotation.imported and annotation.name not in _ENTITY_TYPE_ANNOTATION_CLASSES:
                 continue
             entity_id = annotation.values.get("id")
             if isinstance(entity_id, str) and entity_id:
@@ -879,7 +887,9 @@ def _learn_php(builder: _Builder, walk: _Walk,
     return {
         "class_facts": class_facts,
         "entity_types": {**entity_types[0], **entity_types[1]},
-        "forms": {**base_forms[0], **base_forms[1], **forms[0], **forms[1]},
+        # Later wins: custom over boundary for any key (literal or base id),
+        # and within one side a literal form id over a base form id.
+        "forms": {**base_forms[0], **forms[0], **base_forms[1], **forms[1]},
         "event_constants": event_constants,
     }
 

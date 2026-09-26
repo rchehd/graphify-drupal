@@ -181,7 +181,8 @@ def test_an_annotation_keeps_only_its_literal_keys(tmp_path):
 
     assert found == [(
         "Drupal\\foo\\Plugin\\WebformHandler\\XHandler",
-        Annotation(name="Drupal\\webform\\Annotation\\WebformHandler", line=11, values={"id": "x"}),
+        Annotation(name="Drupal\\webform\\Annotation\\WebformHandler", line=11, values={"id": "x"},
+                   short="WebformHandler", imported=True),
     )]
 
 
@@ -191,8 +192,10 @@ def test_an_entity_type_annotation_gives_nested_handler_maps(tmp_path):
     [(fqcn, annotation)] = read_class_annotations(path)
 
     assert fqcn == "Drupal\\foo\\Entity\\Foo"
-    # Not `use`d: the short name resolves against the file's namespace.
-    assert annotation.name == "Drupal\\foo\\Entity\\ContentEntityType"
+    # Not `use`d, as in Drupal (its reader matches by short name): `short` is
+    # what a matcher compares, and `imported` says no `use` fixed the name.
+    assert annotation.short == "ContentEntityType"
+    assert annotation.imported is False
     assert annotation.values == {
         "id": "foo",
         "bundle_entity_type": "foo_type",
@@ -230,6 +233,7 @@ class Bar {}
     [(_fqcn, annotation)] = read_class_annotations(path)
 
     assert annotation.name == "Drupal\\foo\\Annotation\\Thing"
+    assert (annotation.short, annotation.imported) == ("Thing", True)
     assert annotation.values == {
         "id": 'say "hi"',
         "deriver": {"class": "Drupal\\foo\\Deriver\\BarDeriver"},
@@ -371,6 +375,7 @@ def test_class_facts(tmp_path):
         assigns={},
         parent_args=(),
         create_args=("foo.helper", "", ""),
+        create_props={},
         form_id="foo_promoted",
         base_form_id="foo_base",
         constants={"MODE": "edit", "OTHER": "other"},
@@ -387,6 +392,7 @@ def test_class_facts(tmp_path):
         assigns={"helper2": "h"},
         parent_args=("h", "b", ""),
         create_args=("a", "", "b"),
+        create_props={},
         form_id="",
         base_form_id="",
         constants={},
@@ -397,9 +403,55 @@ def test_class_facts(tmp_path):
     assert plain.create_args == ("named",)
 
 
+SETTER_PHP = r"""<?php
+
+namespace Drupal\foo\Form;
+
+use Drupal\Core\Form\ConfigFormBase;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+
+class SetterForm extends ConfigFormBase {
+
+  public static function create(ContainerInterface $container) {
+    $form = parent::create($container);
+    $form->helper = $container->get('foo.helper');
+    $form->account = $container->get('current_user');
+    $form->computed = $container->get($form->id());
+    $form->chained = $container->get('config.factory')->get('foo.settings');
+    $form->setMessenger($container->get('messenger'));
+    $other = new \stdClass();
+    $other->ignored = $container->get('not_returned');
+    return $form;
+  }
+
+}
+
+class NotReturned {
+
+  public static function create(ContainerInterface $container) {
+    $instance = parent::create($container);
+    $instance->helper = $container->get('foo.helper');
+    return static::wrap($instance);
+  }
+
+}
+"""
+
+
+def test_create_setter_injection_binds_properties_of_the_returned_local(tmp_path):
+    path = _write(tmp_path / "SetterForm.php", SETTER_PHP)
+
+    setter, not_returned = read_class_facts(path)
+
+    assert setter.create_props == {"helper": "foo.helper", "account": "current_user"}
+    assert setter.create_args == ()
+    assert not_returned.create_props == {}
+
+
 def test_class_facts_round_trip_through_a_dict(tmp_path):
     path = _write(tmp_path / "PromotedForm.php", FACTS_PHP)
-    for facts in read_class_facts(path):
+    path2 = _write(tmp_path / "SetterForm.php", SETTER_PHP)
+    for facts in (*read_class_facts(path), *read_class_facts(path2)):
         data = json.loads(json.dumps(facts.to_dict()))
         assert ClassFacts.from_dict(data) == facts
 
@@ -592,6 +644,51 @@ def test_the_registry_learns_the_p4_maps(tmp_path):
     assert base.file == (root / "web/modules/custom/foo/src/FooBase.php").resolve().as_posix()
 
 
+def test_an_entity_annotation_imported_from_elsewhere_is_not_an_entity_type(tmp_path):
+    root = _p4_site(tmp_path)
+    _write(root / "web/modules/custom/foo/src/Entity/Fake.php", r"""<?php
+namespace Drupal\foo\Entity;
+
+use Drupal\foo\Annotation\ContentEntityType;
+
+/**
+ * @ContentEntityType(id = "fake")
+ */
+class Fake {}
+""")
+    registry = build_registry(root)
+    assert "fake" not in registry.entity_types
+    assert "foo" in registry.entity_types
+
+
+def test_custom_forms_win_over_boundary_forms_for_any_key(tmp_path):
+    root = _p4_site(tmp_path)
+    # A custom base id equal to a core literal form id, and a custom literal
+    # form id equal to a contrib base id: custom wins both.
+    _write(root / "web/modules/custom/foo/src/Form/Clash.php", r"""<?php
+namespace Drupal\foo\Form;
+
+class BaseClash {
+  public function getFormId() {
+    return 'foo_clash';
+  }
+  public function getBaseFormId() {
+    return 'system_site_form';
+  }
+}
+
+class LiteralClash {
+  public function getFormId() {
+    return 'node_form';
+  }
+}
+""")
+    registry = build_registry(root)
+    assert registry.forms["system_site_form"] == ("foo", "Drupal\\foo\\Form\\BaseClash")
+    assert registry.forms["node_form"] == ("foo", "Drupal\\foo\\Form\\LiteralClash")
+    assert registry.forms["foo_clash"] == ("foo", "Drupal\\foo\\Form\\BaseClash")
+
+
 def test_the_p4_maps_round_trip_through_json(tmp_path):
     registry = build_registry(_p4_site(tmp_path))
     data = json.loads(json.dumps(registry.to_json()))
@@ -651,6 +748,29 @@ def test_a_changed_constructor_forces_its_file_and_in_graph_subclasses(tmp_path)
     assert (src / "Form/FooSettingsForm.php").resolve().as_posix() not in forced
 
 
+def test_a_changed_setter_injection_forces_its_file_and_subclasses(tmp_path):
+    root = _p4_site(tmp_path)
+    src = root / "web/modules/custom/foo/src"
+    setter = """<?php
+namespace Drupal\\foo;
+
+class FooBase {
+  public static function create($container) {
+    $instance = new static();
+    $instance->helper = $container->get('%s');
+    return $instance;
+  }
+}
+"""
+    (src / "FooBase.php").write_text(setter % "foo.helper", encoding="utf-8")
+    previous = build_registry(root)
+    assert ClassFacts.from_dict(previous.class_facts["Drupal\\foo\\FooBase"]).create_props == {
+        "helper": "foo.helper"}
+    (src / "FooBase.php").write_text(setter % "foo.other", encoding="utf-8")
+    forced = affected_files(previous, build_registry(root))
+    assert {(src / n).resolve().as_posix() for n in ("FooBase.php", "FooChild.php")} <= forced
+
+
 def test_a_removed_class_forces_its_old_file_and_subclasses(tmp_path):
     root = _p4_site(tmp_path)
     previous = build_registry(root)
@@ -694,6 +814,10 @@ def test_corpus_p4_maps_and_prepare_run_time(tmp_path, _isolated_discovery_state
     assert registry.class_facts
     assert all(ClassFacts.from_dict(v).fqcn == k for k, v in registry.class_facts.items())
     assert registry.event_constants
+    # Setter injection (`$instance->p = $container->get('x')` in `create()`):
+    # about 51 such assignments in 14 custom files (fix round 1).
+    create_props = sum(len(v["create_props"]) for v in registry.class_facts.values())
+    assert create_props >= 45, create_props
     # Global constraint: prepare_run(FormsRemote) stays under 5 s.
     assert elapsed < 5.0
 

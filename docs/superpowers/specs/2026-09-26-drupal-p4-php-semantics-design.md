@@ -118,9 +118,12 @@ For each learned plugin type with a `subdir` and an `attribute_class` or
 of a custom extension is a plugin of that type when it carries:
 
 - the attribute: `#[<attribute_class>(…)]`, name resolved through `use`; or
-- the annotation: a docblock `@<short annotation name>(…)` directly above
-  the class, where the short name resolves through `use` to
-  `annotation_class`.
+- the annotation: a docblock `@<Name>(…)` directly above the class, whose
+  short name equals the short name of `annotation_class`. As in Drupal's own
+  annotation reader, no `use` is required (none of the corpus's 62 annotated
+  entity classes imports its annotation class). When a `use` (or a leading
+  `\`) does fix the name and it resolves to a different FQCN, the annotation
+  does not match.
 
 The id is the attribute's first positional string or `id:` argument, or the
 annotation's `id = "…"`. The deriver is `deriver: X::class`, or an annotation
@@ -259,7 +262,14 @@ The registry records, for every custom class:
 - assignments `$this->p = $param;` inside `__construct`;
 - `create()`'s `new static(…)` / `new self(…)` / `new <Class>(…)` arguments,
   positionally: a `$container->get('x')` gives service `x`, anything else
-  gives unknown.
+  gives unknown;
+- `create()`'s setter injection: `$v->p = $container->get('x');` where `$v`
+  is the local variable `create()` returns (typically `$instance =
+  parent::create($container, …); … return $instance;`) gives property `p` →
+  service `x` (`create_props`). Only a direct property assignment with a
+  literal id counts: not a setter call (`$v->setFoo(…)`), and not a chained
+  `$container->get('x')->get(…)`. On FormsRemote: 48 properties in 14
+  classes.
 
 ### 7.3 Property → service
 
@@ -268,6 +278,9 @@ first match wins:
 
 1. `create()` passes `$container->get('x')` at the position of the
    parameter assigned to `p`;
+
+   1b. `create()` assigns `$container->get('x')` to `$<returned>->p`
+   (setter injection, §7.2);
 2. `C` is a service in `*.services.yml` whose `arguments:` has `@x` at that
    position;
 3. `C` is an autowired service (`autowire: true`, or `_defaults`) and the

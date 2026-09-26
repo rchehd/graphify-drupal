@@ -21,7 +21,7 @@ per-class readers from one parse.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import tree_sitter
@@ -756,9 +756,15 @@ def _container_get(node: "tree_sitter.Node | None", receivers: frozenset[str]) -
 
 @dataclass(frozen=True)
 class Annotation:
+    """One Doctrine annotation. Drupal's reader matches an annotation by its
+    short name, with no `use` needed (spec §5.1): a matcher compares `short`
+    with the annotation class's short name, and, when `imported`, also
+    requires `name` to be that class."""
     name: str       # resolved FQCN of `@Name` through the file's `use` statements
     line: int       # 1-based line of the `@Name(`
     values: dict    # the literal top-level `_ANNOTATION_KEYS`: str | {"class": fqcn} | dict | list
+    short: str = ""        # the last segment of the name as written (`ContentEntityType`)
+    imported: bool = False  # the name is fully qualified or resolved through a `use`
 
 
 #: The only top-level keys an annotation keeps (spec §5.1, §5.3): the plugin
@@ -918,7 +924,10 @@ def _annotations(doc: str, first_line: int, namespace: str, uses: dict[str, str]
             continue
         line = first_line + text.count("\n", 0, match.start(1))
         kept = {k: v for k, v in values.items() if k in _ANNOTATION_KEYS}
-        found.append(Annotation(resolve_name(match.group(1), namespace, uses), line, kept))
+        written = match.group(1)
+        imported = written.startswith("\\") or written.partition("\\")[0] in uses
+        found.append(Annotation(resolve_name(written, namespace, uses), line, kept,
+                                written.rsplit("\\", 1)[-1], imported))
         pos = parser.pos
 
 
@@ -987,6 +996,9 @@ class ClassFacts:
     form_id: str                       # `getFormId()`'s literal return, else ""
     base_form_id: str                  # `getBaseFormId()`'s literal return, else ""
     constants: dict[str, str]          # `const NAME = '<literal>'`
+    #: property -> service id, setter injection in `create()`:
+    #: `$v->p = $container->get('<literal>')` where `create()` returns `$v`.
+    create_props: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """A JSON-shaped copy: lists for tuples, `params` as dicts."""
@@ -996,6 +1008,7 @@ class ClassFacts:
             "assigns": dict(self.assigns), "parent_args": list(self.parent_args),
             "create_args": list(self.create_args), "form_id": self.form_id,
             "base_form_id": self.base_form_id, "constants": dict(self.constants),
+            "create_props": dict(self.create_props),
         }
 
     @classmethod
@@ -1013,6 +1026,7 @@ class ClassFacts:
             form_id=str(data.get("form_id") or ""),
             base_form_id=str(data.get("base_form_id") or ""),
             constants={str(k): str(v) for k, v in (data.get("constants") or {}).items()},
+            create_props={str(k): str(v) for k, v in (data.get("create_props") or {}).items()},
         )
 
 
@@ -1129,6 +1143,41 @@ def _create_args(create: "tree_sitter.Node | None", fqcn: str,
     return ()
 
 
+def _create_props(create: "tree_sitter.Node | None", namespace: str,
+                  uses: dict[str, str]) -> dict[str, str]:
+    """Setter injection in `create()` (spec §7.3 rule 1b): property -> service
+    id for every `$v->p = $container->get('<literal>');` where `$v` is the
+    local variable `create()` returns (`return $v;`) and `$container` its
+    first parameter. A setter call (`$v->setFoo(...)`) is not read."""
+    if create is None:
+        return {}
+    params = _params(create, namespace, uses)
+    body = create.child_by_field_name("body")
+    if not params or body is None:
+        return {}
+    receivers = frozenset({f"${params[0].name}"})
+    returned = {_variable(n.named_children[0]) for n in _walk_scope(body)
+                if n.type == "return_statement" and len(n.named_children) == 1}
+    returned.discard("")
+    returned.discard("this")
+    out: dict[str, str] = {}
+    if not returned:
+        return out
+    for node in _walk_scope(body):
+        if node.type != "assignment_expression":
+            continue
+        left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+        if left is None or left.type != "member_access_expression":
+            continue
+        if _variable(left.child_by_field_name("object")) not in returned:
+            continue
+        prop = left.child_by_field_name("name")
+        service = _container_get(right, receivers)
+        if prop is not None and prop.type == "name" and service:
+            out.setdefault(_text(prop), service)
+    return out
+
+
 def _literal_return(method: "tree_sitter.Node | None") -> str:
     return _literal_string(_sole_return(method)) or ""
 
@@ -1165,10 +1214,12 @@ def _class_facts(class_node: "tree_sitter.Node", namespace: str, uses: dict[str,
     ctor_body = ctor.child_by_field_name("body") if ctor is not None else None
     assigns = _assigns(ctor_body, {p.name for p in params}) if ctor_body is not None else {}
     parent_args = _parent_args(ctor_body) if ctor_body is not None else ()
+    create = _find_method(body, "create")
     return ClassFacts(
         fqcn=fqcn, file=file, extends=extends, params=params, assigns=assigns,
         parent_args=parent_args,
-        create_args=_create_args(_find_method(body, "create"), fqcn, namespace, uses),
+        create_args=_create_args(create, fqcn, namespace, uses),
+        create_props=_create_props(create, namespace, uses),
         form_id=_literal_return(_find_method(body, "getFormId")),
         base_form_id=_literal_return(_find_method(body, "getBaseFormId")),
         constants=_constants(body),
