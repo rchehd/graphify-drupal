@@ -258,7 +258,7 @@ def test_changing_only_the_artifact_re_extracts_nothing_and_reaches_the_graph(tm
     assert rerun == 0
     assert service_id("foo.later") in _nodes(graph)
     _assert_overlay_paths_relative(graph)
-    assert _overlay_files(graph) == {"../artifact/drupal-container.json"}
+    assert _overlay_files(graph) == {"container://drupal-container.json"}
 
 
 def test_update_lays_a_changed_artifact_over_the_graph(tmp_path):
@@ -394,17 +394,47 @@ def test_an_in_root_artifact_is_never_extracted_as_code(tmp_path):
 def test_an_out_dir_inside_the_root_keeps_the_overlay_on_a_rerun(tmp_path):
     """With `--out` inside the scan root, core also reads a relative
     `source_file` from the out dir: `../artifact/...` would land back in the
-    root and be pruned, so the overlay falls back to the absolute path."""
+    root and be pruned. An out-of-root artifact is `container://<name>`,
+    which core never prunes, and no machine path reaches graph.json."""
     root = _container_site(tmp_path / "site")
     out = root / "o"
     artifact = _write(tmp_path / "artifact" / "drupal-container.json",
                       _artifact_data(root, tmp_path / "stamp"))
 
     _extract(root, out, artifact)
-    graph, rerun, _ = _extract(root, out, artifact)
+    graph, rerun, text = _extract(root, out, artifact)
 
     assert rerun == 0
-    assert _overlay_files(graph) == {artifact.absolute().as_posix()}
+    assert _overlay_files(graph) == {"container://drupal-container.json"}
+    assert str(tmp_path) not in text
+
+
+def test_an_out_of_root_artifact_marker_survives_update_and_extract(tmp_path):
+    """The marker through `update` (watch's normalisation) and back into an
+    incremental `extract` (`_stale_graph_sources`): never pruned, never
+    collapsed, never a machine path."""
+    root = _container_site(tmp_path / "site")
+    artifact = _write(tmp_path / "artifact" / "drupal-container.json",
+                      _artifact_data(root, tmp_path / "stamp"))
+    graph_json = root / "graphify-out" / "graph.json"
+
+    def run(*args):
+        proc = subprocess.run([sys.executable, "-m", "graphify", *args], capture_output=True,
+                              text=True, cwd=root, env=_env(artifact))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        text = graph_json.read_text(encoding="utf-8")
+        graph = json.loads(text)
+        assert _overlay_files(graph) == {"container://drupal-container.json"}
+        assert str(tmp_path) not in text
+        assert service_id("foo.dynamic") in _nodes(graph)
+        return graph
+
+    first = run("extract", str(root), "--code-only")
+    run("update", str(root))
+    php = root / FOO / "src/OtherBar.php"
+    php.write_text(php.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    last = run("extract", str(root), "--code-only")
+    assert len(_links(last)) == len(_links(first))
 
 
 # -- in process -----------------------------------------------------------------

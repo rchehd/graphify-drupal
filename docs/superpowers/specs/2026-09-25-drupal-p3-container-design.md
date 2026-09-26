@@ -301,7 +301,9 @@ class and file. P4's static ones will meet them through `confirmed_by`.
   `confirmed_by: container`. The graph collapses parallel edges, so confirmation
   is an attribute, never a second edge.
 - **Container only**: a new edge, `origin: container`, `confidence:
-  EXTRACTED`, `confidence_score: 1.0`, `source_file: drupal-container.json`.
+  EXTRACTED`, `confidence_score: 1.0`, `source_file: drupal-container.json`
+  (the artifact's path relative to the scan root; `container://<file name>`
+  when it lives outside the root, §15.5).
 
 `origin` (no underscore) is the overlay's marker, and `_origin` is left to
 core. `extract()` stamps `_origin: "ast"` on every node and edge it returns
@@ -684,12 +686,18 @@ divergences `container_only` 160, `static_only` 13, `conflict` 10;
 - **Abstract parents** (`logger.channel_base`, `default_plugin_manager`) are
   `absent`: the compiled container drops abstract definitions. Accurate, and
   expected noise in `static_only`.
-- An artifact outside the scan root (the real run's scratch file) gives
+- An artifact outside the scan root (the real run's scratch file) gave
   overlay items a `source_file` that climbs out of the root
-  (`../../../../tmp/…/drupal-container.json`): the Task 6 ruling
-  (relative path) applied to an out-of-root file. Harmless to the
-  incremental runs (identical graph, 0 deleted); a committed artifact at the
-  root gives `drupal-container.json`.
+  (`../../../../tmp/…/drupal-container.json`), and with `--out` inside the
+  root the artifact's absolute path. Fixed in the final review: an
+  out-of-root artifact is `container://<file name>` (`source_file` and
+  `_overlay_file` alike), which core never prunes — `cli._stale_graph_sources`
+  skips a `source_file` holding `://`, and `watch` never evicts one with a
+  scheme (`_is_remote_source`). `watch` normalises a preserved
+  `container://x` to `container:/x`; the overlay's ownership test compares
+  the two as one (`container_overlay.same_source`), so `update` still undoes
+  what it made. A committed artifact at the root still gives
+  `drupal-container.json`.
 - Recorded rulings, as built: the runtime hook index is `runtime_order`
   (P2b's `order` keeps the attribute text); boundary facts (§7.8) are applied
   inside `apply`, after undo, with or without an artifact; `tags` are always

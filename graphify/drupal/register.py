@@ -899,8 +899,10 @@ def _patch_dedup(dedup: ModuleType) -> None:
         return str(node.get("type", "")).startswith("drupal_")
 
     def _overlay_made(node) -> bool:
+        from graphify.drupal.container_overlay import same_source
+
         own = node.get("_overlay_file")
-        return bool(node.get("_overlay")) or (bool(own) and node.get("source_file") == own)
+        return bool(node.get("_overlay")) or (bool(own) and same_source(node.get("source_file"), own))
 
     def _key_by_id(original):
         def _is_code(node):

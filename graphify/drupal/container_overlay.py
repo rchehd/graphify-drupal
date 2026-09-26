@@ -144,6 +144,20 @@ def _strip(data: dict) -> None:
     data.update(previous)
 
 
+_SCHEME_SLASHES = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]+:)/+")
+
+
+def same_source(a: object, b: object) -> bool:
+    """`a` and `b` name the same `source_file`: equal, or equal once the
+    slashes after a scheme are collapsed (`watch` normalises a preserved
+    `container://x` to `container:/x`)."""
+    if a == b:
+        return True
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return _SCHEME_SLASHES.sub(r"\1", a) == _SCHEME_SLASHES.sub(r"\1", b)
+
+
 def _owned(data: dict) -> bool:
     """The item is still the overlay's own: its `source_file` is the one it was
     created with. A static producer that later emits the same edge pair takes
@@ -153,7 +167,7 @@ def _owned(data: dict) -> bool:
     if own is None:
         # Laid before `_overlay_file` existed: the overlay's while it carries `origin`.
         return data.get("origin") == ORIGIN
-    return data.get("source_file") == own
+    return same_source(data.get("source_file"), own)
 
 
 def _hand_over(data: dict) -> None:
@@ -398,33 +412,27 @@ class _Binder:
 # -- the pass -------------------------------------------------------------------
 
 
-def _artifact_source_file(artifact: Path, root: Path, out_base: Path | None = None) -> str:
-    """The `source_file` of what the overlay adds: the artifact relative to
-    the scan root, `../`-relative when it lives outside it
-    (`GRAPHIFY_DRUPAL_CONTAINER`).
+#: The scheme of an out-of-root artifact's `source_file` (spec S15.5).
+ARTIFACT_SCHEME = "container://"
 
-    Core's incremental `extract` (`cli._stale_graph_sources`) prunes, after
-    the build the overlay ran in, every relative `source_file` that lands
-    inside the scan root under one of its anchors -- the root, and the
-    `--out` directory (`out_base`) when that differs -- and names no file
-    there. The bare name would be pruned; a `../` path leaving the root is
-    not, unless `--out` sits inside the root and the same path read from
-    there lands back in it: then, and only then, the absolute path."""
+
+def _artifact_source_file(artifact: Path, root: Path) -> str:
+    """The `source_file` of what the overlay adds: the artifact relative to
+    the scan root when it lives inside it, else `container://<name>`
+    (`GRAPHIFY_DRUPAL_CONTAINER`, a `.graphifyrc` path outside the root).
+
+    Never a machine path, and never pruned by core: its incremental `extract`
+    (`cli._stale_graph_sources`) skips a `source_file` holding `://`, and
+    `watch` never evicts one with a scheme (`watch._is_remote_source`, which
+    also matches the `container:/` a path normalisation could collapse it
+    to). A `../` path leaving the root would carry the machine's layout
+    (`../../../../tmp/...`), and with `--out` inside the root it lands back
+    in it and is pruned."""
     artifact, root = Path(artifact).absolute(), Path(root).absolute()
     try:
         return artifact.relative_to(root).as_posix()
     except ValueError:
-        pass
-    rel = Path(os.path.relpath(artifact, root)).as_posix()
-    if out_base is not None:
-        out_base = Path(out_base).absolute()
-        if out_base != root:
-            landed = Path(os.path.normpath(out_base / rel))
-            if landed == root or root in landed.parents:
-                return artifact.as_posix()
-    return rel
-
-
+        return ARTIFACT_SCHEME + artifact.name
 
 
 def _same_text(key: str, static: str, container: str) -> bool:
@@ -439,7 +447,7 @@ def _same_text(key: str, static: str, container: str) -> bool:
 
 class _Overlay:
     def __init__(self, G: nx.Graph, artifact: Artifact, root: Path, result: OverlayResult) -> None:
-        from graphify.drupal.discovery import current_registry, current_run
+        from graphify.drupal.discovery import current_registry
 
         self.G = G
         self.data = artifact.data
@@ -452,9 +460,7 @@ class _Overlay:
         self.binder = _Binder(G, self.root, self.composer_root)
         self.included = included_realms(self.root)
         self.registry = current_registry()
-        run = current_run()
-        self.artifact_file = _artifact_source_file(
-            Path(artifact.path), self.root, run[1].parent if run is not None else None)
+        self.artifact_file = _artifact_source_file(Path(artifact.path), self.root)
 
         self.services: dict[str, dict] = {}
         self.class_files: dict[str, str] = {}
