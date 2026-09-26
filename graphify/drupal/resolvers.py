@@ -18,6 +18,7 @@ silently, which is the exact failure class this project exists to avoid.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,6 +58,7 @@ _OWNER_RELATIONS = frozenset({
     "declares_library", "declares_breakpoint", "declares_menu_link",
     "declares_local_task", "declares_local_action", "declares_contextual_link",
     "defines_config", "defines_schema", "provides_plugin", "defines_plugin_type",
+    "defines_entity_type",
 })
 
 
@@ -239,6 +241,12 @@ _LINK_FAMILIES = {
 }
 
 
+def link_family_names() -> frozenset[str]:
+    """The P1 links families (`links.menu`, ...): a learned type read from one
+    keeps P1's link node for its plugins (P3 ruling)."""
+    return frozenset(_LINK_FAMILIES.values())
+
+
 class _BoundaryIndex:
     """Registry facts keyed by the node id a stub carries, each map built on first use.
 
@@ -345,6 +353,98 @@ def _link_type_edge(stub: dict[str, Any], edge: dict[str, Any]) -> dict[str, Any
     }
 
 
+# -- pending facts (P4 spec §4) ------------------------------------------------------
+
+
+def _normal_file(path: str) -> str:
+    """An absolute, normalised POSIX path: relative ones against the scan root."""
+    p = Path(str(path).replace("\\", "/"))
+    if not p.is_absolute():
+        p = (_scan_root if _scan_root is not None else Path.cwd()) / p
+    try:
+        return Path(os.path.realpath(p)).as_posix()
+    except (OSError, ValueError):
+        return p.as_posix()
+
+
+def _class_file(registry: Any, fqcn: str) -> str:
+    """The file that declares `fqcn`: the registry's class facts, else PSR-4
+    (`Drupal\\<ext>\\X\\Y` in `<ext>/src/X/Y.php`); "" when neither knows."""
+    facts = registry.class_facts.get(fqcn) if registry is not None else None
+    if isinstance(facts, dict) and facts.get("file"):
+        return str(facts["file"])
+    parts = fqcn.split("\\")
+    if registry is None or len(parts) < 3 or parts[0] != "Drupal":
+        return ""
+    directory = registry.extensions.get(parts[1])
+    if not directory:
+        return ""
+    return f"{directory.rstrip('/')}/src/{'/'.join(parts[2:])}.php"
+
+
+def bind_pending(all_nodes: list[dict], all_edges: list[dict]) -> None:
+    """Bind each pending class edge (`php_semantics.PENDING_CLASS`) to the class
+    node whose `source_file` is the class's file and whose label is its short
+    name (P2b/P3's binding), in place. The handler names an `entity_handler`
+    bound so serves (its comma-separated `handler`) leave its source node's
+    `handlers`. An edge that cannot be bound -- the class is
+    outside the graph, or two nodes answer -- stays pending, and the seam's
+    `extract` wrapper drops it (`drop_pending`).
+
+    In place rather than by removal: on an incremental run core hands the
+    resolvers scratch lists that hold the fresh edges by reference and keeps
+    only what is appended past them."""
+    from graphify.drupal.discovery import current_registry
+    from graphify.drupal.php_semantics import PENDING, PENDING_CLASS
+
+    pending = [e for e in all_edges if e.get(PENDING) == PENDING_CLASS
+               and isinstance(e.get("target_name"), str)]
+    if not pending:
+        return
+    registry = current_registry()
+    wanted: dict[str, tuple[str, str]] = {}
+    for e in pending:
+        fqcn = e["target_name"]
+        if fqcn not in wanted:
+            file = _class_file(registry, fqcn)
+            wanted[fqcn] = (_normal_file(file) if file else "", fqcn.rsplit("\\", 1)[-1])
+    labels = {short for file, short in wanted.values() if file}
+    index: dict[tuple[str, str], list[str]] = {}
+    for n in all_nodes:
+        label, source_file = n.get("label"), n.get("source_file")
+        if label not in labels or not source_file or str(n.get("type") or "").startswith("drupal_"):
+            continue
+        index.setdefault((_normal_file(str(source_file)), label), []).append(n["id"])
+    by_id: dict[str, dict] | None = None
+    for e in pending:
+        found = index.get(wanted[e["target_name"]], [])
+        if len(found) != 1:
+            continue
+        e["target"] = found[0]
+        e.pop(PENDING, None)
+        if e.get("relation") == "entity_handler" and isinstance(e.get("handler"), str):
+            if by_id is None:
+                by_id = {n.get("id"): n for n in all_nodes}
+            source = by_id.get(e.get("source"))
+            handlers = source.get("handlers") if source is not None else None
+            if isinstance(handlers, dict):
+                for name in e["handler"].split(","):
+                    handlers.pop(name, None)
+                if not handlers:
+                    source.pop("handlers", None)
+
+
+def drop_pending(result: Any) -> Any:
+    """`result` without the edges still pending after the resolvers ran:
+    no `pending` edge reaches graph.json (spec §4)."""
+    from graphify.drupal.php_semantics import PENDING
+
+    edges = result.get("edges") if isinstance(result, dict) else None
+    if isinstance(edges, list) and any(isinstance(e, dict) and PENDING in e for e in edges):
+        result["edges"] = [e for e in edges if not (isinstance(e, dict) and PENDING in e)]
+    return result
+
+
 def resolve_missing_targets(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -362,6 +462,7 @@ def resolve_missing_targets(
     """
     from graphify.drupal.yaml_common import config_id
 
+    bind_pending(all_nodes, all_edges)
     _retarget_domain_overrides(all_nodes, all_edges)
     _draw_schema_for(all_nodes, all_edges)
 

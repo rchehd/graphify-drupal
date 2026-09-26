@@ -10,7 +10,9 @@ returned; `report.generate`'s wrapper turns it into the "Drupal coverage"
 section appended to `GRAPH_REPORT.md`.
 
 It also lists every hook candidate (P2b spec §5.4): what looks like a hook
-implementation but names no declared hook literally.
+implementation but names no declared hook literally; and every PHP candidate
+(P4 spec §10): what custom PHP says that could not be read as a fact, such as
+a plugin attribute of no learned type.
 
 Nothing here raises on bad input (spec §5.8): an unreadable or unparsable
 YAML file is simply not counted toward `yaml_plugins`.
@@ -26,6 +28,7 @@ from graphify.drupal.config_stores import in_config_directory
 from graphify.drupal.discovery import Registry
 from graphify.drupal.families import is_drupal_file
 from graphify.drupal.hooks import find_hook_candidates, is_procedural_file
+from graphify.drupal.php_semantics import find_php_candidates
 from graphify.drupal.yaml_common import load_drupal_yaml
 from graphify.drupal.yaml_plugins import learned_family
 
@@ -242,6 +245,20 @@ def _hook_candidates(registry: Registry, detected: set[str], root: Path) -> list
     return found
 
 
+def _php_candidates(registry: Registry, detected: set[str], root: Path) -> list[dict[str, Any]]:
+    """Every `php_candidates` entry (P4 spec §10) of the detected PHP files,
+    `file` relative to `root`: read from the full file list, like
+    `_hook_candidates`, with the extractor's own `find_php_candidates`."""
+    found: list[dict[str, Any]] = []
+    for p in sorted(detected):
+        if not p.endswith(".php"):
+            continue
+        for entry in find_php_candidates(Path(p), registry):
+            found.append({**entry, "file": _relative(entry["file"], root)})
+    found.sort(key=lambda e: (e["kind"], e["module"], e["file"], e["line"]))
+    return found
+
+
 def build_inventory(registry: Registry, detected_files: set[str], root: Path) -> dict:
     """The coverage inventory (spec §5.7): what plugin discovery, the P1/P1b
     families and P5/P6's deferred families claim of `detected_files`, and
@@ -304,6 +321,7 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         filtered += 1
 
     candidates = _hook_candidates(registry, detected, root)
+    php_candidates = _php_candidates(registry, detected, root)
 
     unrecognised_files = sum(e["files"] for e in unrecognised)
     boundary, boundary_reasons, composer_error = _boundary_counts(registry, root)
@@ -318,6 +336,7 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         "boundary": boundary,
         "boundary_reasons": boundary_reasons,
         "hook_candidates": len(candidates),
+        "php_candidates": len(php_candidates),
     }
 
     inventory = {
@@ -325,6 +344,7 @@ def build_inventory(registry: Registry, detected_files: set[str], root: Path) ->
         "deferred": deferred_entries,
         "managers_unresolved": [dict(u) for u in registry.unresolved],
         "hook_candidates": candidates,
+        "php_candidates": php_candidates,
         "summary": summary,
     }
     if composer_error:
@@ -341,6 +361,7 @@ _SUMMARY_LABELS = (
     ("unrecognised_files", "unrecognised files"),
     ("filtered", "filtered"),
     ("hook_candidates", "hook candidates"),
+    ("php_candidates", "PHP candidates"),
 )
 
 _MAX_RENDERED_FAMILIES = 15
@@ -402,6 +423,17 @@ def render_section(inventory: dict) -> str:
             by_kind[c.get("kind", "")] = by_kind.get(c.get("kind", ""), 0) + 1
         for kind in sorted(by_kind):
             lines.append(f"- {kind}: {by_kind[kind]}")
+    else:
+        lines.append("- none")
+
+    lines += ["", "### PHP candidates"]
+    php_candidates = inventory.get("php_candidates") or []
+    if php_candidates:
+        php_by_kind: dict[str, int] = {}
+        for c in php_candidates:
+            php_by_kind[c.get("kind", "")] = php_by_kind.get(c.get("kind", ""), 0) + 1
+        for kind in sorted(php_by_kind):
+            lines.append(f"- {kind}: {php_by_kind[kind]}")
     else:
         lines.append("- none")
 

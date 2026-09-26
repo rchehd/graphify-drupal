@@ -325,7 +325,8 @@ def _patch_extract(extract: ModuleType) -> None:
     from graphify.drupal.families import drupal_extractor, is_api_php
     from graphify.drupal.hooks import extract_hook_declarations, extract_hook_invocations
     from graphify.drupal.merge import collapse_drupal_duplicates, collision_group, compose_handlers
-    from graphify.drupal.resolvers import scanning
+    from graphify.drupal.php_semantics import extract_php_semantics, is_semantics_file
+    from graphify.drupal.resolvers import drop_pending, scanning
     from graphify.drupal.yaml_settings import extract_drupal_settings, is_settings_php
 
     if not hasattr(extract, "_get_extractor"):
@@ -395,6 +396,11 @@ def _patch_extract(extract: ModuleType) -> None:
                 # files and `src/Hook/**/*.php` already carry this through
                 # `hooks.extract_php_with_hooks` (`drupal_extractor`, above).
                 extras.append(extract_hook_invocations)
+            if is_semantics_file(path):
+                # A class under an extension's `src/`: its plugins, entity
+                # types (P4 spec §5). `src/Hook/**` gets this through
+                # `hooks.extract_php_with_hooks` (`drupal_extractor`, above).
+                extras.append(extract_php_semantics)
             # A `#[Hook]` outside `<extension>/src/Hook/` is no implementation
             # (Drupal never collects it): the inventory lists it as `misplaced`.
             return compose_handlers(base, extras) if extras else base
@@ -451,6 +457,8 @@ def _patch_extract(extract: ModuleType) -> None:
             # resolver runs inside this call but is not handed the root.
             with scanning(anchor):
                 result = original(paths, cache_root, **kwargs)
+            # What the resolver could not bind never reaches the graph.
+            drop_pending(result)
             # Only now are the forced files re-extracted; an exception above
             # leaves the set in place for the next run to carry over.
             clear_force_miss()

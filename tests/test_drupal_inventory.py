@@ -92,8 +92,10 @@ def test_build_inventory_partitions_the_site(tmp_path, _isolated_discovery_state
         "boundary": {"core": 1, "contrib": 0, "vendor": 0, "files": 0},
         "boundary_reasons": {"path_rule": 1},
         "hook_candidates": 0,
+        "php_candidates": 0,
     }
     assert inventory["hook_candidates"] == []
+    assert inventory["php_candidates"] == []
 
 
 def test_unrecognised_families_are_sorted_by_count_then_name(tmp_path, _isolated_discovery_state):

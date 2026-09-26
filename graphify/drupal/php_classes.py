@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import tree_sitter
 import tree_sitter_php
@@ -213,6 +214,11 @@ class AttrArg:
     name: str            # the named argument's name (`method:` -> "method"), "" when positional
     text: str            # the value's source text, verbatim (`Order::First`)
     string: str | None   # the value of a plain string literal, else None
+    #: The literal value, shaped like an annotation's (`Annotation.values`): a
+    #: string, `{"class": fqcn}` for `X::class`, a dict for a keyed array and a
+    #: list for an unkeyed one (non-literal elements dropped), else None. Never
+    #: evaluated; left out of equality so positional construction still compares.
+    value: Any = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -338,10 +344,46 @@ def _attributes(decl: "tree_sitter.Node", namespace: str, uses: dict[str, str]) 
                     continue
                 value = values[-1]
                 string = _literal_string(value)
-                args.append(AttrArg(_text(arg_name), _text(value), string))
+                args.append(AttrArg(_text(arg_name), _text(value), string,
+                                    _attr_value(value, namespace, uses, 0)))
             found.append(PhpAttribute(resolve_name(_text(name_node), namespace, uses),
                                       attr.start_point[0] + 1, tuple(args)))
     return tuple(found)
+
+
+#: How deep `_attr_value` follows nested arrays; deeper values are dropped.
+_MAX_ATTR_DEPTH = 32
+
+
+def _attr_value(node: "tree_sitter.Node | None", namespace: str, uses: dict[str, str],
+                depth: int) -> Any:
+    """An attribute argument's literal value (see `AttrArg.value`), or None."""
+    if node is None or depth > _MAX_ATTR_DEPTH:
+        return None
+    string = _literal_string(node)
+    if string is not None:
+        return string
+    if node.type == "class_constant_access_expression":
+        children = node.named_children
+        if len(children) == 2 and _text(children[1]) == "class":
+            return {"class": resolve_name(_text(children[0]), namespace, uses)}
+        return None
+    if node.type != "array_creation_expression":
+        return None
+    keyed: dict[str, Any] = {}
+    items: list[Any] = []
+    for element in node.named_children:
+        if element.type != "array_element_initializer" or not element.named_children:
+            continue
+        parts = element.named_children
+        value = _attr_value(parts[-1], namespace, uses, depth + 1)
+        if len(parts) == 2:
+            key = _literal_string(parts[0])
+            if key is not None and value is not None:
+                keyed[key] = value
+        elif value is not None:
+            items.append(value)
+    return keyed if keyed or not items else items
 
 
 def read_php_functions(path: Path) -> list[PhpFunction]:
@@ -773,6 +815,9 @@ class Annotation:
 _ANNOTATION_KEYS = frozenset({
     "id", "deriver", "handlers", "bundle_entity_type", "base_table", "admin_permission",
 })
+#: The key Doctrine gives an annotation's unnamed first value; kept as `id`
+#: when there is no `id =` (`@RenderElement("x")`, Drupal's `PluginID`).
+_ANNOTATION_VALUE = "value"
 #: A top-level annotation: `@Name(` first on a docblock line.
 _ANNOTATION_START = re.compile(r"^[ \t]*@(\\?[A-Za-z_][\w\\]*)\(", re.MULTILINE)
 _TOKEN = re.compile(r"""\s*(?:
@@ -835,12 +880,18 @@ class _AnnotationParser:
     def arguments(self, depth: int) -> dict:
         """After `(`: the keyed arguments up to and including `)`."""
         values: dict = {}
+        first = True
         while True:
             if self._peek() == ("punct", ")"):
                 self._next()
                 return values
             key = self._keyed()
             value = self.value(depth)
+            if key is None and first and isinstance(value, str):
+                # Doctrine's unnamed first value: `@RenderElement("x")`,
+                # which a `PluginID` annotation reads as the id.
+                key = _ANNOTATION_VALUE
+            first = False
             if key is not None and value is not _SKIP:
                 values.setdefault(key, value)
             kind, token = self._next()
@@ -924,6 +975,8 @@ def _annotations(doc: str, first_line: int, namespace: str, uses: dict[str, str]
             continue
         line = first_line + text.count("\n", 0, match.start(1))
         kept = {k: v for k, v in values.items() if k in _ANNOTATION_KEYS}
+        if "id" not in kept and isinstance(values.get(_ANNOTATION_VALUE), str):
+            kept["id"] = values[_ANNOTATION_VALUE]
         written = match.group(1)
         imported = written.startswith("\\") or written.partition("\\")[0] in uses
         found.append(Annotation(resolve_name(written, namespace, uses), line, kept,

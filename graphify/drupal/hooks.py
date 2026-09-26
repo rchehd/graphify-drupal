@@ -465,10 +465,12 @@ def extract_php_with_hooks(path: Path) -> dict[str, Any]:
     `.php` handler exists."""
     import graphify.extract as core
     from graphify.drupal.merge import compose_handlers
+    from graphify.drupal.php_semantics import extract_php_semantics, is_semantics_file
 
-    return compose_handlers(
-        core._DISPATCH[".php"], [extract_hook_implementations, extract_hook_invocations]
-    )(path)
+    extras = [extract_hook_implementations, extract_hook_invocations]
+    if is_semantics_file(path):
+        extras.append(extract_php_semantics)
+    return compose_handlers(core._DISPATCH[".php"], extras)(path)
 
 
 # -- invocations (spec §5.3) ----------------------------------------------------
