@@ -669,7 +669,11 @@ def bind_service_calls(all_nodes: list[dict], all_edges: list[dict]) -> None:
         if carrier is None:
             continue
         carrier["methods"] = sorted({*(carrier.get("methods") or ()), method})
-        waiting = [list(c) for c in carrier.get("_pending_calls") or ()]
+        # Caller ids in an attribute: core's `ext_id_remap` (out-of-root
+        # files) rewrites only `source`/`target`, so a remapped caller's
+        # entry no longer names a node and the overlay skips it -- a lost
+        # fact, never an invented one.
+        waiting =[list(c) for c in carrier.get("_pending_calls") or ()]
         if [e.get("source"), method] not in waiting:
             waiting.append([e.get("source"), method])
             carrier["_pending_calls"] = sorted(waiting)
