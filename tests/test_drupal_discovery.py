@@ -560,3 +560,43 @@ def test_the_services_fast_path_parses_exactly_what_the_p1_loader_does(tmp_path)
         path.write_text(text, encoding="utf-8")
         assert _load_services_yaml(path) == load_drupal_yaml(path), name
     assert _load_services_yaml(tmp_path / "missing.services.yml")[1]
+
+
+def test_directory_facts_owner_agrees_with_the_longest_match_owner(tmp_path):
+    """Final review m5: `_DirectoryFacts.of` walks up to the nearest extension
+    directory where `_Builder.owner_of` scans for the longest match; the two
+    agree for every file of the synthetic sites, nested and prefix-named
+    extensions included."""
+    import os
+
+    from graphify.drupal.discovery import _Builder, _DirectoryFacts, _walk, find_web_root
+    from tests.test_drupal_php_hook_binding import _binding_site
+    from tests.test_drupal_php_plugins import _plugin_site
+    from tests.test_drupal_php_services import _services_site
+
+    sites = [_binding_site(tmp_path / "binding"), _services_site(tmp_path / "services"),
+             _plugin_site(tmp_path / "plugins"),
+             _site(tmp_path / "nested", {
+                 "web/modules/custom/foo/foo.info.yml": "name: Foo\ntype: module\n",
+                 "web/modules/custom/foo/src/A.php": "<?php\n",
+                 "web/modules/custom/foo/modules/foo_sub/foo_sub.info.yml": "name: S\ntype: module\n",
+                 "web/modules/custom/foo/modules/foo_sub/src/B.php": "<?php\n",
+                 "web/modules/custom/foo_x/foo_x.info.yml": "name: X\ntype: module\n",
+                 "web/modules/custom/foo_x/foo_x.module": "<?php\n",
+                 "web/modules/custom/foox/foox.info.yml": "name: X\ntype: module\n",
+                 "web/modules/custom/loose.php": "<?php\n",
+                 "web/themes/custom/t/t.info.yml": "name: T\ntype: theme\n",
+                 "web/themes/custom/t/templates/page.html.twig": "",
+             })]
+    checked = 0
+    for root in sites:
+        web = find_web_root(root.resolve())
+        walk = _walk(web, web / "core")
+        builder = _Builder(web, walk)
+        where = _DirectoryFacts(builder)
+        for dirpath, _dirs, files in os.walk(web):
+            for name in files:
+                path = Path(dirpath) / name
+                assert where.of(path)[0] == builder.owner_of(path), path
+                checked += 1
+    assert checked > 50

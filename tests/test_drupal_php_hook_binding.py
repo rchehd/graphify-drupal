@@ -393,6 +393,35 @@ def test_entity_form_alters_bind_only_to_forms_drupal_builds(tmp_path):
     assert hook_impl_id("foo", "form_node_blog_form_alter") not in {n["id"] for n in result["nodes"]}
 
 
+def test_an_entity_base_form_that_is_also_another_type_s_exact_form_alters_both(tmp_path):
+    """Final review m3: `foo_edit_form` is `EntityForm::getBaseFormId()` of
+    entity type `foo_edit` and exactly `foo`'s `edit` form; Drupal runs the
+    alter for both, so both are its targets."""
+    root = _binding_site(tmp_path)
+    (root / FOO / "src/Entity/FooEdit.php").write_text(_entity(
+        "Drupal\\foo\\Entity", "FooEdit", "foo_edit",
+        {"default": "Drupal\\foo\\Form\\FooEntityForm"}), encoding="utf-8")
+    prepare_run(root)
+    result, _core = _hooks_result(root)
+    impl = hook_impl_id("foo", "form_foo_edit_form_alter")
+    alters = _alters(result, impl)
+    assert set(alters) == {entity_form_id("foo_edit", "default"), entity_form_id("foo", "edit")}
+    assert {e["confidence"] for e in alters.values()} == {"EXTRACTED"}
+
+
+@pytest.mark.parametrize("ignored", [
+    "config/sync/node.type.article.yml\nweb/modules/contrib/bar/config/optional/node.type.page.yml\n",
+    "config/sync/\nweb/modules/contrib/bar/config/\n",
+])
+def test_an_excluded_config_file_proves_no_bundle(tmp_path, ignored):
+    """Final review m4: the sync store and `config/optional` names obey the
+    user's excludes, as the rest of the registry walk does."""
+    root = _binding_site(tmp_path)
+    (root / ".graphifyignore").write_text(ignored, encoding="utf-8")
+    registry = prepare_run(root)
+    assert not registry.entity_bundles.get("node")
+
+
 def test_an_unknown_form_is_an_unbound_form_candidate(tmp_path):
     root = _binding_site(tmp_path)
     registry = prepare_run(root)
