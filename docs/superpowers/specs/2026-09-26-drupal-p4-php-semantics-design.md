@@ -383,6 +383,9 @@ subscriber edges meet these through `confirmed_by`.
   `_invokes_hook_files` pattern);
 - a changed constructor or `create()` in class `C` → `C`'s file. It is in the
   batch anyway, and its subclasses in the graph;
+- a method added to or removed from class `C` → every in-graph file with a
+  `uses_service` or bound `calls` edge to a service whose class, or a custom
+  ancestor of it, is `C` (final review I2; `ClassFacts.methods`);
 - a changed boundary form, entity type or event-constant map → files with
   `alters_form`, `hooks_entity_type`, `subscribes_to_event` or the matching
   candidates.
@@ -714,7 +717,16 @@ the phase can be reviewed in one place.
   - the classes whose `hook_services` membership changed;
   - the hook files, when forms, base forms, entity types, entity-form
     handlers, bundles, extension info or event constants change;
-  - every custom file, when the shortcut map changes (§9, widened).
+  - every custom file, when the shortcut map changes (§9, widened);
+  - the users of a service whose class, or a custom ancestor of it, gained
+    or lost a method (final review I2).
+- The final review's fix wave (after `f7a2259`): the registry widening
+  extends the caller's list in place, so `graphify watch` and the git hooks
+  evict a pulled-in file's old edges; `form_<t>_form_alter` also targets
+  another type's exact entity form of that id (rules 5 and 6 together);
+  excluded config files prove no bundle. None of it moves a number above:
+  re-measured with the artifact (5,051 nodes, 11,523 edges, rerun 2) and
+  statically (5,003, 11,342); `prepare_run` 3.00, 3.03 and 3.06 s cold.
 - The inventory's PHP candidates are cached in
   `<out>/drupal-php-candidates.json`, keyed by file stat and a digest of the
   registry and the extractor's code.
@@ -745,6 +757,12 @@ Final suite: 6,501 passed, 100 skipped, and the 4 known
 `test_ollama_retry_cap` failures (`openai` is not installed). `-k drupal`
 with `DRUPAL_CONTAINER_ARTIFACT` set: 774 passed, and 4 skipped for missing
 optional dependencies (`falkordb`, `docx`, tree-sitter-sql, `mcp`).
+
+After the final review's fix wave: 6,547 passed, 100 skipped, the same 4
+known failures; `-k drupal` with the artifact 820 passed, 4 skipped. The P4
+incremental cases now run through the CLI's incremental extract, watch with
+and without `--no-cluster`, and a full build, each checked equal to a full
+build of the same tree.
 
 ### 15.7 Left for later phases
 
