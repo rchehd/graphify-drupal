@@ -380,6 +380,7 @@ def test_class_facts(tmp_path):
         form_id="foo_promoted",
         base_form_id="foo_base",
         constants={"MODE": "edit", "OTHER": "other"},
+        methods=("__construct", "create", "getBaseFormId", "getFormId"),
     )
     assert assigned == ClassFacts(
         fqcn="Drupal\\foo\\Form\\AssignedForm",
@@ -397,8 +398,15 @@ def test_class_facts(tmp_path):
         form_id="",
         base_form_id="",
         constants={},
+        methods=("__construct", "create", "getFormId"),
     )
     assert plain.fqcn == "Drupal\\foo\\Form\\Plain"
+    assert plain.methods == ("create",)
+    # Its own methods only, sorted: never an anonymous class's.
+    anon = _write(tmp_path / "Anon.php", "<?php\nclass Anon {\n  public function zed() {\n"
+                  "    return new class { public function inner() {} };\n  }\n"
+                  "  private static function alpha() {}\n}\n")
+    assert [f.methods for f in read_class_facts(anon)] == [("alpha", "zed")]
     assert plain.extends == ""
     assert plain.params == ()
     assert plain.create_args == ("named",)
