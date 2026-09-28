@@ -315,7 +315,8 @@ def _form_targets(x: str, registry: Any) -> tuple[tuple[tuple[str, str, str], ..
     6. `x` exactly an entity form id `EntityForm::getFormId()` builds:
        `<t>[_<op>]_form` for a `t` with no `bundle` key, `<t>_<bundle>[_<op>]_form`
        for a bundle a config file proves (`Registry.entity_bundles`); every
-       such reading (two readings of one id are two forms Drupal alters).
+       such reading (two readings of one id are two forms Drupal alters),
+       together with 5's when both match (through a base form id then).
 
     Empty targets when nothing matches: no bundle is guessed."""
     from graphify.drupal.php_semantics import entity_form_id, entity_form_operations, \
@@ -338,13 +339,14 @@ def _form_targets(x: str, registry: Any) -> tuple[tuple[tuple[str, str, str], ..
         literal = sorted({m[0] for m in members if m[0]})
         return tuple((form_id(i), i, "") for i in literal), True
     types = registry.entity_types or {}
+    found: list[tuple[str, str, str]] = []
+    based_on_type = False
     if x.endswith("_form") and x[:-len("_form")] in types:
         t = x[:-len("_form")]
         ops = entity_form_operations(registry, t)
-        if ops:
-            return tuple((entity_form_id(t, op), entity_form_pattern(t, op), "") for op in ops), True
+        found += [(entity_form_id(t, op), entity_form_pattern(t, op), "") for op in ops]
+        based_on_type = bool(ops)
     bundles = getattr(registry, "entity_bundles", None) or {}
-    found: list[tuple[str, str, str]] = []
     for t in types:
         if not x.startswith(t + "_"):
             continue
@@ -354,7 +356,10 @@ def _form_targets(x: str, registry: Any) -> tuple[tuple[tuple[str, str, str], ..
                 built = t + (f"_{bundle}" if bundle else "") + tail
                 if built == x:
                     found.append((entity_form_id(t, op), entity_form_pattern(t, op), bundle))
-    return tuple(sorted(set(found))), False
+    # 5 and 6 together: `foo_edit_form` is the base of type `foo_edit` and
+    # exactly `foo`'s edit form, and Drupal alters both. The implementation
+    # keeps 5's `form_BASE_FORM_ID_alter` reading when 5 matched.
+    return tuple(sorted(set(found))), based_on_type
 
 
 def _entity_split(name: str, module: str, registry: Any, function: str) -> tuple[str, str] | None:
