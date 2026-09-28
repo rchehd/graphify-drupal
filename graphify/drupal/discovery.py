@@ -386,7 +386,9 @@ def _walk(base: Path, core_dir: Path | None,
         in_src = "src" in Path(dirpath[len(str(base)):]).parts
         if (directory.name in ("install", "optional") and directory.parent.name == "config") \
                 or "core.extension.yml" in names:
-            found.config_names.update(n for n in names if n.endswith(".yml"))
+            # Asked per file: a config directory is small, and a name here
+            # proves a bundle (`_entity_bundles`).
+            found.config_names.update(n for n in names if n.endswith(".yml") and kept(directory / n))
         for name in names:
             path = directory / name
             if name.endswith(_SERVICES_SUFFIX):
@@ -871,7 +873,7 @@ def build_registry(scan_root: Path, is_ignored: Callable[[Path], bool] | None = 
                 pattern=hook_pattern(name),
             )
 
-    walk.config_names |= _sync_config_names(scan_root, base)
+    walk.config_names |= _sync_config_names(scan_root, base, is_ignored)
     php = _learn_php(builder, walk, is_ignored, where)
 
     return Registry(
@@ -915,12 +917,20 @@ _ENTITY_TYPE_ANNOTATION_CLASSES = frozenset({
 })
 
 
-def _sync_config_names(scan_root: Path, base: Path) -> set[str]:
+def _sync_config_names(scan_root: Path, base: Path,
+                       is_ignored: Callable[[Path], bool] | None = None) -> set[str]:
     """`.yml` names of the sync stores outside the walked web root: the ones
     `config_stores` finds one or two levels below the scan root (a
     `core.extension.yml` marker) and the `.graphifyrc` `drupal.config.sync`
-    directories. File names only, never content. Never raises."""
+    directories. File names only, never content. A directory or file
+    `is_ignored` rejects counts for nothing, as in `_walk`. Never raises."""
     from graphify.drupal.config_stores import _markers_under, _rc_sync_dirs
+
+    def kept(path: Path) -> bool:
+        try:
+            return is_ignored is None or not is_ignored(path)
+        except Exception:
+            return True
 
     names: set[str] = set()
     try:
@@ -931,8 +941,11 @@ def _sync_config_names(scan_root: Path, base: Path) -> set[str]:
         try:
             if Path(directory).resolve().is_relative_to(base):
                 continue            # the walk saw it
+            if not kept(Path(directory)):
+                continue
             with os.scandir(directory) as entries:
-                names.update(e.name for e in entries if e.name.endswith(".yml") and e.is_file())
+                names.update(e.name for e in entries if e.name.endswith(".yml") and e.is_file()
+                             and kept(Path(directory) / e.name))
         except OSError:
             continue
     return names
