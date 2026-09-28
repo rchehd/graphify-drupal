@@ -169,6 +169,15 @@ def _service_class(registry: Any, sid: str) -> str:
         return ""
 
 
+def _chain(registry: Any, sid: str) -> list[str]:
+    from graphify.drupal.resolvers import service_class_chain
+
+    try:
+        return service_class_chain(registry, sid)
+    except Exception:
+        return []
+
+
 def _wiring(registry: Any) -> dict[str, dict]:
     return {k: v for k, v in (getattr(registry, "service_wiring", None) or {}).items()
             if isinstance(v, dict)}
@@ -182,7 +191,14 @@ def _service_files(previous: Any, current: Any, prior: PreviousRun) -> set[str]:
     wiring = _changed(_wiring(previous), _wiring(current))
     hooked = set(previous.hook_services or ()) ^ set(current.hook_services or ())
     out: set[str] = set()
-    names = services | aliases
+    # A class that gained or lost a method (spec §7.4): a call on a service
+    # whose class, or a custom ancestor of it, is that class binds (or stops
+    # binding) there, so the service's users re-extract.
+    methods = _changed(_facts(previous), _facts(current),
+                       lambda d: tuple(d.get("methods") or ()))
+    called = {sid for r in both for sid in r.services
+              if methods.intersection(_chain(r, sid))} if methods else set()
+    names = services | aliases | called
     if names:
         # Every use of the service or alias: a `uses_service` names it as its
         # target or its `alias`, a bound `calls` as its `service`.
@@ -313,7 +329,8 @@ def stale_files(previous: Any, current: Any, prior: PreviousRun) -> set[str]:
     """Files whose P4 facts the change from `previous` to `current` makes stale:
 
     - a service whose class changed, or an alias added, removed or
-      retargeted: every file with a `uses_service` or bound `calls` naming it
+      retargeted, or whose class or a custom ancestor of it gained or lost
+      a method: every file with a `uses_service` or bound `calls` naming it
       in the previous graph; the class of a changed service or service
       wiring (rule 2), the classes whose `create()`, `arguments:` or
       parameter types name a changed alias and their subclasses, and, when

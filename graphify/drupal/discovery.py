@@ -1314,7 +1314,14 @@ def affected_files(previous: Registry | None, current: Registry | None,
 def _class_facts_files(old: dict[str, dict], new: dict[str, dict]) -> set[str]:
     """The files of every class whose facts differ between `old` and `new`
     (added and removed included), and of their subclasses in either map."""
-    changed = [fqcn for fqcn in old.keys() | new.keys() if old.get(fqcn) != new.get(fqcn)]
+    def injects(data: Any) -> Any:
+        # A class's own method set is not what it injects: a changed one
+        # makes the callers of its services stale, not its subclasses
+        # (`staleness._service_files`).
+        return {k: v for k, v in data.items() if k != "methods"} if isinstance(data, dict) else data
+
+    changed = [fqcn for fqcn in old.keys() | new.keys()
+               if fqcn not in old or fqcn not in new or injects(old[fqcn]) != injects(new[fqcn])]
     out: set[str] = set()
     if not changed:
         return out

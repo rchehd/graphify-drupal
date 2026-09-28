@@ -1079,6 +1079,10 @@ class ClassFacts:
     #: `create()` builds with `new static(...)` (so a subclass inheriting it
     #: is what it builds), not `new self(...)` / `new <Class>(...)`.
     create_static: bool = False
+    #: The class's own method names (direct members of its body), sorted:
+    #: a call on a service lands on one of them (spec §7.4), so a changed set
+    #: makes the service's callers stale (`staleness._service_files`).
+    methods: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         """A JSON-shaped copy: lists for tuples, `params` as dicts."""
@@ -1090,6 +1094,7 @@ class ClassFacts:
             "base_form_id": self.base_form_id, "constants": dict(self.constants),
             "create_props": dict(self.create_props),
             "create_static": self.create_static,
+            "methods": list(self.methods),
         }
 
     @classmethod
@@ -1109,6 +1114,7 @@ class ClassFacts:
             constants={str(k): str(v) for k, v in (data.get("constants") or {}).items()},
             create_props={str(k): str(v) for k, v in (data.get("create_props") or {}).items()},
             create_static=data.get("create_static") is True,
+            methods=tuple(str(m) for m in data.get("methods") or []),
         )
 
 
@@ -1285,6 +1291,14 @@ def _constants(body: "tree_sitter.Node") -> dict[str, str]:
     return out
 
 
+def _method_names(body: "tree_sitter.Node") -> tuple[str, ...]:
+    """The class's own method names, as `_find_method` sees them."""
+    names = {_text(node.child_by_field_name("name")) for node in body.named_children
+             if node.type == "method_declaration"}
+    names.discard("")
+    return tuple(sorted(names))
+
+
 def _class_facts(class_node: "tree_sitter.Node", namespace: str, uses: dict[str, str],
                  file: str) -> ClassFacts | None:
     name = _text(class_node.child_by_field_name("name"))
@@ -1312,6 +1326,7 @@ def _class_facts(class_node: "tree_sitter.Node", namespace: str, uses: dict[str,
         form_id=_literal_return(_find_method(body, "getFormId")),
         base_form_id=_literal_return(_find_method(body, "getBaseFormId")),
         constants=_constants(body),
+        methods=_method_names(body),
     )
 
 

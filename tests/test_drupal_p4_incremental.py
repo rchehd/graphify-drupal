@@ -403,6 +403,53 @@ def test_a_hook_class_defined_as_a_service_loses_autowiring(tmp_path, mode):
     assert _targets(second, hooks, "uses_service", via="injected") == {service_id("foo.other")}
 
 
+def _carrier(graph: dict, source: str, sid: str) -> dict:
+    found = [e for e in _links(graph) if e["source"] == source and e["relation"] == "uses_service"
+             and e["target"] == service_id(sid)]
+    assert len(found) == 1, found
+    return found[0]
+
+
+def test_a_method_added_to_or_removed_from_a_service_class_moves_its_calls(tmp_path, mode):
+    """Final review I2: the callers of a service whose class (or a custom
+    ancestor, `foo.worker` extends FooHelper) gained or lost a method are
+    unchanged files; their `calls` and the carrier's `methods` must follow."""
+    root = _services_with_other(tmp_path / "site")
+    controller = root / FOO / "src/Controller/FooController.php"
+    _edit(controller, "    \\Drupal::service('foo.worker')->run();\n",
+          "    \\Drupal::service('foo.worker')->run();\n    \\Drupal::service('foo.worker')->later();\n")
+    _edit(controller, "  public function aliased() {\n",
+          "  public function soon() {\n    \\Drupal::service('foo.helper')->later();\n  }\n\n"
+          "  public function aliased() {\n")
+    run = Run(mode, root, tmp_path)
+    ctl = "src/Controller/FooController.php"
+    first = run.build()
+    soon = _method(first, ctl, "FooController", "soon")
+    inherited = _method(first, ctl, "FooController", "inherited")
+    page = _method(first, ctl, "FooController", "page")
+    helper_run = _method(first, "src/FooHelper.php", "FooHelper", "run")
+    assert _targets(first, soon, "calls") == set()
+    assert _carrier(first, soon, "foo.helper")["methods"] == ["later"]
+
+    run.edit(root / FOO / "src/FooHelper.php", "  public function run() {\n  }\n",
+             "  public function run() {\n  }\n\n  public function later() {\n  }\n")
+    second = run.again()
+
+    later = _method(second, "src/FooHelper.php", "FooHelper", "later")
+    assert _targets(second, soon, "calls") == {later}
+    assert _targets(second, inherited, "calls") == {helper_run, later}
+    assert "methods" not in _carrier(second, soon, "foo.helper")
+
+    run.edit(root / FOO / "src/FooHelper.php", "  public function run() {\n  }\n\n", "")
+    third = run.again()
+
+    assert _targets(third, page, "calls") == set()
+    assert _targets(third, inherited, "calls") == {later}
+    carrier = _carrier(third, page, "foo.helper")
+    assert carrier["methods"] == ["run"]
+    assert carrier["_pending_calls"] == [[page, "run"]]
+
+
 def test_an_unchanged_services_site_re_extracts_nothing(tmp_path):
     root = _services_with_other(tmp_path / "site")
     out = tmp_path / "out"
